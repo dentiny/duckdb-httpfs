@@ -12,7 +12,11 @@ CALL enable_logging('HTTP');
 statement ok
 CREATE TABLE T AS FROM 'https://data.gharchive.org/2023-02-08-0.json.gz';
 
+# The requested file is of size 105159017 bytes;
+# current read buffer is at max 33554432 bytes, which means we at least require 4 requests;
+# and the buffer is at minimum 1048576 bytes, as long as it grows, it caps at 100 requests.
 query I
-SELECT count(*) FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'GET' GROUP BY request.type;
+SELECT CASE WHEN count(*) >= 4 AND count(*) <= 100 THEN 1 ELSE 0 END 
+FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'GET' GROUP BY request.type;
 ----
-8
+1
