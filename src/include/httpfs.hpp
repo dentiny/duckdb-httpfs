@@ -181,6 +181,7 @@ public:
 	int64_t GetFileSize(FileHandle &handle) override;
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
 	string GetVersionTag(FileHandle &handle) override;
+	FileMetadata Stats(FileHandle &handle) override;
 	bool FileExists(const string &filename, optional_ptr<FileOpener> opener) override;
 	void Seek(FileHandle &handle, idx_t location) override;
 	idx_t SeekPosition(FileHandle &handle) override;
