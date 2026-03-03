@@ -663,7 +663,7 @@ FileMetadata HTTPFileSystem::Stats(FileHandle &handle) {
 	metadata.file_size = hfh.length;
 	metadata.last_modification_time = hfh.last_modified;
 	metadata.file_type = FileType::FILE_TYPE_REGULAR;
-	
+
 	// Add extended file information
 	if (!hfh.etag.empty()) {
 		metadata.extended_file_info["etag"] = Value(hfh.etag);
