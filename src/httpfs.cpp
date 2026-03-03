@@ -657,19 +657,47 @@ void HTTPFileSystem::FileSync(FileHandle &handle) {
 	throw NotImplementedException("FileSync for HTTP files not implemented");
 }
 
+FileMetadata HTTPFileSystem::Stats(FileHandle &handle) {
+	auto &hfh = handle.Cast<HTTPFileHandle>();
+	FileMetadata metadata;
+	metadata.file_size = hfh.length;
+	metadata.last_modification_time = hfh.last_modified;
+	metadata.file_type = FileType::FILE_TYPE_REGULAR;
+
+	// Add extended file information
+	if (!hfh.etag.empty()) {
+		metadata.extended_file_info["etag"] = Value(hfh.etag);
+	}
+	if (!hfh.version_id.empty()) {
+		metadata.extended_file_info["version_id"] = Value(hfh.version_id);
+	}
+
+	// Include any additional properties from the cache entry (e.g., s3_region for S3)
+	auto cache_entry = hfh.GetCacheEntry();
+	for (const auto &prop : cache_entry.properties) {
+		metadata.extended_file_info[prop.first] = Value(prop.second);
+	}
+
+	return metadata;
+}
+
 int64_t HTTPFileSystem::GetFileSize(FileHandle &handle) {
-	auto &sfh = handle.Cast<HTTPFileHandle>();
-	return sfh.length;
+	const auto file_metadata = Stats(handle);
+	return file_metadata.file_size;
 }
 
 timestamp_t HTTPFileSystem::GetLastModifiedTime(FileHandle &handle) {
-	auto &sfh = handle.Cast<HTTPFileHandle>();
-	return sfh.last_modified;
+	const auto file_metadata = Stats(handle);
+	return file_metadata.last_modification_time;
 }
 
 string HTTPFileSystem::GetVersionTag(FileHandle &handle) {
-	auto &sfh = handle.Cast<HTTPFileHandle>();
-	return sfh.etag;
+	const auto file_metadata = Stats(handle);
+	auto etag_entry = file_metadata.extended_file_info.find("etag");
+	if (etag_entry != file_metadata.extended_file_info.end()) {
+		return etag_entry->second.GetValue<string>();
+	}
+	return "";
 }
 
 bool HTTPFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
