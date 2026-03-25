@@ -39,6 +39,72 @@ static std::string SelectCURLCertPath() {
 	return std::string();
 }
 
+static constexpr idx_t BUFFER_BLOCK_SIZE = 2097152; // 2 MiB
+
+// Collects curl response data into a series of fixed-size AllocatedData blocks.
+// Each block is BUFFER_BLOCK_SIZE (2 MiB); when one fills up, a new block is allocated.
+// After the request completes, the caller can take ownership of all blocks via TakeBlocks().
+class CurlResponseBuffer {
+public:
+	CurlResponseBuffer() : current_block_offset(0), total_bytes(0) {
+		AllocateNewBlock();
+	}
+
+	void Append(const char *data, size_t size) {
+		size_t remaining = size;
+		const char *src = data;
+
+		while (remaining > 0) {
+			idx_t space_in_block = BUFFER_BLOCK_SIZE - current_block_offset;
+			idx_t to_copy = MinValue<idx_t>(remaining, space_in_block);
+
+			memcpy(blocks.back().get() + current_block_offset, src, to_copy);
+			current_block_offset += to_copy;
+			src += to_copy;
+			remaining -= to_copy;
+			total_bytes += to_copy;
+
+			if (current_block_offset == BUFFER_BLOCK_SIZE) {
+				AllocateNewBlock();
+			}
+		}
+	}
+
+	vector<AllocatedData> TakeBlocks() {
+		return std::move(blocks);
+	}
+
+	const vector<AllocatedData> &GetBlocks() const {
+		return blocks;
+	}
+
+	idx_t TotalBytes() const {
+		return total_bytes;
+	}
+
+	idx_t GetLastBlockSize() const {
+		return current_block_offset;
+	}
+
+private:
+	void AllocateNewBlock() {
+		auto &allocator = Allocator::DefaultAllocator();
+		blocks.push_back(allocator.Allocate(BUFFER_BLOCK_SIZE));
+		current_block_offset = 0;
+	}
+
+	vector<AllocatedData> blocks;
+	idx_t current_block_offset;
+	idx_t total_bytes;
+};
+
+static size_t BufferWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+	size_t total_size = size * nmemb;
+	auto *buffer = static_cast<CurlResponseBuffer *>(userp);
+	buffer->Append(static_cast<const char *>(contents), total_size);
+	return total_size;
+}
+
 static size_t RequestWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
 	size_t totalSize = size * nmemb;
 	std::string *str = static_cast<std::string *>(userp);
@@ -227,6 +293,10 @@ public:
 		auto curl_headers = TransformHeadersCurl(info.headers, info.params);
 		request_info->url = info.url;
 
+		// POC: collect response body into 2 MiB buffer blocks instead of a single std::string.
+		// The CurlResponseBuffer is stack-allocated; curl's write callback streams data into it.
+		CurlResponseBuffer response_buffer;
+
 		CURLcode res;
 		{
 			curl_easy_setopt(*curl, CURLOPT_NOBODY, 0L);
@@ -239,20 +309,23 @@ public:
 			curl_easy_setopt(*curl, CURLOPT_CURLU, url);
 			curl_easy_setopt(*curl, CURLOPT_HTTPHEADER, curl_headers ? curl_headers.headers : nullptr);
 
+			// Point curl's write callback at our block-based buffer instead of request_info->body
+			curl_easy_setopt(*curl, CURLOPT_WRITEFUNCTION, BufferWriteCallback);
+			curl_easy_setopt(*curl, CURLOPT_WRITEDATA, &response_buffer);
+
 			res = curl->Execute();
 			curl_url_cleanup(url);
 		}
 
 		curl_easy_getinfo(*curl, CURLINFO_RESPONSE_CODE, &request_info->response_code);
 
-		const idx_t bytes_received = request_info->body.size();
+		const idx_t bytes_received = response_buffer.TotalBytes();
 		if (!request_info->header_collection.empty() &&
 		    request_info->header_collection.back().HasHeader("content-length")) {
 			const idx_t content_length_received =
 			    std::stoi(request_info->header_collection.back().GetHeaderValue("content-length"));
 			if (bytes_received != content_length_received) {
 				// Something is off, might happen in case of unreliable network
-				// TODO: consider logging this
 			}
 		}
 
@@ -267,12 +340,22 @@ public:
 			}
 		}
 
-		const char *data = request_info->body.c_str();
+		// Deliver data to content_handler block-by-block.
+		// Each full block is exactly BUFFER_BLOCK_SIZE; the last block may be smaller.
 		if (info.content_handler) {
-			info.content_handler(const_data_ptr_cast(data), bytes_received);
+			auto &blocks = response_buffer.GetBlocks();
+			idx_t remaining = bytes_received;
+			for (idx_t i = 0; i < blocks.size() && remaining > 0; i++) {
+				idx_t block_bytes = MinValue<idx_t>(remaining, BUFFER_BLOCK_SIZE);
+				info.content_handler(const_data_ptr_cast(blocks[i].get()), block_bytes);
+				remaining -= block_bytes;
+			}
 		}
 
-		return TransformResponseCurl(res);
+		auto response = TransformResponseCurl(res);
+		response->last_block_size = response_buffer.GetLastBlockSize();
+		response->response_blocks = response_buffer.TakeBlocks();
+		return response;
 	}
 
 	unique_ptr<HTTPResponse> Put(PutRequestInfo &info) override {
