@@ -54,6 +54,7 @@ jobs:
       extension_name: httpfs
       duckdb_version: 043e1894425b49984c5010f253589e5d9c5fdde4
       ci_tools_version: main
+      extra_toolchains: 'python3'
       format_checks: 'format'
 
   tidy:
