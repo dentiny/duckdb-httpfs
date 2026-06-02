@@ -83,11 +83,14 @@ SELECT * FROM "http://test-bucket-public.${DUCKDB_S3_ENDPOINT}/url_encode/just+d
 ----
 2
 
-# Due to our support for query parameters, this will fail
-statement error
+# Query strings that do not contain S3 config parameters are part of the object key
+statement ok
 COPY test_4 TO '${prefix}test-bucket-public/url_encode/question?marks?are?even?worse.parquet' (FORMAT 'parquet');
+
+query I
+SELECT * FROM "${prefix}test-bucket-public/url_encode/question?marks?are?even?worse.parquet" LIMIT 1;
 ----
-Invalid query parameters found.
+4
 
 # Enabling url compatibility mode will disable both Globs and query params
 # allowing a user to query those hard-to-reach files
