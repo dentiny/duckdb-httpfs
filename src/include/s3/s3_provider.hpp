@@ -29,6 +29,12 @@ struct S3Provider {
 	static optional<S3ProviderMatch> TryMatchUrl(const string &url);
 	static S3ProviderMatch MatchUrl(const string &url);
 
+	//! Configure additional URL schemes routed to the S3-compatible filesystem
+	//! (set via the 's3_compatible_url_schemes' setting, e.g. "oss, cos").
+	//! Returns the normalized scheme list (lowercased, deduplicated, '://'-suffixed).
+	static string SetCustomUrlSchemes(const string &schemes_csv);
+	static vector<string> GetCustomUrlSchemes();
+
 	static vector<string> DefaultSecretScope(const string &secret_type);
 	static void SetSecretNamedParameters(const string &secret_type, CreateSecretFunction &function);
 	static void ApplySecretDefaults(const CreateSecretInput &input, KeyValueSecret &secret);

@@ -2,8 +2,11 @@
 
 #include "s3/s3_auth.hpp"
 
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/secret/secret.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 
@@ -13,6 +16,53 @@ static const array<S3ProviderMatch, 6> &ProviderMatches() {
 	    S3ProviderMatch {S3ProviderType::S3, "s3n://"}, S3ProviderMatch {S3ProviderType::GCS, "gcs://"},
 	    S3ProviderMatch {S3ProviderType::GCS, "gs://"}, S3ProviderMatch {S3ProviderType::R2, "r2://"}};
 	return provider_matches;
+}
+
+namespace {
+//! Additional URL schemes routed to the S3-compatible filesystem, configured
+//! via the 's3_compatible_url_schemes' setting (e.g. "oss://", "cos://").
+mutex custom_scheme_lock;
+vector<string> custom_url_schemes;
+} // namespace
+
+string S3Provider::SetCustomUrlSchemes(const string &schemes_csv) {
+	//! Schemes already claimed by built-in filesystems or well-known extensions (e.g. azure); allowing these would
+	//! hijack their routing
+	static const vector<string> reserved_schemes = {"s3://", "s3a://",   "s3n://",   "gcs://", "gs://",
+	                                                "r2://", "http://",  "https://", "hf://",  "file://",
+	                                                "az://", "azure://", "abfss://", "abfs://"};
+	vector<string> result;
+	for (auto &scheme : StringUtil::Split(schemes_csv, ',')) {
+		auto trimmed = StringUtil::Lower(scheme);
+		StringUtil::Trim(trimmed);
+		if (trimmed.empty()) {
+			continue;
+		}
+		// Accept both 'oss' and 'oss://'
+		if (!StringUtil::EndsWith(trimmed, "://")) {
+			trimmed += "://";
+		}
+		for (auto &reserved : reserved_schemes) {
+			if (trimmed == reserved) {
+				throw InvalidInputException("Scheme '%s' is already handled by a built-in filesystem and cannot be "
+				                            "added to 's3_compatible_url_schemes'",
+				                            trimmed);
+			}
+		}
+		if (std::find(result.begin(), result.end(), trimmed) != result.end()) {
+			continue;
+		}
+		result.push_back(std::move(trimmed));
+	}
+	auto normalized = StringUtil::Join(result, ",");
+	lock_guard<mutex> guard(custom_scheme_lock);
+	custom_url_schemes = std::move(result);
+	return normalized;
+}
+
+vector<string> S3Provider::GetCustomUrlSchemes() {
+	lock_guard<mutex> guard(custom_scheme_lock);
+	return custom_url_schemes;
 }
 
 const array<const char *, 4> &S3Provider::SecretTypes() {
@@ -34,6 +84,12 @@ optional<S3ProviderMatch> S3Provider::TryMatchUrl(const string &url) {
 			return provider_match;
 		}
 	}
+	// Custom schemes registered via 's3_compatible_url_schemes' are served by the plain S3 provider
+	for (auto &prefix : GetCustomUrlSchemes()) {
+		if (StringUtil::StartsWith(lower_url, prefix)) {
+			return S3ProviderMatch {S3ProviderType::S3, prefix};
+		}
+	}
 	return {};
 }
 
@@ -44,14 +100,19 @@ S3ProviderMatch S3Provider::MatchUrl(const string &url) {
 		for (const auto &entry : ProviderMatches()) {
 			prefixes.push_back(entry.prefix);
 		}
-		throw IOException("URL needs to start with %s", StringUtil::Join(prefixes, ", "));
+		throw IOException("URL needs to start with %s (or a scheme listed in the 's3_compatible_url_schemes' setting)",
+		                  StringUtil::Join(prefixes, ", "));
 	}
 	return *provider_match;
 }
 
 vector<string> S3Provider::DefaultSecretScope(const string &secret_type) {
 	if (secret_type == "s3") {
-		return {"s3://", "s3n://", "s3a://"};
+		vector<string> scope {"s3://", "s3n://", "s3a://"};
+		for (auto &scheme : GetCustomUrlSchemes()) {
+			scope.push_back(scheme);
+		}
+		return scope;
 	}
 	if (secret_type == "r2") {
 		return {"r2://"};
