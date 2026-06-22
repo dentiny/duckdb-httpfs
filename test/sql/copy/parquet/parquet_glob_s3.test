@@ -124,16 +124,14 @@ select count(*) from parquet_scan('s3://test-bucket/parquet_glob_s3/g*/t1.parque
 ----
 2
 
-# Question mark is not supported for S3 due to our use of query parameters
+# Question mark is treated as a literal path character for S3, not a glob wildcard
 statement error
 select count(*) from parquet_scan('s3://test-bucket/parquet_glob_s3/glob/t?.parquet')
 ----
-Invalid query parameters found.
 
 statement error
 select count(*) from parquet_scan('s3://test-bucket/parquet_glob_s3/?lob/t?.parquet')
 ----
-Invalid query parameters found.
 
 # Finally, enabling url compatibility mode will disable globs allowing a user to query files with special chars
 statement ok

@@ -376,54 +376,79 @@ BufferHandle S3FileSystem::Allocate(idx_t part_size, uint16_t max_threads) {
 	return buffer_manager.Allocate(MemoryTag::EXTENSION, part_size);
 }
 
-void GetQueryParam(const string &key, string &param, unordered_map<string, string> &query_params) {
+bool GetQueryParam(const string &key, string *param, unordered_map<string, string> &query_params) {
 	auto found_param = query_params.find(key);
 	if (found_param != query_params.end()) {
-		param = found_param->second;
+		if (param) {
+			*param = found_param->second;
+		}
 		query_params.erase(found_param);
+		return true;
 	}
+	return false;
 }
 
-void S3FileSystem::ReadQueryParams(const string &url_query_param, S3AuthParams &params) {
+static bool GetBooleanQueryParam(const string &key, bool *param, unordered_map<string, string> &query_params) {
+	auto found_param = query_params.find(key);
+	if (found_param == query_params.end()) {
+		return false;
+	}
+	if (found_param->second == "true") {
+		if (param) {
+			*param = true;
+		}
+	} else if (found_param->second == "false") {
+		if (param) {
+			*param = false;
+		}
+	} else {
+		throw IOException("Incorrect setting found for %s, allowed values are: 'true' or 'false'", key);
+	}
+	query_params.erase(found_param);
+	return true;
+}
+
+static bool ReadS3QueryParams(const string &url_query_param, S3AuthParams *params) {
 	if (url_query_param.empty()) {
-		return;
+		return false;
 	}
 
 	auto query_params = HTTPFSUtil::ParseGetParameters(url_query_param);
 
-	GetQueryParam("s3_region", params.region, query_params);
-	GetQueryParam("s3_access_key_id", params.access_key_id, query_params);
-	GetQueryParam("s3_secret_access_key", params.secret_access_key, query_params);
-	GetQueryParam("s3_session_token", params.session_token, query_params);
-	GetQueryParam("s3_endpoint", params.endpoint, query_params);
-	GetQueryParam("s3_url_style", params.url_style, query_params);
-	auto found_param = query_params.find("s3_use_ssl");
-	if (found_param != query_params.end()) {
-		if (found_param->second == "true") {
-			params.use_ssl = true;
-		} else if (found_param->second == "false") {
-			params.use_ssl = false;
-		} else {
-			throw IOException("Incorrect setting found for s3_use_ssl, allowed values are: 'true' or 'false'");
+	bool found_s3_query_param = false;
+	found_s3_query_param |= GetQueryParam("s3_region", params ? &params->region : nullptr, query_params);
+	found_s3_query_param |= GetQueryParam("s3_access_key_id", params ? &params->access_key_id : nullptr, query_params);
+	found_s3_query_param |= GetQueryParam("s3_secret_access_key", params ? &params->secret_access_key : nullptr,
+	                                      query_params);
+	found_s3_query_param |= GetQueryParam("s3_session_token", params ? &params->session_token : nullptr, query_params);
+	found_s3_query_param |= GetQueryParam("s3_endpoint", params ? &params->endpoint : nullptr, query_params);
+	found_s3_query_param |= GetQueryParam("s3_url_style", params ? &params->url_style : nullptr, query_params);
+	found_s3_query_param |= GetBooleanQueryParam("s3_use_ssl", params ? &params->use_ssl : nullptr, query_params);
+	found_s3_query_param |=
+	    GetBooleanQueryParam("s3_requester_pays", params ? &params->requester_pays : nullptr, query_params);
+
+	if (!found_s3_query_param) {
+		for (auto &query_param : query_params) {
+			if (StringUtil::StartsWith(query_param.first, "s3_")) {
+				found_s3_query_param = true;
+				break;
+			}
 		}
-		query_params.erase(found_param);
 	}
-	auto found_requester_pays_param = query_params.find("s3_requester_pays");
-	if (found_requester_pays_param != query_params.end()) {
-		if (found_requester_pays_param->second == "true") {
-			params.requester_pays = true;
-		} else if (found_requester_pays_param->second == "false") {
-			params.requester_pays = false;
-		} else {
-			throw IOException("Incorrect setting found for s3_requester_pays, allowed values are: 'true' or 'false'");
-		}
-		query_params.erase(found_requester_pays_param);
+
+	if (!found_s3_query_param) {
+		return false;
 	}
 	if (!query_params.empty()) {
 		throw IOException("Invalid query parameters found. Supported parameters are:\n's3_region', 's3_access_key_id', "
 		                  "'s3_secret_access_key', 's3_session_token',\n's3_endpoint', 's3_url_style', 's3_use_ssl', "
 		                  "'s3_requester_pays'");
 	}
+	return true;
+}
+
+void S3FileSystem::ReadQueryParams(const string &url_query_param, S3AuthParams &params) {
+	ReadS3QueryParams(url_query_param, &params);
 }
 
 string S3FileSystem::TryGetPrefix(const string &url) {
@@ -466,8 +491,13 @@ ParsedS3Url S3FileSystem::S3UrlParse(string url, const S3AuthParams &params) {
 		// Parse query parameters
 		auto question_pos = url.find_first_of('?');
 		if (question_pos != string::npos) {
-			query_param = url.substr(question_pos + 1);
-			trimmed_s3_url = url.substr(0, question_pos);
+			auto candidate_query_param = url.substr(question_pos + 1);
+			if (ReadS3QueryParams(candidate_query_param, nullptr)) {
+				query_param = std::move(candidate_query_param);
+				trimmed_s3_url = url.substr(0, question_pos);
+			} else {
+				trimmed_s3_url = url;
+			}
 		} else {
 			trimmed_s3_url = url;
 		}
