@@ -234,17 +234,13 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRequest(FileHandle &handle, string u
 	    url, header_map, hfh.http_params,
 	    [&](const HTTPResponse &response) {
 		    if (static_cast<int>(response.status) >= 400) {
-			    string error =
-			        "HTTP GET error on '" + url + "' (HTTP " + to_string(static_cast<int>(response.status)) + ")";
-			    if (response.status == HTTPStatusCode::RangeNotSatisfiable_416) {
-				    error += " This could mean the file was changed. Try disabling the duckdb http metadata cache "
-				             "if enabled, and confirm the server supports range requests.";
-			    }
-			    throw HTTPException(error);
+			    throw GetHTTPError(handle, response, url);
 		    }
-		    if (hfh.http_params.s3_version_id_pinning && hfh.version_id.empty() &&
-		        response.HasHeader("x-amz-version-id")) {
-			    hfh.version_id = response.GetHeaderValue("x-amz-version-id");
+		    if (hfh.http_params.s3_version_id_pinning && response.HasHeader("x-amz-version-id")) {
+			    lock_guard<mutex> lck(hfh.mu);
+			    if (hfh.version_id.empty()) {
+				    hfh.version_id = response.GetHeaderValue("x-amz-version-id");
+			    }
 		    }
 		    return true;
 	    },
@@ -330,9 +326,11 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRangeRequest(FileHandle &handle, str
 				    }
 			    }
 
-			    if (hfh.http_params.s3_version_id_pinning && hfh.version_id.empty() &&
-			        response.HasHeader("x-amz-version-id")) {
-				    hfh.version_id = response.GetHeaderValue("x-amz-version-id");
+			    if (hfh.http_params.s3_version_id_pinning && response.HasHeader("x-amz-version-id")) {
+				    lock_guard<mutex> lck(hfh.mu);
+				    if (hfh.version_id.empty()) {
+					    hfh.version_id = response.GetHeaderValue("x-amz-version-id");
+				    }
 			    }
 
 			    if (response.HasHeader("Content-Length")) {
