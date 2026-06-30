@@ -407,7 +407,8 @@ bool S3FileHandle::TryRefreshAuthParams(const S3AuthParams &request_auth_params)
 		return false;
 	}
 	ReloadAuthParams(*client_context);
-	return true;
+	// If refresh recreated the same credentials, retrying the same failed request only repeats the auth failure.
+	return !S3AuthParamsMatch(auth_params, request_auth_params);
 }
 
 S3ConfigParams S3ConfigParams::ReadFrom(optional_ptr<FileOpener> opener) {
