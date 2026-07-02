@@ -1201,7 +1201,6 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 			const string http_query_param_for_url = "delete";
 			auto payload_hash = GetPayloadHash(const_cast<char *>(body.data()), body.length());
 
-			string bucket_url = url_info.prefix + bucket + "/";
 			string secret_lookup_url = secret_lookup_paths[batch_start];
 			string result;
 			unique_ptr<HTTPResponse> res;
