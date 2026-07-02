@@ -218,6 +218,18 @@ static S3RefreshableHTTPParams ReadRefreshableHTTPParams(optional_ptr<FileOpener
 	return SnapshotRefreshableHTTPParams(params->Cast<HTTPFSParams>());
 }
 
+static bool TryRefreshS3SecretForPath(ClientContext &context, const string &path) {
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	bool refreshed_secret = false;
+	for (const string type : {"s3", "r2", "gcs", "aws"}) {
+		auto res = context.db->GetSecretManager().LookupSecret(transaction, path, type);
+		if (res.HasMatch()) {
+			refreshed_secret |= CreateS3SecretFunctions::TryRefreshS3Secret(context, *res.secret_entry);
+		}
+	}
+	return refreshed_secret;
+}
+
 static void AddS3HTTPHeaders(HTTPFSParams &http_params, HTTPHeaders &headers) {
 	if (!http_params.user_agent.empty()) {
 		headers.Insert("User-Agent", http_params.user_agent);
@@ -614,15 +626,7 @@ bool S3FileHandle::TryRefreshAuthParams(S3AuthParams request_auth_params, S3Refr
 		return false;
 	}
 
-	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*context);
-	bool refreshed_secret = false;
-	for (const string type : {"s3", "r2", "gcs", "aws"}) {
-		auto res = context->db->GetSecretManager().LookupSecret(transaction, path, type);
-		if (res.HasMatch()) {
-			refreshed_secret |= CreateS3SecretFunctions::TryRefreshS3Secret(*context, *res.secret_entry);
-		}
-	}
-	if (!refreshed_secret) {
+	if (!TryRefreshS3SecretForPath(*context, path)) {
 		return false;
 	}
 	auto previous_region = auth_params.region;
@@ -662,15 +666,7 @@ bool S3HTTPInput::TryRefreshAuthParams(const string &path, S3AuthParams request_
 		return false;
 	}
 
-	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*context);
-	bool refreshed_secret = false;
-	for (const string type : {"s3", "r2", "gcs", "aws"}) {
-		auto res = context->db->GetSecretManager().LookupSecret(transaction, path, type);
-		if (res.HasMatch()) {
-			refreshed_secret |= CreateS3SecretFunctions::TryRefreshS3Secret(*context, *res.secret_entry);
-		}
-	}
-	if (!refreshed_secret) {
+	if (!TryRefreshS3SecretForPath(*context, path)) {
 		return false;
 	}
 	auto previous_region = auth_params.region;
@@ -696,15 +692,7 @@ static bool TryRefreshS3AuthParams(optional_ptr<FileOpener> opener, const string
 		return false;
 	}
 
-	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*context);
-	bool refreshed_secret = false;
-	for (const string type : {"s3", "r2", "gcs", "aws"}) {
-		auto res = context->db->GetSecretManager().LookupSecret(transaction, path, type);
-		if (res.HasMatch()) {
-			refreshed_secret |= CreateS3SecretFunctions::TryRefreshS3Secret(*context, *res.secret_entry);
-		}
-	}
-	if (!refreshed_secret) {
+	if (!TryRefreshS3SecretForPath(*context, path)) {
 		return false;
 	}
 
