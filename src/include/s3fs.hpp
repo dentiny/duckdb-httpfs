@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <exception>
 #include <iostream>
+#include <unordered_map>
 
 #undef RemoveDirectory
 
@@ -130,6 +131,17 @@ class S3FileSystem;
 class S3MultiPartUpload;
 class S3WriteBuffer;
 
+struct S3RefreshableHTTPParams {
+	string http_proxy;
+	idx_t http_proxy_port = 0;
+	string http_proxy_username;
+	string http_proxy_password;
+	unordered_map<string, string> extra_headers;
+	bool override_verify_ssl = false;
+	bool verify_ssl = true;
+	string bearer_token;
+};
+
 class S3FileHandle : public HTTPFileHandle {
 	friend class S3FileSystem;
 
@@ -150,8 +162,9 @@ public:
 protected:
 	void InitializeFromCacheEntry(const HTTPMetadataCacheEntry &cache_entry) override;
 	HTTPMetadataCacheEntry GetCacheEntry() const override;
-	bool TryRefreshAuthParams(S3AuthParams request_auth_params);
+	bool TryRefreshAuthParams(S3AuthParams request_auth_params, S3RefreshableHTTPParams request_http_params);
 	void ReloadAuthParams(ClientContext &context);
+	void ReloadHTTPParams(ClientContext &context);
 	void SetRegion(string region_p);
 
 protected:
@@ -192,7 +205,7 @@ public:
 	void FileSync(FileHandle &handle) override;
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 
-	void ReadQueryParams(const string &url_query_param, S3AuthParams &params);
+	static void ReadQueryParams(const string &url_query_param, S3AuthParams &params);
 	static ParsedS3Url S3UrlParse(string url, const S3AuthParams &params);
 
 	static string UrlEncode(const string &input, bool encode_slash = false);
@@ -239,7 +252,7 @@ protected:
 struct AWSListObjectV2 {
 	static string Request(const string &path, HTTPParams &http_params, S3AuthParams &s3_auth_params,
 	                      string &continuation_token, bool use_delimiter = false,
-	                      optional_idx max_keys = optional_idx());
+	                      optional_idx max_keys = optional_idx(), optional_ptr<FileOpener> opener = nullptr);
 	static void ParseFileList(string &aws_response, vector<OpenFileInfo> &result);
 	static vector<string> ParseCommonPrefix(string &aws_response);
 	static string ParseContinuationToken(string &aws_response);

@@ -157,6 +157,10 @@ static bool IsAuthRefreshStatus(const ErrorData &error) {
 	return entry->second == "401" || entry->second == "403";
 }
 
+static bool IsAuthRefreshStatus(const HTTPResponse &response) {
+	return response.status == HTTPStatusCode::Unauthorized_401 || response.status == HTTPStatusCode::Forbidden_403;
+}
+
 static bool S3AuthParamsMatch(const S3AuthParams &left, const S3AuthParams &right) {
 	return left.region == right.region && left.access_key_id == right.access_key_id &&
 	       left.secret_access_key == right.secret_access_key && left.session_token == right.session_token &&
@@ -166,24 +170,75 @@ static bool S3AuthParamsMatch(const S3AuthParams &left, const S3AuthParams &righ
 	       left.requester_pays == right.requester_pays && left.oauth2_bearer_token == right.oauth2_bearer_token;
 }
 
-struct S3GetRequestData {
+static S3RefreshableHTTPParams SnapshotRefreshableHTTPParams(const HTTPFSParams &params) {
+	S3RefreshableHTTPParams result;
+	result.http_proxy = params.http_proxy;
+	result.http_proxy_port = params.http_proxy.empty() ? 0 : params.http_proxy_port;
+	result.http_proxy_username = params.http_proxy_username;
+	result.http_proxy_password = params.http_proxy_password;
+	result.extra_headers = params.extra_headers;
+	result.override_verify_ssl = params.override_verify_ssl;
+	result.verify_ssl = params.verify_ssl;
+	result.bearer_token = params.bearer_token;
+	return result;
+}
+
+static void ApplyRefreshableHTTPParams(HTTPFSParams &target, const S3RefreshableHTTPParams &source) {
+	target.http_proxy = source.http_proxy;
+	target.http_proxy_port = source.http_proxy.empty() ? 0 : source.http_proxy_port;
+	target.http_proxy_username = source.http_proxy_username;
+	target.http_proxy_password = source.http_proxy_password;
+	target.extra_headers = source.extra_headers;
+	target.override_verify_ssl = source.override_verify_ssl;
+	target.verify_ssl = source.verify_ssl;
+	target.bearer_token = source.bearer_token;
+	target.pre_merged_headers = false;
+}
+
+static bool S3RefreshableHTTPParamsMatch(const S3RefreshableHTTPParams &left, const S3RefreshableHTTPParams &right) {
+	return left.http_proxy == right.http_proxy && left.http_proxy_port == right.http_proxy_port &&
+	       left.http_proxy_username == right.http_proxy_username &&
+	       left.http_proxy_password == right.http_proxy_password && left.extra_headers == right.extra_headers &&
+	       left.override_verify_ssl == right.override_verify_ssl && left.verify_ssl == right.verify_ssl &&
+	       left.bearer_token == right.bearer_token;
+}
+
+static S3AuthParams ReadS3AuthParams(optional_ptr<FileOpener> opener, const string &path) {
+	FileOpenerInfo info = {path};
+	auto auth_params = S3AuthParams::ReadFrom(opener, info);
+	auto parsed_url = S3FileSystem::S3UrlParse(path, auth_params);
+	S3FileSystem::ReadQueryParams(parsed_url.query_param, auth_params);
+	return auth_params;
+}
+
+static S3RefreshableHTTPParams ReadRefreshableHTTPParams(optional_ptr<FileOpener> opener, const string &path) {
+	FileOpenerInfo info = {path};
+	auto &http_util = HTTPFSUtil::GetHTTPUtil(opener);
+	auto params = http_util.InitializeParameters(opener, info);
+	return SnapshotRefreshableHTTPParams(params->Cast<HTTPFSParams>());
+}
+
+struct S3RequestData {
 	S3AuthParams auth_params;
+	S3RefreshableHTTPParams http_params;
 	string http_url;
 	HTTPHeaders headers;
 };
 
-static S3GetRequestData CreateS3GetRequestData(S3FileHandle &s3_handle, const string &s3_url) {
-	S3GetRequestData result;
+static S3RequestData CreateS3RequestData(S3FileHandle &s3_handle, const string &s3_url, const string &method,
+                                         bool use_version_id) {
+	S3RequestData result;
 	string version_id;
 	{
 		lock_guard<mutex> lck(s3_handle.mu);
 		result.auth_params = s3_handle.auth_params;
+		result.http_params = SnapshotRefreshableHTTPParams(s3_handle.http_params);
 		version_id = s3_handle.version_id;
 	}
 	auto parsed_s3_url = S3FileSystem::S3UrlParse(s3_url, result.auth_params);
 
 	string query_string;
-	if (!version_id.empty()) {
+	if (use_version_id && !version_id.empty()) {
 		query_string = "versionId=" + S3FileSystem::UrlEncode(version_id, true);
 	}
 
@@ -193,27 +248,32 @@ static S3GetRequestData CreateS3GetRequestData(S3FileHandle &s3_handle, const st
 		result.headers["Authorization"] = "Bearer " + result.auth_params.oauth2_bearer_token;
 		result.headers["Host"] = parsed_s3_url.host;
 	} else {
-		result.headers = CreateS3Header(parsed_s3_url.path, query_string, parsed_s3_url.host, "s3", "GET",
+		result.headers = CreateS3Header(parsed_s3_url.path, query_string, parsed_s3_url.host, "s3", method,
 		                                result.auth_params, "", "", "", "");
 	}
 	return result;
 }
 
 template <class REQUEST, class REFRESH>
-static unique_ptr<HTTPResponse> RunS3GetRequestWithAuthRefresh(S3FileHandle &s3_handle, const string &s3_url,
-                                                               REQUEST request, REFRESH refresh_auth_params) {
-	auto request_data = CreateS3GetRequestData(s3_handle, s3_url);
+static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefresh(S3FileHandle &s3_handle, const string &s3_url,
+                                                            const string &method, bool use_version_id, REQUEST request,
+                                                            REFRESH refresh_auth_params) {
+	auto request_data = CreateS3RequestData(s3_handle, s3_url, method, use_version_id);
 
 	try {
-		return request(request_data);
+		auto result = request(request_data);
+		if (!result || !IsAuthRefreshStatus(*result) ||
+		    !refresh_auth_params(request_data.auth_params, request_data.http_params)) {
+			return result;
+		}
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
-		if (!IsAuthRefreshStatus(error) || !refresh_auth_params(request_data.auth_params)) {
+		if (!IsAuthRefreshStatus(error) || !refresh_auth_params(request_data.auth_params, request_data.http_params)) {
 			throw;
 		}
 	}
 
-	request_data = CreateS3GetRequestData(s3_handle, s3_url);
+	request_data = CreateS3RequestData(s3_handle, s3_url, method, use_version_id);
 	return request(request_data);
 }
 
@@ -399,14 +459,20 @@ void S3FileHandle::SetRegion(string region_p) {
 
 void S3FileHandle::ReloadAuthParams(ClientContext &context) {
 	ClientContextFileOpener opener(context);
-	FileOpenerInfo info = {path};
-	auth_params = S3AuthParams::ReadFrom(opener, info);
+	auth_params = ReadS3AuthParams(opener, path);
 	client_cache.Clear();
 }
 
-bool S3FileHandle::TryRefreshAuthParams(S3AuthParams request_auth_params) {
+void S3FileHandle::ReloadHTTPParams(ClientContext &context) {
+	ClientContextFileOpener opener(context);
+	ApplyRefreshableHTTPParams(http_params, ReadRefreshableHTTPParams(opener, path));
+	client_cache.Clear();
+}
+
+bool S3FileHandle::TryRefreshAuthParams(S3AuthParams request_auth_params, S3RefreshableHTTPParams request_http_params) {
 	lock_guard<mutex> lck(mu);
-	if (!S3AuthParamsMatch(auth_params, request_auth_params)) {
+	if (!S3AuthParamsMatch(auth_params, request_auth_params) ||
+	    !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(http_params), request_http_params)) {
 		return true;
 	}
 	auto context = client_context.lock();
@@ -426,8 +492,41 @@ bool S3FileHandle::TryRefreshAuthParams(S3AuthParams request_auth_params) {
 		return false;
 	}
 	ReloadAuthParams(*context);
-	// If refresh recreated the same credentials, retrying the same failed request only repeats the auth failure.
-	return !S3AuthParamsMatch(auth_params, request_auth_params);
+	ReloadHTTPParams(*context);
+	// If refresh recreated the same request material, retrying the same failed request only repeats the auth failure.
+	return !S3AuthParamsMatch(auth_params, request_auth_params) ||
+	       !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(http_params), request_http_params);
+}
+
+static bool TryRefreshS3AuthParams(optional_ptr<FileOpener> opener, const string &path, HTTPParams &http_params,
+                                   S3AuthParams &auth_params, const S3AuthParams &request_auth_params,
+                                   const S3RefreshableHTTPParams &request_http_params) {
+	auto &httpfs_params = http_params.Cast<HTTPFSParams>();
+	if (!S3AuthParamsMatch(auth_params, request_auth_params) ||
+	    !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(httpfs_params), request_http_params)) {
+		return true;
+	}
+	auto context = FileOpener::TryGetClientContext(opener);
+	if (!context) {
+		return false;
+	}
+
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*context);
+	bool refreshed_secret = false;
+	for (const string type : {"s3", "r2", "gcs", "aws"}) {
+		auto res = context->db->GetSecretManager().LookupSecret(transaction, path, type);
+		if (res.HasMatch()) {
+			refreshed_secret |= CreateS3SecretFunctions::TryRefreshS3Secret(*context, *res.secret_entry);
+		}
+	}
+	if (!refreshed_secret) {
+		return false;
+	}
+
+	auth_params = ReadS3AuthParams(opener, path);
+	ApplyRefreshableHTTPParams(httpfs_params, ReadRefreshableHTTPParams(opener, path));
+	return !S3AuthParamsMatch(auth_params, request_auth_params) ||
+	       !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(httpfs_params), request_http_params);
 }
 
 S3ConfigParams S3ConfigParams::ReadFrom(optional_ptr<FileOpener> opener) {
@@ -686,47 +785,40 @@ unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPInput &input, string url, 
 
 unique_ptr<HTTPResponse> S3FileSystem::HeadRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
-	S3AuthParams auth_params;
-	{
-		lock_guard<mutex> lck(s3_handle.mu);
-		auth_params = s3_handle.auth_params;
-	}
-	auto parsed_s3_url = S3UrlParse(s3_url, auth_params);
-	string http_url = parsed_s3_url.GetHTTPUrl(auth_params);
-
-	HTTPHeaders headers;
-	if (IsGCSRequest(s3_url) && !auth_params.oauth2_bearer_token.empty()) {
-		// Use bearer token for GCS
-		headers["Authorization"] = "Bearer " + auth_params.oauth2_bearer_token;
-		headers["Host"] = parsed_s3_url.host;
-	} else {
-		// Use existing S3 authentication
-		headers = CreateS3Header(parsed_s3_url.path, "", parsed_s3_url.host, "s3", "HEAD", auth_params, "", "", "", "");
-	}
-
-	return HTTPFileSystem::HeadRequest(handle, http_url, headers);
+	return RunS3RequestWithAuthRefresh(
+	    s3_handle, s3_url, "HEAD", false,
+	    [&](const S3RequestData &request_data) {
+		    return HTTPFileSystem::HeadRequest(handle, request_data.http_url, request_data.headers);
+	    },
+	    [&](const S3AuthParams &request_auth_params, const S3RefreshableHTTPParams &request_http_params) {
+		    return s3_handle.TryRefreshAuthParams(request_auth_params, request_http_params);
+	    });
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
-	return RunS3GetRequestWithAuthRefresh(
-	    s3_handle, s3_url,
-	    [&](const S3GetRequestData &request_data) {
+	return RunS3RequestWithAuthRefresh(
+	    s3_handle, s3_url, "GET", true,
+	    [&](const S3RequestData &request_data) {
 		    return HTTPFileSystem::GetRequest(handle, request_data.http_url, request_data.headers);
 	    },
-	    [&](const S3AuthParams &request_auth_params) { return s3_handle.TryRefreshAuthParams(request_auth_params); });
+	    [&](const S3AuthParams &request_auth_params, const S3RefreshableHTTPParams &request_http_params) {
+		    return s3_handle.TryRefreshAuthParams(request_auth_params, request_http_params);
+	    });
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
                                                        idx_t file_offset, char *buffer_out, idx_t buffer_out_len) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
-	return RunS3GetRequestWithAuthRefresh(
-	    s3_handle, s3_url,
-	    [&](const S3GetRequestData &request_data) {
+	return RunS3RequestWithAuthRefresh(
+	    s3_handle, s3_url, "GET", true,
+	    [&](const S3RequestData &request_data) {
 		    return HTTPFileSystem::GetRangeRequest(handle, request_data.http_url, request_data.headers, file_offset,
 		                                           buffer_out, buffer_out_len);
 	    },
-	    [&](const S3AuthParams &request_auth_params) { return s3_handle.TryRefreshAuthParams(request_auth_params); });
+	    [&](const S3AuthParams &request_auth_params, const S3RefreshableHTTPParams &request_http_params) {
+		    return s3_handle.TryRefreshAuthParams(request_auth_params, request_http_params);
+	    });
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
@@ -798,7 +890,7 @@ void S3FileHandle::Initialize(optional_ptr<FileOpener> opener) {
 		ErrorData error(ex);
 		bool refreshed_secret = false;
 		if (error.Type() == ExceptionType::IO || error.Type() == ExceptionType::HTTP) {
-			refreshed_secret = TryRefreshAuthParams(auth_params);
+			refreshed_secret = TryRefreshAuthParams(auth_params, SnapshotRefreshableHTTPParams(http_params));
 		}
 		string correct_region;
 		if (!refreshed_secret) {
@@ -1145,7 +1237,7 @@ bool S3GlobResult::ExpandNextPath() const {
 		if (is_match) {
 			prefix_path = S3FileSystem::UrlDecode(prefix_path);
 			auto prefix_res = AWSListObjectV2::Request(prefix_path, *http_params, s3_auth_params,
-			                                           common_prefix_continuation_token, true);
+			                                           common_prefix_continuation_token, true, optional_idx(), opener);
 
 			AWSListObjectV2::ParseFileList(prefix_res, s3_keys);
 			auto more_prefixes = AWSListObjectV2::ParseCommonPrefix(prefix_res);
@@ -1184,8 +1276,9 @@ bool S3GlobResult::ExpandNextPath() const {
 		bool perform_listing = (glob_type != GlobType::HIERARCHICAL);
 
 		// First perform listing once (default will get back up to 1000 elements)
-		string response_str = AWSListObjectV2::Request(shared_path, *http_params, s3_auth_params,
-		                                               main_continuation_token, !perform_listing);
+		string response_str =
+		    AWSListObjectV2::Request(shared_path, *http_params, s3_auth_params, main_continuation_token,
+		                             !perform_listing, optional_idx(), opener);
 
 		string next_continuation_token = AWSListObjectV2::ParseContinuationToken(response_str);
 
@@ -1215,8 +1308,8 @@ bool S3GlobResult::ExpandNextPath() const {
 				// 1. clear keys
 				s3_keys_tmp.clear();
 				// 2. do request again, now passing true
-				response_str =
-				    AWSListObjectV2::Request(shared_path, *http_params, s3_auth_params, main_continuation_token, true);
+				response_str = AWSListObjectV2::Request(shared_path, *http_params, s3_auth_params,
+				                                        main_continuation_token, true, optional_idx(), opener);
 
 				// 3. now set next_continuation_token
 				next_continuation_token = AWSListObjectV2::ParseContinuationToken(response_str);
@@ -1432,9 +1525,14 @@ HTTPException S3FileSystem::GetHTTPError(FileHandle &handle, const HTTPResponse 
 }
 
 string AWSListObjectV2::Request(const string &path, HTTPParams &http_params, S3AuthParams &s3_auth_params,
-                                string &continuation_token, bool use_delimiter, optional_idx max_keys) {
-	const idx_t MAX_RETRIES = 1;
+                                string &continuation_token, bool use_delimiter, optional_idx max_keys,
+                                optional_ptr<FileOpener> opener) {
+	const idx_t MAX_RETRIES = 2;
+	bool retried_auth_refresh = false;
+	bool retried_region = false;
 	for (idx_t it = 0; it <= MAX_RETRIES; it++) {
+		auto request_auth_params = s3_auth_params;
+		auto request_http_params = SnapshotRefreshableHTTPParams(http_params.Cast<HTTPFSParams>());
 		auto parsed_url = S3FileSystem::S3UrlParse(path, s3_auth_params);
 
 		// Construct the ListObjectsV2 call
@@ -1503,7 +1601,7 @@ string AWSListObjectV2::Request(const string &path, HTTPParams &http_params, S3A
 		string updated_bucket_region;
 		if (result->status == HTTPStatusCode::MovedPermanently_301) {
 			string moved_error;
-			if (it == 0 && result->HasHeader("x-amz-bucket-region")) {
+			if (!retried_region && result->HasHeader("x-amz-bucket-region")) {
 				auto response_region = result->GetHeaderValue("x-amz-bucket-region");
 				if (response_region == s3_auth_params.region) {
 					moved_error = "suggested region \"" + response_region +
@@ -1519,7 +1617,13 @@ string AWSListObjectV2::Request(const string &path, HTTPParams &http_params, S3A
 			}
 		}
 		if (error.HasError()) {
-			if (it == 0 && result->HasHeader("x-amz-bucket-region")) {
+			if (!retried_auth_refresh && IsAuthRefreshStatus(error) &&
+			    TryRefreshS3AuthParams(opener, path, http_params, s3_auth_params, request_auth_params,
+			                           request_http_params)) {
+				retried_auth_refresh = true;
+				continue;
+			}
+			if (!retried_region && result->HasHeader("x-amz-bucket-region")) {
 				auto response_region = result->GetHeaderValue("x-amz-bucket-region");
 				if (response_region != s3_auth_params.region) {
 					updated_bucket_region = response_region;
@@ -1539,12 +1643,13 @@ string AWSListObjectV2::Request(const string &path, HTTPParams &http_params, S3A
 
 			// bucket region was updated - update and re-run the request against the correct endpoint
 			s3_auth_params.SetRegion(std::move(updated_bucket_region));
+			retried_region = true;
 			continue;
 		}
 		return response.str();
 	}
 	throw InvalidInputException(
-	    "Exceeded retry count in AWSListObjectV2::Request - this means we got multiple redirects to different regions");
+	    "Exceeded retry count in AWSListObjectV2::Request while retrying region redirects or credential refresh");
 }
 
 void AWSListObjectV2::ParseFileList(string &aws_response, vector<OpenFileInfo> &result) {
