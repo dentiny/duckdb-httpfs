@@ -150,7 +150,7 @@ public:
 protected:
 	void InitializeFromCacheEntry(const HTTPMetadataCacheEntry &cache_entry) override;
 	HTTPMetadataCacheEntry GetCacheEntry() const override;
-	bool TryRefreshAuthParams(const S3AuthParams &request_auth_params);
+	bool TryRefreshAuthParams(S3AuthParams request_auth_params);
 	void ReloadAuthParams(ClientContext &context);
 	void SetRegion(string region_p);
 

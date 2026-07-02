@@ -404,7 +404,7 @@ void S3FileHandle::ReloadAuthParams(ClientContext &context) {
 	client_cache.Clear();
 }
 
-bool S3FileHandle::TryRefreshAuthParams(const S3AuthParams &request_auth_params) {
+bool S3FileHandle::TryRefreshAuthParams(S3AuthParams request_auth_params) {
 	lock_guard<mutex> lck(mu);
 	if (!S3AuthParamsMatch(auth_params, request_auth_params)) {
 		return true;
