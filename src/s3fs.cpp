@@ -235,7 +235,7 @@ static bool TryRefreshS3AuthMaterial(ClientContext *context, optional_ptr<FileOp
                                      S3AuthParams &auth_params, HTTPFSParams &http_params,
                                      const S3AuthParams &request_auth_params,
                                      const S3RefreshableHTTPParams &request_http_params,
-                                     HTTPClientCache *client_cache = nullptr) {
+                                     HTTPClientCache *client_cache = nullptr, bool preserve_region = false) {
 	if (!S3AuthParamsMatch(auth_params, request_auth_params) ||
 	    !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(http_params), request_http_params)) {
 		return true;
@@ -249,7 +249,7 @@ static bool TryRefreshS3AuthMaterial(ClientContext *context, optional_ptr<FileOp
 
 	auto previous_region = auth_params.region;
 	auth_params = ReadS3AuthParams(opener, path);
-	if (!previous_region.empty() && auth_params.region != previous_region) {
+	if (preserve_region && !previous_region.empty() && auth_params.region != previous_region) {
 		auth_params.SetRegion(std::move(previous_region));
 	}
 	ApplyRefreshableHTTPParams(http_params, ReadRefreshableHTTPParams(opener, path));
@@ -643,6 +643,7 @@ S3FileHandle::~S3FileHandle() {
 void S3FileHandle::SetRegion(string region_p) {
 	lock_guard<mutex> lck(mu);
 	auth_params.SetRegion(std::move(region_p));
+	region_redirected = true;
 	client_cache.Clear();
 }
 
@@ -651,15 +652,16 @@ bool S3FileHandle::TryRefreshAuthParams(S3AuthParams request_auth_params, S3Refr
 	auto context = client_context.lock();
 	if (!context) {
 		return TryRefreshS3AuthMaterial(nullptr, nullptr, path, auth_params, http_params, request_auth_params,
-		                                request_http_params, &client_cache);
+		                                request_http_params, &client_cache, region_redirected);
 	}
 	ClientContextFileOpener opener(*context);
 	return TryRefreshS3AuthMaterial(context.get(), opener, path, auth_params, http_params, request_auth_params,
-	                                request_http_params, &client_cache);
+	                                request_http_params, &client_cache, region_redirected);
 }
 
 void S3HTTPInput::SetRegion(string region_p) {
 	auth_params.SetRegion(std::move(region_p));
+	region_redirected = true;
 }
 
 bool S3HTTPInput::TryRefreshAuthParams(const string &path, S3AuthParams request_auth_params,
@@ -668,20 +670,20 @@ bool S3HTTPInput::TryRefreshAuthParams(const string &path, S3AuthParams request_
 	auto context = client_context.lock();
 	if (!context) {
 		return TryRefreshS3AuthMaterial(nullptr, nullptr, path, auth_params, http_params, request_auth_params,
-		                                request_http_params);
+		                                request_http_params, nullptr, region_redirected);
 	}
 	ClientContextFileOpener opener(*context);
 	return TryRefreshS3AuthMaterial(context.get(), opener, path, auth_params, http_params, request_auth_params,
-	                                request_http_params);
+	                                request_http_params, nullptr, region_redirected);
 }
 
 static bool TryRefreshS3AuthParams(optional_ptr<FileOpener> opener, const string &path, HTTPParams &http_params,
                                    S3AuthParams &auth_params, const S3AuthParams &request_auth_params,
-                                   const S3RefreshableHTTPParams &request_http_params) {
+                                   const S3RefreshableHTTPParams &request_http_params, bool preserve_region = false) {
 	auto &httpfs_params = http_params.Cast<HTTPFSParams>();
 	auto context = FileOpener::TryGetClientContext(opener);
 	return TryRefreshS3AuthMaterial(context.get(), opener, path, auth_params, httpfs_params, request_auth_params,
-	                                request_http_params);
+	                                request_http_params, nullptr, preserve_region);
 }
 
 S3ConfigParams S3ConfigParams::ReadFrom(optional_ptr<FileOpener> opener) {
@@ -1173,12 +1175,77 @@ static void AddDeleteBatchHTTPKeyParts(S3DeleteBatchKeyBuilder &key_builder,
 	}
 }
 
+static void AddDeleteBatchSecretKeyParts(S3DeleteBatchKeyBuilder &key_builder, const SecretEntry &secret_entry) {
+	auto &secret = *secret_entry.secret;
+	key_builder.AddString(secret.GetType());
+	key_builder.AddString(secret.GetProvider());
+	key_builder.AddString(secret.GetName());
+	key_builder.AddString(secret_entry.storage_mode);
+	key_builder.AddIndex(static_cast<idx_t>(secret_entry.persist_type));
+	key_builder.AddIndex(secret.GetScope().size());
+	for (auto &scope : secret.GetScope()) {
+		key_builder.AddString(scope);
+	}
+}
+
+static void AddDeleteBatchSelectedSecretKeyParts(S3DeleteBatchKeyBuilder &key_builder, optional_ptr<FileOpener> opener,
+                                                 const string &path) {
+	auto secret_manager = FileOpener::TryGetSecretManager(opener);
+	auto transaction = FileOpener::TryGetCatalogTransaction(opener);
+	if (!secret_manager || !transaction) {
+		key_builder.AddString("");
+		return;
+	}
+
+	for (const string type : {"s3", "r2", "gcs", "aws"}) {
+		key_builder.AddString(type);
+		auto match = secret_manager->LookupSecret(*transaction, path, type);
+		if (!match.HasMatch()) {
+			key_builder.AddString("");
+			continue;
+		}
+		key_builder.AddIndex(static_cast<idx_t>(match.score));
+		AddDeleteBatchSecretKeyParts(key_builder, *match.secret_entry);
+	}
+}
+
+static string GetDeleteBatchLookupDirectory(const string &path) {
+	auto slash_pos = path.rfind('/');
+	if (slash_pos == string::npos) {
+		return path;
+	}
+	return path.substr(0, slash_pos + 1);
+}
+
+static bool HasRefreshableS3Secret(optional_ptr<FileOpener> opener, const string &path) {
+	if (!opener) {
+		return false;
+	}
+	const char *secret_types[] = {"s3", "r2", "gcs", "aws"};
+	FileOpenerInfo info = {path};
+	KeyValueSecretReader secret_reader(*opener, info, secret_types, 4);
+	Value refresh_info;
+	return secret_reader.TryGetSecretKey("refresh_info", refresh_info);
+}
+
+static void AddDeleteBatchRefreshKeyParts(S3DeleteBatchKeyBuilder &key_builder, optional_ptr<FileOpener> opener,
+                                          const string &path) {
+	if (HasRefreshableS3Secret(opener, path)) {
+		key_builder.AddString(GetDeleteBatchLookupDirectory(path));
+	} else {
+		key_builder.AddString("");
+	}
+}
+
 static string CreateDeleteBatchKey(const S3DeleteBatchUrlInfo &url_info,
-                                   const S3RefreshableHTTPParams &refreshable_http_params) {
+                                   const S3RefreshableHTTPParams &refreshable_http_params,
+                                   optional_ptr<FileOpener> opener, const string &path) {
 	S3DeleteBatchKeyBuilder key_builder;
 	AddDeleteBatchUrlKeyParts(key_builder, url_info);
 	AddDeleteBatchAuthKeyParts(key_builder, url_info.auth_params);
 	AddDeleteBatchHTTPKeyParts(key_builder, refreshable_http_params);
+	AddDeleteBatchSelectedSecretKeyParts(key_builder, opener, path);
+	AddDeleteBatchRefreshKeyParts(key_builder, opener, path);
 	return key_builder.Build();
 }
 
@@ -1202,7 +1269,7 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 		S3DeleteBatchUrlInfo url_info = {parsed_url.prefix, parsed_url.http_proto, parsed_url.host, bucket_path,
 		                                 auth_params};
 		auto refreshable_http_params = ReadRefreshableHTTPParams(opener, path);
-		auto batch_key = CreateDeleteBatchKey(url_info, refreshable_http_params);
+		auto batch_key = CreateDeleteBatchKey(url_info, refreshable_http_params, opener, path);
 		auto entry = delete_batches.find(batch_key);
 		if (entry == delete_batches.end()) {
 			S3DeleteBatch batch;
@@ -1844,7 +1911,7 @@ string AWSListObjectV2::Request(const string &path, HTTPParams &http_params, S3A
 		if (error.HasError()) {
 			if (!retried_auth_refresh && IsAuthRefreshStatus(error) &&
 			    TryRefreshS3AuthParams(opener, path, http_params, s3_auth_params, request_auth_params,
-			                           request_http_params)) {
+			                           request_http_params, retried_region)) {
 				retried_auth_refresh = true;
 				continue;
 			}

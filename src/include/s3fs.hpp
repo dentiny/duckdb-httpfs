@@ -144,6 +144,7 @@ private:
 	//! Credential refresh helpers used by S3 write/multipart request retries.
 	mutex mu;
 	weak_ptr<ClientContext> client_context;
+	bool region_redirected = false;
 
 	bool TryRefreshAuthParams(const string &path, S3AuthParams request_auth_params,
 	                          S3RefreshableHTTPParams request_http_params);
@@ -181,6 +182,7 @@ private:
 	void SetRegion(string region_p);
 
 	weak_ptr<ClientContext> client_context;
+	bool region_redirected = false;
 };
 
 class S3FileSystem : public HTTPFileSystem {
