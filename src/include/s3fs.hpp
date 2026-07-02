@@ -5,6 +5,7 @@
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -157,7 +158,7 @@ protected:
 	unique_ptr<HTTPClient> CreateClient() override;
 
 private:
-	optional_ptr<ClientContext> client_context;
+	weak_ptr<ClientContext> client_context;
 };
 
 class S3FileSystem : public HTTPFileSystem {

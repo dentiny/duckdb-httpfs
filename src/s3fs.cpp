@@ -199,6 +199,24 @@ static S3GetRequestData CreateS3GetRequestData(S3FileHandle &s3_handle, const st
 	return result;
 }
 
+template <class REQUEST, class REFRESH>
+static unique_ptr<HTTPResponse> RunS3GetRequestWithAuthRefresh(S3FileHandle &s3_handle, const string &s3_url,
+                                                               REQUEST request, REFRESH refresh_auth_params) {
+	auto request_data = CreateS3GetRequestData(s3_handle, s3_url);
+
+	try {
+		return request(request_data);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		if (!IsAuthRefreshStatus(error) || !refresh_auth_params(request_data.auth_params)) {
+			throw;
+		}
+	}
+
+	request_data = CreateS3GetRequestData(s3_handle, s3_url);
+	return request(request_data);
+}
+
 void AWSEnvironmentCredentialsProvider::SetExtensionOptionValue(string key, const char *env_var_name) {
 	char *evar;
 
@@ -391,22 +409,23 @@ bool S3FileHandle::TryRefreshAuthParams(const S3AuthParams &request_auth_params)
 	if (!S3AuthParamsMatch(auth_params, request_auth_params)) {
 		return true;
 	}
-	if (!client_context) {
+	auto context = client_context.lock();
+	if (!context) {
 		return false;
 	}
 
-	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*client_context);
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*context);
 	bool refreshed_secret = false;
 	for (const string type : {"s3", "r2", "gcs", "aws"}) {
-		auto res = client_context->db->GetSecretManager().LookupSecret(transaction, path, type);
+		auto res = context->db->GetSecretManager().LookupSecret(transaction, path, type);
 		if (res.HasMatch()) {
-			refreshed_secret |= CreateS3SecretFunctions::TryRefreshS3Secret(*client_context, *res.secret_entry);
+			refreshed_secret |= CreateS3SecretFunctions::TryRefreshS3Secret(*context, *res.secret_entry);
 		}
 	}
 	if (!refreshed_secret) {
 		return false;
 	}
-	ReloadAuthParams(*client_context);
+	ReloadAuthParams(*context);
 	// If refresh recreated the same credentials, retrying the same failed request only repeats the auth failure.
 	return !S3AuthParamsMatch(auth_params, request_auth_params);
 }
@@ -690,39 +709,24 @@ unique_ptr<HTTPResponse> S3FileSystem::HeadRequest(FileHandle &handle, string s3
 
 unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
-	auto request_data = CreateS3GetRequestData(s3_handle, s3_url);
-
-	try {
-		return HTTPFileSystem::GetRequest(handle, request_data.http_url, request_data.headers);
-	} catch (std::exception &ex) {
-		ErrorData error(ex);
-		if (!IsAuthRefreshStatus(error) || !s3_handle.TryRefreshAuthParams(request_data.auth_params)) {
-			throw;
-		}
-	}
-
-	request_data = CreateS3GetRequestData(s3_handle, s3_url);
-	return HTTPFileSystem::GetRequest(handle, request_data.http_url, request_data.headers);
+	return RunS3GetRequestWithAuthRefresh(
+	    s3_handle, s3_url,
+	    [&](const S3GetRequestData &request_data) {
+		    return HTTPFileSystem::GetRequest(handle, request_data.http_url, request_data.headers);
+	    },
+	    [&](const S3AuthParams &request_auth_params) { return s3_handle.TryRefreshAuthParams(request_auth_params); });
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
                                                        idx_t file_offset, char *buffer_out, idx_t buffer_out_len) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
-	auto request_data = CreateS3GetRequestData(s3_handle, s3_url);
-
-	try {
-		return HTTPFileSystem::GetRangeRequest(handle, request_data.http_url, request_data.headers, file_offset,
-		                                       buffer_out, buffer_out_len);
-	} catch (std::exception &ex) {
-		ErrorData error(ex);
-		if (!IsAuthRefreshStatus(error) || !s3_handle.TryRefreshAuthParams(request_data.auth_params)) {
-			throw;
-		}
-	}
-
-	request_data = CreateS3GetRequestData(s3_handle, s3_url);
-	return HTTPFileSystem::GetRangeRequest(handle, request_data.http_url, request_data.headers, file_offset, buffer_out,
-	                                       buffer_out_len);
+	return RunS3GetRequestWithAuthRefresh(
+	    s3_handle, s3_url,
+	    [&](const S3GetRequestData &request_data) {
+		    return HTTPFileSystem::GetRangeRequest(handle, request_data.http_url, request_data.headers, file_offset,
+		                                           buffer_out, buffer_out_len);
+	    },
+	    [&](const S3AuthParams &request_auth_params) { return s3_handle.TryRefreshAuthParams(request_auth_params); });
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
@@ -782,7 +786,12 @@ HTTPMetadataCacheEntry S3FileHandle::GetCacheEntry() const {
 }
 
 void S3FileHandle::Initialize(optional_ptr<FileOpener> opener) {
-	client_context = FileOpener::TryGetClientContext(opener);
+	auto context = FileOpener::TryGetClientContext(opener);
+	if (context) {
+		client_context = context->shared_from_this();
+	} else {
+		client_context.reset();
+	}
 	try {
 		HTTPFileHandle::Initialize(opener);
 	} catch (std::exception &ex) {
