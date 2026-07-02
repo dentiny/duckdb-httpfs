@@ -147,8 +147,6 @@ private:
 
 	bool TryRefreshAuthParams(const string &path, S3AuthParams request_auth_params,
 	                          S3RefreshableHTTPParams request_http_params);
-	void ReloadAuthParams(ClientContext &context, const string &path);
-	void ReloadHTTPParams(ClientContext &context, const string &path);
 	void SetRegion(string region_p);
 };
 
@@ -180,8 +178,6 @@ protected:
 private:
 	//! Credential refresh helpers used by S3 read request retries.
 	bool TryRefreshAuthParams(S3AuthParams request_auth_params, S3RefreshableHTTPParams request_http_params);
-	void ReloadAuthParams(ClientContext &context);
-	void ReloadHTTPParams(ClientContext &context);
 	void SetRegion(string region_p);
 
 	weak_ptr<ClientContext> client_context;

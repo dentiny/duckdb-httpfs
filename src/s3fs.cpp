@@ -230,6 +230,36 @@ static bool TryRefreshS3SecretForPath(ClientContext &context, const string &path
 	return refreshed_secret;
 }
 
+static bool TryRefreshS3AuthMaterial(ClientContext *context, optional_ptr<FileOpener> opener, const string &path,
+                                     S3AuthParams &auth_params, HTTPFSParams &http_params,
+                                     const S3AuthParams &request_auth_params,
+                                     const S3RefreshableHTTPParams &request_http_params,
+                                     HTTPClientCache *client_cache = nullptr) {
+	if (!S3AuthParamsMatch(auth_params, request_auth_params) ||
+	    !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(http_params), request_http_params)) {
+		return true;
+	}
+	if (!context) {
+		return false;
+	}
+	if (!TryRefreshS3SecretForPath(*context, path)) {
+		return false;
+	}
+
+	auto previous_region = auth_params.region;
+	auth_params = ReadS3AuthParams(opener, path);
+	if (!previous_region.empty() && auth_params.region != previous_region) {
+		auth_params.SetRegion(std::move(previous_region));
+	}
+	ApplyRefreshableHTTPParams(http_params, ReadRefreshableHTTPParams(opener, path));
+	if (client_cache) {
+		client_cache->Clear();
+	}
+	// If refresh recreated the same request material, retrying the same failed request only repeats the auth failure.
+	return !S3AuthParamsMatch(auth_params, request_auth_params) ||
+	       !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(http_params), request_http_params);
+}
+
 static void AddS3HTTPHeaders(HTTPFSParams &http_params, HTTPHeaders &headers) {
 	if (!http_params.user_agent.empty()) {
 		headers.Insert("User-Agent", http_params.user_agent);
@@ -340,6 +370,8 @@ template <class CREATE_DATA, class REQUEST, class REFRESH, class SET_REGION>
 static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefreshInternal(const string &s3_url, CREATE_DATA create_data,
                                                                     REQUEST request, REFRESH refresh_auth_params,
                                                                     SET_REGION set_region) {
+	// create_data snapshots signed request material, request sends it,
+	// refresh_auth_params reloads changed credentials, and set_region handles region redirects.
 	bool retried_auth_refresh = false;
 	bool retried_region = false;
 	for (idx_t attempt = 0; attempt < 3; attempt++) {
@@ -404,6 +436,8 @@ template <class REQUEST>
 unique_ptr<HTTPResponse> S3FileSystem::RunS3HandleRequestWithAuthRefresh(S3FileHandle &s3_handle, const string &s3_url,
                                                                          const string &method, bool use_version_id,
                                                                          REQUEST request) {
+	// Use cloned params and fresh clients for retries: an in-flight old client can otherwise be returned to the
+	// handle cache after another thread refreshes auth/proxy material.
 	return RunS3RequestWithAuthRefreshInternal(
 	    s3_url, [&]() { return CreateS3HandleRequestData(s3_handle, s3_url, method, use_version_id); }, request,
 	    [&](const S3AuthParams &request_auth_params, const S3RefreshableHTTPParams &request_http_params) {
@@ -603,107 +637,42 @@ void S3FileHandle::SetRegion(string region_p) {
 	client_cache.Clear();
 }
 
-void S3FileHandle::ReloadAuthParams(ClientContext &context) {
-	ClientContextFileOpener opener(context);
-	auth_params = ReadS3AuthParams(opener, path);
-	client_cache.Clear();
-}
-
-void S3FileHandle::ReloadHTTPParams(ClientContext &context) {
-	ClientContextFileOpener opener(context);
-	ApplyRefreshableHTTPParams(http_params, ReadRefreshableHTTPParams(opener, path));
-	client_cache.Clear();
-}
-
 bool S3FileHandle::TryRefreshAuthParams(S3AuthParams request_auth_params, S3RefreshableHTTPParams request_http_params) {
 	lock_guard<mutex> lck(mu);
-	if (!S3AuthParamsMatch(auth_params, request_auth_params) ||
-	    !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(http_params), request_http_params)) {
-		return true;
-	}
 	auto context = client_context.lock();
 	if (!context) {
-		return false;
+		return TryRefreshS3AuthMaterial(nullptr, nullptr, path, auth_params, http_params, request_auth_params,
+		                                request_http_params, &client_cache);
 	}
-
-	if (!TryRefreshS3SecretForPath(*context, path)) {
-		return false;
-	}
-	auto previous_region = auth_params.region;
-	ReloadAuthParams(*context);
-	if (!previous_region.empty() && auth_params.region != previous_region) {
-		auth_params.SetRegion(std::move(previous_region));
-	}
-	ReloadHTTPParams(*context);
-	// If refresh recreated the same request material, retrying the same failed request only repeats the auth failure.
-	return !S3AuthParamsMatch(auth_params, request_auth_params) ||
-	       !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(http_params), request_http_params);
+	ClientContextFileOpener opener(*context);
+	return TryRefreshS3AuthMaterial(context.get(), opener, path, auth_params, http_params, request_auth_params,
+	                                request_http_params, &client_cache);
 }
 
 void S3HTTPInput::SetRegion(string region_p) {
 	auth_params.SetRegion(std::move(region_p));
 }
 
-void S3HTTPInput::ReloadAuthParams(ClientContext &context, const string &path) {
-	ClientContextFileOpener opener(context);
-	auth_params = ReadS3AuthParams(opener, path);
-}
-
-void S3HTTPInput::ReloadHTTPParams(ClientContext &context, const string &path) {
-	ClientContextFileOpener opener(context);
-	ApplyRefreshableHTTPParams(http_params, ReadRefreshableHTTPParams(opener, path));
-}
-
 bool S3HTTPInput::TryRefreshAuthParams(const string &path, S3AuthParams request_auth_params,
                                        S3RefreshableHTTPParams request_http_params) {
 	lock_guard<mutex> lck(mu);
-	if (!S3AuthParamsMatch(auth_params, request_auth_params) ||
-	    !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(http_params), request_http_params)) {
-		return true;
-	}
 	auto context = client_context.lock();
 	if (!context) {
-		return false;
+		return TryRefreshS3AuthMaterial(nullptr, nullptr, path, auth_params, http_params, request_auth_params,
+		                                request_http_params);
 	}
-
-	if (!TryRefreshS3SecretForPath(*context, path)) {
-		return false;
-	}
-	auto previous_region = auth_params.region;
-	ReloadAuthParams(*context, path);
-	if (!previous_region.empty() && auth_params.region != previous_region) {
-		auth_params.SetRegion(std::move(previous_region));
-	}
-	ReloadHTTPParams(*context, path);
-	return !S3AuthParamsMatch(auth_params, request_auth_params) ||
-	       !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(http_params), request_http_params);
+	ClientContextFileOpener opener(*context);
+	return TryRefreshS3AuthMaterial(context.get(), opener, path, auth_params, http_params, request_auth_params,
+	                                request_http_params);
 }
 
 static bool TryRefreshS3AuthParams(optional_ptr<FileOpener> opener, const string &path, HTTPParams &http_params,
                                    S3AuthParams &auth_params, const S3AuthParams &request_auth_params,
                                    const S3RefreshableHTTPParams &request_http_params) {
 	auto &httpfs_params = http_params.Cast<HTTPFSParams>();
-	if (!S3AuthParamsMatch(auth_params, request_auth_params) ||
-	    !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(httpfs_params), request_http_params)) {
-		return true;
-	}
 	auto context = FileOpener::TryGetClientContext(opener);
-	if (!context) {
-		return false;
-	}
-
-	if (!TryRefreshS3SecretForPath(*context, path)) {
-		return false;
-	}
-
-	auto previous_region = auth_params.region;
-	auth_params = ReadS3AuthParams(opener, path);
-	if (!previous_region.empty() && auth_params.region != previous_region) {
-		auth_params.SetRegion(std::move(previous_region));
-	}
-	ApplyRefreshableHTTPParams(httpfs_params, ReadRefreshableHTTPParams(opener, path));
-	return !S3AuthParamsMatch(auth_params, request_auth_params) ||
-	       !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(httpfs_params), request_http_params);
+	return TryRefreshS3AuthMaterial(context.get(), opener, path, auth_params, httpfs_params, request_auth_params,
+	                                request_http_params);
 }
 
 S3ConfigParams S3ConfigParams::ReadFrom(optional_ptr<FileOpener> opener) {
@@ -1129,6 +1098,8 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 		S3AuthParams auth_params;
 	};
 
+	// S3 DeleteObjects signs one request for one bucket batch. This currently uses a representative secret per bucket;
+	// a follow-up should group by effective credential material if mixed same-bucket scoped secrets need support.
 	unordered_map<string, vector<string>> keys_by_bucket;
 	unordered_map<string, vector<string>> secret_lookup_paths_by_bucket;
 	unordered_map<string, BucketUrlInfo> url_info_by_bucket;
