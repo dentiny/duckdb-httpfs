@@ -117,20 +117,6 @@ struct S3ConfigParams {
 	static S3ConfigParams ReadFrom(optional_ptr<FileOpener> opener);
 };
 
-class S3HTTPInput : public HTTPInput {
-public:
-	S3HTTPInput(unique_ptr<HTTPParams> params, const S3AuthParams &auth_params_p,
-	            const S3ConfigParams &config_params_p);
-	~S3HTTPInput() override;
-
-	S3AuthParams auth_params;
-	S3ConfigParams config_params;
-};
-
-class S3FileSystem;
-class S3MultiPartUpload;
-class S3WriteBuffer;
-
 struct S3RefreshableHTTPParams {
 	string http_proxy;
 	idx_t http_proxy_port = 0;
@@ -141,6 +127,34 @@ struct S3RefreshableHTTPParams {
 	bool verify_ssl = true;
 	string bearer_token;
 };
+
+class S3HTTPInput : public HTTPInput {
+	friend class S3FileHandle;
+	friend class S3FileSystem;
+
+public:
+	S3HTTPInput(unique_ptr<HTTPParams> params, const S3AuthParams &auth_params_p,
+	            const S3ConfigParams &config_params_p);
+	~S3HTTPInput() override;
+
+	S3AuthParams auth_params;
+	S3ConfigParams config_params;
+
+private:
+	//! Credential refresh helpers used by S3 write/multipart request retries.
+	mutex mu;
+	weak_ptr<ClientContext> client_context;
+
+	bool TryRefreshAuthParams(const string &path, S3AuthParams request_auth_params,
+	                          S3RefreshableHTTPParams request_http_params);
+	void ReloadAuthParams(ClientContext &context, const string &path);
+	void ReloadHTTPParams(ClientContext &context, const string &path);
+	void SetRegion(string region_p);
+};
+
+class S3FileSystem;
+class S3MultiPartUpload;
+class S3WriteBuffer;
 
 class S3FileHandle : public HTTPFileHandle {
 	friend class S3FileSystem;
@@ -154,7 +168,6 @@ public:
 	const S3ConfigParams &config_params;
 	shared_ptr<S3MultiPartUpload> multi_part_upload;
 
-public:
 	void Close() override;
 	void Initialize(optional_ptr<FileOpener> opener) override;
 	void FinalizeUpload();
@@ -162,15 +175,15 @@ public:
 protected:
 	void InitializeFromCacheEntry(const HTTPMetadataCacheEntry &cache_entry) override;
 	HTTPMetadataCacheEntry GetCacheEntry() const override;
+	unique_ptr<HTTPClient> CreateClient() override;
+
+private:
+	//! Credential refresh helpers used by S3 read request retries.
 	bool TryRefreshAuthParams(S3AuthParams request_auth_params, S3RefreshableHTTPParams request_http_params);
 	void ReloadAuthParams(ClientContext &context);
 	void ReloadHTTPParams(ClientContext &context);
 	void SetRegion(string region_p);
 
-protected:
-	unique_ptr<HTTPClient> CreateClient() override;
-
-private:
 	weak_ptr<ClientContext> client_context;
 };
 
@@ -180,21 +193,9 @@ public:
 	}
 
 	BufferManager &buffer_manager;
+
+	//! FileSystem overrides.
 	string GetName() const override;
-
-public:
-	duckdb::unique_ptr<HTTPResponse> HeadRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) override;
-	duckdb::unique_ptr<HTTPResponse> GetRequest(FileHandle &handle, string url, HTTPHeaders header_map) override;
-	duckdb::unique_ptr<HTTPResponse> GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
-	                                                 idx_t file_offset, char *buffer_out,
-	                                                 idx_t buffer_out_len) override;
-	duckdb::unique_ptr<HTTPResponse> PostRequest(HTTPInput &input, string s3_url, HTTPHeaders header_map,
-	                                             string &buffer_out, char *buffer_in, idx_t buffer_in_len,
-	                                             string http_params = "") override;
-	duckdb::unique_ptr<HTTPResponse> PutRequest(HTTPInput &input, string s3_url, HTTPHeaders header_map,
-	                                            char *buffer_in, idx_t buffer_in_len, string http_params = "") override;
-	duckdb::unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) override;
-
 	bool CanHandleFile(const string &fpath) override;
 	bool OnDiskFile(FileHandle &handle) override {
 		return false;
@@ -204,32 +205,38 @@ public:
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void FileSync(FileHandle &handle) override;
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
-
-	static void ReadQueryParams(const string &url_query_param, S3AuthParams &params);
-	static ParsedS3Url S3UrlParse(string url, const S3AuthParams &params);
-
-	static string UrlEncode(const string &input, bool encode_slash = false);
-	static string UrlDecode(string input);
-
-	static string TryGetPrefix(const string &url);
-
-	//! Wrapper around BufferManager::Allocate to limit the number of buffers
-	BufferHandle Allocate(idx_t part_size, uint16_t max_threads);
-
-	//! S3 is object storage so directories effectively always exist
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
 		return true;
 	}
 
+	//! HTTP request overrides.
+	unique_ptr<HTTPResponse> HeadRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) override;
+	unique_ptr<HTTPResponse> GetRequest(FileHandle &handle, string url, HTTPHeaders header_map) override;
+	unique_ptr<HTTPResponse> GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
+	                                         idx_t file_offset, char *buffer_out, idx_t buffer_out_len) override;
+	unique_ptr<HTTPResponse> PostRequest(HTTPInput &input, string s3_url, HTTPHeaders header_map, string &buffer_out,
+	                                     char *buffer_in, idx_t buffer_in_len, string http_params = "") override;
+	unique_ptr<HTTPResponse> PutRequest(HTTPInput &input, string s3_url, HTTPHeaders header_map, char *buffer_in,
+	                                    idx_t buffer_in_len, string http_params = "") override;
+	unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) override;
+	HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) override;
+
+	//! S3 helper APIs used by upload/list/request construction.
+	static void ReadQueryParams(const string &url_query_param, S3AuthParams &params);
+	static ParsedS3Url S3UrlParse(string url, const S3AuthParams &params);
+	static string UrlEncode(const string &input, bool encode_slash = false);
+	static string UrlDecode(string input);
+	static string TryGetPrefix(const string &url);
+	BufferHandle Allocate(idx_t part_size, uint16_t max_threads);
 	static string GetS3BadRequestError(const S3AuthParams &s3_auth_params, string correct_region = "");
 	static string ParseS3Error(const string &error);
 	static string GetS3AuthError(const S3AuthParams &s3_auth_params);
 	static string GetGCSAuthError(const S3AuthParams &s3_auth_params);
 	static HTTPException GetS3Error(const S3AuthParams &s3_auth_params, const HTTPResponse &response,
 	                                const string &url);
-	HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) override;
 
 protected:
+	//! FileSystem extension points for S3 open/list/glob.
 	bool ListFilesExtended(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
 	                       optional_ptr<FileOpener> opener) override;
 	bool SupportsListFilesExtended() const override {
@@ -240,12 +247,24 @@ protected:
 	bool SupportsGlobExtended() const override {
 		return true;
 	}
+	unique_ptr<HTTPFileHandle> CreateHandle(const OpenFileInfo &file, FileOpenFlags flags,
+	                                        optional_ptr<FileOpener> opener) override;
 
-protected:
+	//! S3 request construction helpers.
 	static string GetPrefix(const string &url);
-	duckdb::unique_ptr<HTTPFileHandle> CreateHandle(const OpenFileInfo &file, FileOpenFlags flags,
-	                                                optional_ptr<FileOpener> opener) override;
 	string GetPayloadHash(char *buffer, idx_t buffer_len);
+
+private:
+	//! Request retry wrappers that refresh credentials and rebuild signed S3 requests.
+	template <class REQUEST>
+	unique_ptr<HTTPResponse> RunS3InputRequestWithAuthRefresh(S3HTTPInput &s3_input, const string &s3_url,
+	                                                          const string &method, const string &query_string,
+	                                                          const string &payload_hash, const string &content_type,
+	                                                          REQUEST request);
+	template <class REQUEST>
+	unique_ptr<HTTPResponse> RunS3HandleRequestWithAuthRefresh(S3FileHandle &s3_handle, const string &s3_url,
+	                                                           const string &method, bool use_version_id,
+	                                                           REQUEST request);
 };
 
 // Helper class to do s3 ListObjectV2 api call https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html

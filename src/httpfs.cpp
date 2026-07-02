@@ -116,6 +116,40 @@ unique_ptr<HTTPParams> HTTPFSUtil::InitializeParameters(optional_ptr<FileOpener>
 	return std::move(result);
 }
 
+unique_ptr<HTTPParams> HTTPFSParams::Clone() const {
+	auto result = make_uniq<HTTPFSParams>(http_util);
+	result->timeout = timeout;
+	result->timeout_usec = timeout_usec;
+	result->retries = retries;
+	result->retry_wait_ms = retry_wait_ms;
+	result->retry_backoff = retry_backoff;
+	result->keep_alive = keep_alive;
+	result->follow_location = follow_location;
+	result->override_verify_ssl = override_verify_ssl;
+	result->verify_ssl = verify_ssl;
+	result->http_proxy = http_proxy;
+	result->http_proxy_port = http_proxy_port;
+	result->http_proxy_username = http_proxy_username;
+	result->http_proxy_password = http_proxy_password;
+	result->extra_headers = extra_headers;
+	result->logger = logger;
+
+	result->force_download = force_download;
+	result->auto_fallback_to_full_download = auto_fallback_to_full_download;
+	result->enable_server_cert_verification = enable_server_cert_verification;
+	result->enable_curl_server_cert_verification = enable_curl_server_cert_verification;
+	result->hf_max_per_page = hf_max_per_page;
+	result->ca_cert_file = ca_cert_file;
+	result->bearer_token = bearer_token;
+	result->unsafe_disable_etag_checks = unsafe_disable_etag_checks;
+	result->s3_version_id_pinning = s3_version_id_pinning;
+	result->state = state;
+	result->user_agent = user_agent;
+	result->pre_merged_headers = pre_merged_headers;
+	result->force_download_threshold = force_download_threshold;
+	return std::move(result);
+}
+
 unique_ptr<HTTPClient> HTTPClientCache::GetClient() {
 	lock_guard<mutex> lck(lock);
 	if (clients.size() == 0) {
@@ -151,92 +185,53 @@ static void AddHandleHeaders(HTTPFSParams &http_params, HTTPHeaders &header_map)
 	http_params.pre_merged_headers = true;
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::PostRequest(HTTPInput &input, string url, HTTPHeaders header_map,
-                                                     string &buffer_out, char *buffer_in, idx_t buffer_in_len,
-                                                     string params) {
-	auto &http_util = input.http_params.http_util;
+static string StripETagQuotes(const string &etag) {
+	if (etag.size() >= 2 && etag.front() == '"' && etag.back() == '"') {
+		return etag.substr(1, etag.size() - 2);
+	}
+	return etag;
+}
 
-	AddUserAgentIfAvailable(input.http_params, header_map);
-	AddHandleHeaders(input.http_params, header_map);
+unique_ptr<HTTPResponse> HTTPFileSystem::RunHeadRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
+                                                        HTTPSendCallback send_request) {
+	HeadRequestInfo head_request(url, header_map, http_params);
+	return send_request(head_request);
+}
 
-	PostRequestInfo post_request(url, header_map, input.http_params, const_data_ptr_cast(buffer_in), buffer_in_len);
-	auto result = http_util.Request(post_request);
+unique_ptr<HTTPResponse> HTTPFileSystem::RunDeleteRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
+                                                          HTTPSendCallback send_request) {
+	DeleteRequestInfo delete_request(url, header_map, http_params);
+	return send_request(delete_request);
+}
+
+unique_ptr<HTTPResponse> HTTPFileSystem::RunPostRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
+                                                        string &buffer_out, char *buffer_in, idx_t buffer_in_len,
+                                                        HTTPSendCallback send_request) {
+	PostRequestInfo post_request(url, header_map, http_params, const_data_ptr_cast(buffer_in), buffer_in_len);
+	auto result = send_request(post_request);
 	buffer_out = std::move(post_request.buffer_out);
 	return result;
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::PutRequest(HTTPInput &input, string url, HTTPHeaders header_map,
-                                                    char *buffer_in, idx_t buffer_in_len, string params) {
-	auto &http_util = input.http_params.http_util;
-
-	AddUserAgentIfAvailable(input.http_params, header_map);
-	AddHandleHeaders(input.http_params, header_map);
-
-	string content_type = "application/octet-stream";
-	PutRequestInfo put_request(url, header_map, input.http_params, (const_data_ptr_t)buffer_in, buffer_in_len,
+unique_ptr<HTTPResponse> HTTPFileSystem::RunPutRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
+                                                       char *buffer_in, idx_t buffer_in_len, const string &content_type,
+                                                       HTTPSendCallback send_request) {
+	PutRequestInfo put_request(url, header_map, http_params, const_data_ptr_cast(buffer_in), buffer_in_len,
 	                           content_type);
-	return http_util.Request(put_request);
+	return send_request(put_request);
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::HeadRequest(FileHandle &handle, string url, HTTPHeaders header_map) {
-	auto &hfh = handle.Cast<HTTPFileHandle>();
-	auto &http_util = hfh.http_params.http_util;
-
-	AddUserAgentIfAvailable(hfh.http_params, header_map);
-	AddHandleHeaders(hfh.http_params, header_map);
-
-	auto http_client = hfh.GetClient();
-
-	HeadRequestInfo head_request(url, header_map, hfh.http_params);
-	auto response = http_util.Request(head_request, http_client);
-
-	hfh.StoreClient(std::move(http_client));
-	return response;
-}
-
-unique_ptr<HTTPResponse> HTTPFileSystem::DeleteRequest(FileHandle &handle, string url, HTTPHeaders header_map) {
-	auto &hfh = handle.Cast<HTTPFileHandle>();
-	auto &http_util = hfh.http_params.http_util;
-
-	AddUserAgentIfAvailable(hfh.http_params, header_map);
-	AddHandleHeaders(hfh.http_params, header_map);
-
-	auto http_client = hfh.GetClient();
-	DeleteRequestInfo delete_request(url, header_map, hfh.http_params);
-	auto response = http_util.Request(delete_request, http_client);
-
-	hfh.StoreClient(std::move(http_client));
-	return response;
-}
-
-HTTPException HTTPFileSystem::GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) {
-	auto status_message = HTTPFSUtil::GetStatusMessage(response.status);
-	string error = "HTTP GET error on '" + url + "' (HTTP " + to_string(static_cast<int>(response.status)) + " " +
-	               status_message + ")";
-	if (response.status == HTTPStatusCode::RangeNotSatisfiable_416) {
-		error += " This could mean the file was changed. Try disabling the duckdb http metadata cache "
-		         "if enabled, and confirm the server supports range requests.";
-	}
-	return HTTPException(response, error);
-}
-
-unique_ptr<HTTPResponse> HTTPFileSystem::GetRequest(FileHandle &handle, string url, HTTPHeaders header_map) {
-	auto &hfh = handle.Cast<HTTPFileHandle>();
-	auto &http_util = hfh.http_params.http_util;
-
-	AddUserAgentIfAvailable(hfh.http_params, header_map);
-	AddHandleHeaders(hfh.http_params, header_map);
-
+unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRequest(HTTPFileHandle &hfh, string url, HTTPHeaders header_map,
+                                                       HTTPFSParams &http_params, HTTPErrorCallback get_error,
+                                                       HTTPSendCallback send_request) {
 	D_ASSERT(hfh.cached_file_handle);
-
-	auto http_client = hfh.GetClient();
 	GetRequestInfo get_request(
-	    url, header_map, hfh.http_params,
+	    url, header_map, http_params,
 	    [&](const HTTPResponse &response) {
 		    if (static_cast<int>(response.status) >= 400) {
-			    throw GetHTTPError(handle, response, url);
+			    throw get_error(response);
 		    }
-		    if (hfh.http_params.s3_version_id_pinning && response.HasHeader("x-amz-version-id")) {
+		    if (http_params.s3_version_id_pinning && response.HasHeader("x-amz-version-id")) {
 			    lock_guard<mutex> lck(hfh.mu);
 			    if (hfh.version_id.empty()) {
 				    hfh.version_id = response.GetHeaderValue("x-amz-version-id");
@@ -265,68 +260,49 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRequest(FileHandle &handle, string u
 		    return true;
 	    });
 
-	auto response = http_util.Request(get_request, http_client);
-
-	hfh.StoreClient(std::move(http_client));
-	return response;
+	return send_request(get_request);
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::GetRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map,
-                                                         idx_t file_offset, char *buffer_out, idx_t buffer_out_len) {
-	auto &hfh = handle.Cast<HTTPFileHandle>();
-	auto &http_util = hfh.http_params.http_util;
-
-	AddUserAgentIfAvailable(hfh.http_params, header_map);
-	AddHandleHeaders(hfh.http_params, header_map);
-
+unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh, string url, HTTPHeaders header_map,
+                                                            HTTPFSParams &http_params, const string &etag,
+                                                            bool auto_fallback_to_full_file_download, idx_t file_offset,
+                                                            char *buffer_out, idx_t buffer_out_len,
+                                                            HTTPErrorCallback get_error,
+                                                            HTTPSendCallback send_request) {
 	// send the Range header to read only subset of file
 	string range_expr = "bytes=" + to_string(file_offset) + "-" + to_string(file_offset + buffer_out_len - 1);
 	header_map.Insert("Range", range_expr);
 
-	auto http_client = hfh.GetClient();
-
 	idx_t out_offset = 0;
-
 	GetRequestInfo get_request(
-	    url, header_map, hfh.http_params,
+	    url, header_map, http_params,
 	    [&](const HTTPResponse &response) {
 		    if (static_cast<int>(response.status) >= 400) {
-			    throw GetHTTPError(handle, response, url);
+			    throw get_error(response);
 		    }
 		    if (static_cast<int>(response.status) < 300) { // done redirecting
 			    out_offset = 0;
 
-			    if (!hfh.http_params.unsafe_disable_etag_checks && !hfh.etag.empty() && response.HasHeader("ETag")) {
+			    if (!http_params.unsafe_disable_etag_checks && !etag.empty() && response.HasHeader("ETag")) {
 				    string responseEtag = response.GetHeaderValue("ETag");
 
-				    // Strip surrounding quotes for comparison: some S3-compatible backends
-				    // (e.g. NetApp ONTAP) omit quotes in ListObjectsV2 XML ETags, while
-				    // HTTP headers include them per RFC 7232
-				    auto strip_quotes = [](const string &etag) -> string {
-					    if (etag.size() >= 2 && etag.front() == '"' && etag.back() == '"') {
-						    return etag.substr(1, etag.size() - 2);
-					    }
-					    return etag;
-				    };
-
-				    if (!responseEtag.empty() && strip_quotes(responseEtag) != strip_quotes(hfh.etag)) {
+				    if (!responseEtag.empty() && StripETagQuotes(responseEtag) != StripETagQuotes(etag)) {
 					    if (global_metadata_cache) {
-						    global_metadata_cache->Erase(handle.path);
+						    global_metadata_cache->Erase(hfh.path);
 					    }
 					    throw HTTPException(
 					        response,
 					        "ETag on reading file \"%s\" was initially %s and now it returned %s, this likely means "
-					        "the "
-					        "remote file has "
-					        "changed.\nFor parquet or similar single table sources, consider retrying the query, for "
+					        "the remote file has changed.\nFor parquet or similar single table sources, consider "
+					        "retrying the query, for "
 					        "persistent FileHandles such as databases consider `DETACH` and re-`ATTACH` "
 					        "\nYou can disable checking etags via `SET "
 					        "unsafe_disable_etag_checks = true;`",
-					        handle.path, hfh.etag, response.GetHeaderValue("ETag"));
+					        hfh.path, etag, response.GetHeaderValue("ETag"));
 				    }
 			    }
 
-			    if (hfh.http_params.s3_version_id_pinning && response.HasHeader("x-amz-version-id")) {
+			    if (http_params.s3_version_id_pinning && response.HasHeader("x-amz-version-id")) {
 				    lock_guard<mutex> lck(hfh.mu);
 				    if (hfh.version_id.empty()) {
 					    hfh.version_id = response.GetHeaderValue("x-amz-version-id");
@@ -340,7 +316,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRangeRequest(FileHandle &handle, str
 					    content_length = stoull(response.GetHeaderValue("Content-Length"));
 					    parsed = true;
 				    } catch (const std::exception &) {
-					    // Content-Length header contains a non-numeric value — skip validation.
+					    // Content-Length header contains a non-numeric value, so skip validation.
 				    }
 				    if (parsed && (idx_t)content_length != buffer_out_len) {
 					    RangeRequestNotSupportedException::Throw();
@@ -352,11 +328,6 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRangeRequest(FileHandle &handle, str
 	    [&](const_data_ptr_t data, idx_t data_length) {
 		    if (buffer_out != nullptr) {
 			    if (data_length + out_offset > buffer_out_len) {
-				    // As of v0.8.2-dev4424 we might end up here when very big files are served from servers
-				    // that returns more data than requested via range header. This is an uncommon but legal
-				    // behaviour, so we have to improve logic elsewhere to properly handle this case.
-
-				    // To avoid corruption of memory, we bail out.
 				    throw HTTPException("Server sent back more data than expected, `SET force_download=true` might "
 				                        "help in this case");
 			    }
@@ -366,10 +337,91 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRangeRequest(FileHandle &handle, str
 		    return true;
 	    });
 
-	get_request.try_request = hfh.auto_fallback_to_full_file_download;
+	get_request.try_request = auto_fallback_to_full_file_download;
+	return send_request(get_request);
+}
 
-	auto response = http_util.Request(get_request, http_client);
+unique_ptr<HTTPResponse> HTTPFileSystem::PostRequest(HTTPInput &input, string url, HTTPHeaders header_map,
+                                                     string &buffer_out, char *buffer_in, idx_t buffer_in_len,
+                                                     string params) {
+	AddUserAgentIfAvailable(input.http_params, header_map);
+	AddHandleHeaders(input.http_params, header_map);
+	return RunPostRequest(url, header_map, input.http_params, buffer_out, buffer_in, buffer_in_len,
+	                      [&](BaseRequest &request) { return input.http_params.http_util.Request(request); });
+}
 
+unique_ptr<HTTPResponse> HTTPFileSystem::PutRequest(HTTPInput &input, string url, HTTPHeaders header_map,
+                                                    char *buffer_in, idx_t buffer_in_len, string params) {
+	AddUserAgentIfAvailable(input.http_params, header_map);
+	AddHandleHeaders(input.http_params, header_map);
+
+	string content_type = "application/octet-stream";
+	return RunPutRequest(url, header_map, input.http_params, buffer_in, buffer_in_len, content_type,
+	                     [&](BaseRequest &request) { return input.http_params.http_util.Request(request); });
+}
+
+unique_ptr<HTTPResponse> HTTPFileSystem::HeadRequest(FileHandle &handle, string url, HTTPHeaders header_map) {
+	auto &hfh = handle.Cast<HTTPFileHandle>();
+	AddUserAgentIfAvailable(hfh.http_params, header_map);
+	AddHandleHeaders(hfh.http_params, header_map);
+
+	auto http_client = hfh.GetClient();
+	auto response = RunHeadRequest(url, header_map, hfh.http_params, [&](BaseRequest &request) {
+		return hfh.http_params.http_util.Request(request, http_client);
+	});
+	hfh.StoreClient(std::move(http_client));
+	return response;
+}
+
+unique_ptr<HTTPResponse> HTTPFileSystem::DeleteRequest(FileHandle &handle, string url, HTTPHeaders header_map) {
+	auto &hfh = handle.Cast<HTTPFileHandle>();
+	AddUserAgentIfAvailable(hfh.http_params, header_map);
+	AddHandleHeaders(hfh.http_params, header_map);
+
+	auto http_client = hfh.GetClient();
+	auto response = RunDeleteRequest(url, header_map, hfh.http_params, [&](BaseRequest &request) {
+		return hfh.http_params.http_util.Request(request, http_client);
+	});
+	hfh.StoreClient(std::move(http_client));
+	return response;
+}
+
+HTTPException HTTPFileSystem::GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) {
+	auto status_message = HTTPFSUtil::GetStatusMessage(response.status);
+	string error = "HTTP GET error on '" + url + "' (HTTP " + to_string(static_cast<int>(response.status)) + " " +
+	               status_message + ")";
+	if (response.status == HTTPStatusCode::RangeNotSatisfiable_416) {
+		error += " This could mean the file was changed. Try disabling the duckdb http metadata cache "
+		         "if enabled, and confirm the server supports range requests.";
+	}
+	return HTTPException(response, error);
+}
+
+unique_ptr<HTTPResponse> HTTPFileSystem::GetRequest(FileHandle &handle, string url, HTTPHeaders header_map) {
+	auto &hfh = handle.Cast<HTTPFileHandle>();
+	AddUserAgentIfAvailable(hfh.http_params, header_map);
+	AddHandleHeaders(hfh.http_params, header_map);
+
+	auto http_client = hfh.GetClient();
+	auto response = RunGetRequest(
+	    hfh, url, header_map, hfh.http_params,
+	    [&](const HTTPResponse &response) { return GetHTTPError(handle, response, url); },
+	    [&](BaseRequest &request) { return hfh.http_params.http_util.Request(request, http_client); });
+	hfh.StoreClient(std::move(http_client));
+	return response;
+}
+
+unique_ptr<HTTPResponse> HTTPFileSystem::GetRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map,
+                                                         idx_t file_offset, char *buffer_out, idx_t buffer_out_len) {
+	auto &hfh = handle.Cast<HTTPFileHandle>();
+	AddUserAgentIfAvailable(hfh.http_params, header_map);
+	AddHandleHeaders(hfh.http_params, header_map);
+
+	auto http_client = hfh.GetClient();
+	auto response = RunGetRangeRequest(
+	    hfh, url, header_map, hfh.http_params, hfh.etag, hfh.auto_fallback_to_full_file_download, file_offset,
+	    buffer_out, buffer_out_len, [&](const HTTPResponse &response) { return GetHTTPError(handle, response, url); },
+	    [&](BaseRequest &request) { return hfh.http_params.http_util.Request(request, http_client); });
 	hfh.StoreClient(std::move(http_client));
 	return response;
 }
