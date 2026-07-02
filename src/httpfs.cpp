@@ -151,14 +151,20 @@ unique_ptr<HTTPParams> HTTPFSParams::Clone() const {
 }
 
 unique_ptr<HTTPClient> HTTPClientCache::GetClient() {
+	return GetClientWithGeneration().client;
+}
+
+HTTPClientCache::Entry HTTPClientCache::GetClientWithGeneration() {
 	lock_guard<mutex> lck(lock);
+	Entry result;
+	result.generation = generation;
 	if (clients.size() == 0) {
-		return nullptr;
+		return result;
 	}
 
-	auto client = std::move(clients.back());
+	result.client = std::move(clients.back());
 	clients.pop_back();
-	return client;
+	return result;
 }
 
 void HTTPClientCache::StoreClient(unique_ptr<HTTPClient> client) {
@@ -166,8 +172,21 @@ void HTTPClientCache::StoreClient(unique_ptr<HTTPClient> client) {
 	clients.push_back(std::move(client));
 }
 
+bool HTTPClientCache::StoreClient(Entry &entry) {
+	lock_guard<mutex> lck(lock);
+	if (!entry.client) {
+		return true;
+	}
+	if (entry.generation != generation) {
+		return false;
+	}
+	clients.push_back(std::move(entry.client));
+	return true;
+}
+
 void HTTPClientCache::Clear() {
 	lock_guard<mutex> lck(lock);
+	generation++;
 	clients.clear();
 }
 

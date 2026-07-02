@@ -22,6 +22,7 @@
 
 #include "create_secret_functions.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <iostream>
 
@@ -436,14 +437,22 @@ template <class REQUEST>
 unique_ptr<HTTPResponse> S3FileSystem::RunS3HandleRequestWithAuthRefresh(S3FileHandle &s3_handle, const string &s3_url,
                                                                          const string &method, bool use_version_id,
                                                                          REQUEST request) {
-	// Use cloned params and fresh clients for retries: an in-flight old client can otherwise be returned to the
-	// handle cache after another thread refreshes auth/proxy material.
 	return RunS3RequestWithAuthRefreshInternal(
 	    s3_url, [&]() { return CreateS3HandleRequestData(s3_handle, s3_url, method, use_version_id); }, request,
 	    [&](const S3AuthParams &request_auth_params, const S3RefreshableHTTPParams &request_http_params) {
 		    return s3_handle.TryRefreshAuthParams(request_auth_params, request_http_params);
 	    },
 	    [&](string correct_region) { s3_handle.SetRegion(std::move(correct_region)); });
+}
+
+static unique_ptr<HTTPResponse> SendS3HandleRequestWithClientCache(S3FileHandle &s3_handle, HTTPFSParams &params,
+                                                                   BaseRequest &request) {
+	auto client_entry = s3_handle.client_cache.GetClientWithGeneration();
+	auto response = params.http_util.Request(request, client_entry.client);
+	if (!s3_handle.client_cache.StoreClient(client_entry)) {
+		params.http_util.CloseClient(std::move(client_entry.client));
+	}
+	return response;
 }
 
 static HTTPException GetS3RequestError(const S3RequestData &request_data, const HTTPResponse &response) {
@@ -915,8 +924,9 @@ unique_ptr<HTTPResponse> S3FileSystem::HeadRequest(FileHandle &handle, string s3
 	auto &s3_handle = handle.Cast<S3FileHandle>();
 	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "HEAD", false, [&](S3RequestData &request_data) {
 		auto &params = request_data.http_params->Cast<HTTPFSParams>();
-		return RunHeadRequest(request_data.http_url, request_data.headers, params,
-		                      [&](BaseRequest &request) { return params.http_util.Request(request); });
+		return RunHeadRequest(request_data.http_url, request_data.headers, params, [&](BaseRequest &request) {
+			return SendS3HandleRequestWithClientCache(s3_handle, params, request);
+		});
 	});
 }
 
@@ -927,7 +937,7 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_
 		return RunGetRequest(
 		    s3_handle, request_data.http_url, request_data.headers, params,
 		    [&](const HTTPResponse &response) { return GetS3RequestError(request_data, response); },
-		    [&](BaseRequest &request) { return params.http_util.Request(request); });
+		    [&](BaseRequest &request) { return SendS3HandleRequestWithClientCache(s3_handle, params, request); });
 	});
 }
 
@@ -940,7 +950,7 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, strin
 		    s3_handle, request_data.http_url, request_data.headers, params, request_data.etag,
 		    request_data.auto_fallback_to_full_file_download, file_offset, buffer_out, buffer_out_len,
 		    [&](const HTTPResponse &response) { return GetS3RequestError(request_data, response); },
-		    [&](BaseRequest &request) { return params.http_util.Request(request); });
+		    [&](BaseRequest &request) { return SendS3HandleRequestWithClientCache(s3_handle, params, request); });
 	});
 }
 
@@ -948,8 +958,9 @@ unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, string 
 	auto &s3_handle = handle.Cast<S3FileHandle>();
 	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "DELETE", false, [&](S3RequestData &request_data) {
 		auto &params = request_data.http_params->Cast<HTTPFSParams>();
-		return RunDeleteRequest(request_data.http_url, request_data.headers, params,
-		                        [&](BaseRequest &request) { return params.http_util.Request(request); });
+		return RunDeleteRequest(request_data.http_url, request_data.headers, params, [&](BaseRequest &request) {
+			return SendS3HandleRequestWithClientCache(s3_handle, params, request);
+		});
 	});
 }
 
@@ -1085,24 +1096,98 @@ void S3FileSystem::RemoveFile(const string &path, optional_ptr<FileOpener> opene
 // Forward declaration for FindTagContents (defined later in file)
 optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
 
+struct S3DeleteBatchUrlInfo {
+	string prefix;
+	string http_proto;
+	string host;
+	string path;
+	S3AuthParams auth_params;
+};
+
+struct S3DeleteBatch {
+	S3DeleteBatchUrlInfo url_info;
+	vector<string> keys;
+	vector<string> secret_lookup_paths;
+};
+
+struct S3DeleteBatchKeyBuilder {
+	void AddString(const string &value) {
+		parts.push_back(StringUtil::Format("%s:%s;", to_string(value.size()), value));
+	}
+
+	void AddBool(bool value) {
+		AddString(value ? string("1") : string("0"));
+	}
+
+	void AddIndex(idx_t value) {
+		AddString(to_string(value));
+	}
+
+	string Build() const {
+		return StringUtil::Join(parts, "");
+	}
+
+private:
+	vector<string> parts;
+};
+
+static void AddDeleteBatchUrlKeyParts(S3DeleteBatchKeyBuilder &key_builder, const S3DeleteBatchUrlInfo &url_info) {
+	key_builder.AddString(url_info.prefix);
+	key_builder.AddString(url_info.http_proto);
+	key_builder.AddString(url_info.host);
+	key_builder.AddString(url_info.path);
+}
+
+static void AddDeleteBatchAuthKeyParts(S3DeleteBatchKeyBuilder &key_builder, const S3AuthParams &auth_params) {
+	key_builder.AddString(auth_params.region);
+	key_builder.AddString(auth_params.access_key_id);
+	key_builder.AddString(auth_params.secret_access_key);
+	key_builder.AddString(auth_params.session_token);
+	key_builder.AddString(auth_params.endpoint);
+	key_builder.AddString(auth_params.kms_key_id);
+	key_builder.AddString(auth_params.url_style);
+	key_builder.AddBool(auth_params.use_ssl);
+	key_builder.AddBool(auth_params.s3_url_compatibility_mode);
+	key_builder.AddBool(auth_params.requester_pays);
+	key_builder.AddString(auth_params.oauth2_bearer_token);
+}
+
+static void AddDeleteBatchHTTPKeyParts(S3DeleteBatchKeyBuilder &key_builder,
+                                       const S3RefreshableHTTPParams &refreshable_http_params) {
+	key_builder.AddString(refreshable_http_params.http_proxy);
+	key_builder.AddIndex(refreshable_http_params.http_proxy_port);
+	key_builder.AddString(refreshable_http_params.http_proxy_username);
+	key_builder.AddString(refreshable_http_params.http_proxy_password);
+	key_builder.AddBool(refreshable_http_params.override_verify_ssl);
+	key_builder.AddBool(refreshable_http_params.verify_ssl);
+	key_builder.AddString(refreshable_http_params.bearer_token);
+
+	vector<pair<string, string>> extra_headers;
+	for (auto &entry : refreshable_http_params.extra_headers) {
+		extra_headers.emplace_back(entry.first, entry.second);
+	}
+	std::sort(extra_headers.begin(), extra_headers.end());
+	for (auto &entry : extra_headers) {
+		key_builder.AddString(entry.first);
+		key_builder.AddString(entry.second);
+	}
+}
+
+static string CreateDeleteBatchKey(const S3DeleteBatchUrlInfo &url_info,
+                                   const S3RefreshableHTTPParams &refreshable_http_params) {
+	S3DeleteBatchKeyBuilder key_builder;
+	AddDeleteBatchUrlKeyParts(key_builder, url_info);
+	AddDeleteBatchAuthKeyParts(key_builder, url_info.auth_params);
+	AddDeleteBatchHTTPKeyParts(key_builder, refreshable_http_params);
+	return key_builder.Build();
+}
+
 void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpener> opener) {
 	if (paths.empty()) {
 		return;
 	}
 
-	struct BucketUrlInfo {
-		string prefix;
-		string http_proto;
-		string host;
-		string path;
-		S3AuthParams auth_params;
-	};
-
-	// S3 DeleteObjects signs one request for one bucket batch. This currently uses a representative secret per bucket;
-	// a follow-up should group by effective credential material if mixed same-bucket scoped secrets need support.
-	unordered_map<string, vector<string>> keys_by_bucket;
-	unordered_map<string, vector<string>> secret_lookup_paths_by_bucket;
-	unordered_map<string, BucketUrlInfo> url_info_by_bucket;
+	unordered_map<string, S3DeleteBatch> delete_batches;
 
 	for (auto &path : paths) {
 		FileOpenerInfo info = {path};
@@ -1110,27 +1195,33 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 		auto parsed_url = S3UrlParse(path, auth_params);
 		ReadQueryParams(parsed_url.query_param, auth_params);
 
-		const string &bucket = parsed_url.bucket;
-		if (keys_by_bucket.find(bucket) == keys_by_bucket.end()) {
-			string bucket_path = parsed_url.path.substr(0, parsed_url.path.length() - parsed_url.key.length());
-			if (bucket_path.empty()) {
-				bucket_path = "/";
-			}
-			url_info_by_bucket[bucket] = {parsed_url.prefix, parsed_url.http_proto, parsed_url.host, bucket_path,
-			                              auth_params};
+		string bucket_path = parsed_url.path.substr(0, parsed_url.path.length() - parsed_url.key.length());
+		if (bucket_path.empty()) {
+			bucket_path = "/";
 		}
+		S3DeleteBatchUrlInfo url_info = {parsed_url.prefix, parsed_url.http_proto, parsed_url.host, bucket_path,
+		                                 auth_params};
+		auto refreshable_http_params = ReadRefreshableHTTPParams(opener, path);
+		auto batch_key = CreateDeleteBatchKey(url_info, refreshable_http_params);
+		auto entry = delete_batches.find(batch_key);
+		if (entry == delete_batches.end()) {
+			S3DeleteBatch batch;
+			batch.url_info = std::move(url_info);
+			entry = delete_batches.emplace(std::move(batch_key), std::move(batch)).first;
+		}
+		auto &batch = entry->second;
 
-		keys_by_bucket[bucket].push_back(parsed_url.key);
-		secret_lookup_paths_by_bucket[bucket].push_back(path);
+		batch.keys.push_back(parsed_url.key);
+		batch.secret_lookup_paths.push_back(path);
 	}
 
 	constexpr idx_t MAX_KEYS_PER_REQUEST = 1000;
 
-	for (auto &bucket_entry : keys_by_bucket) {
-		const string &bucket = bucket_entry.first;
-		const vector<string> &keys = bucket_entry.second;
-		const vector<string> &secret_lookup_paths = secret_lookup_paths_by_bucket[bucket];
-		auto &url_info = url_info_by_bucket[bucket];
+	for (auto &batch_entry : delete_batches) {
+		auto &batch = batch_entry.second;
+		const vector<string> &keys = batch.keys;
+		const vector<string> &secret_lookup_paths = batch.secret_lookup_paths;
+		auto &url_info = batch.url_info;
 
 		for (idx_t batch_start = 0; batch_start < keys.size(); batch_start += MAX_KEYS_PER_REQUEST) {
 			idx_t batch_end = MinValue<idx_t>(batch_start + MAX_KEYS_PER_REQUEST, keys.size());

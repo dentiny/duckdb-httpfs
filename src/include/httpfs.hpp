@@ -31,16 +31,27 @@ public:
 
 class HTTPClientCache {
 public:
+	struct Entry {
+		unique_ptr<HTTPClient> client;
+		idx_t generation = 0;
+	};
+
 	//! Get a client from the client cache
 	unique_ptr<HTTPClient> GetClient();
+	//! Get a client together with the cache generation it came from
+	Entry GetClientWithGeneration();
 	//! Store a client in the cache for reuse
 	void StoreClient(unique_ptr<HTTPClient> client);
+	//! Store a generation-tagged client if the cache was not cleared while it was checked out
+	bool StoreClient(Entry &entry);
 	//! Clear the stored clients
 	void Clear();
 
 protected:
 	//! The cached clients
 	vector<unique_ptr<HTTPClient>> clients;
+	//! Incremented when the cache is cleared, invalidating checked-out clients
+	idx_t generation = 0;
 	//! Lock to fetch a client
 	mutex lock;
 };
