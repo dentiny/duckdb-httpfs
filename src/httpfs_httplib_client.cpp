@@ -54,18 +54,33 @@ public:
 		if (!info.response_handler && !info.content_handler) {
 			return TransformResult(client->Get(info.path, headers));
 		} else {
-			return TransformResult(client->Get(
+			// The httplib client streams per chunk, so the first chunk gives us TTFB, used by the prefetch cost model as the latency estimate.
+			const auto request_monotonic_start = TimePoint::Tick();
+			idx_t total_bytes = 0;
+			bool first_chunk = true;
+			auto result = TransformResult(client->Get(
 			    info.path.c_str(), headers,
 			    [&](const duckdb_httplib_openssl::Response &response) {
 				    auto http_response = TransformResponse(response);
 				    return info.response_handler(*http_response);
 			    },
 			    [&](const char *data, size_t data_length) {
+				    if (first_chunk) {
+					    first_chunk = false;
+					    info.have_time_to_fst_byte = true;
+					    // Time to first byte is the duration from issuing the request until the first chunk arrives.
+					    const auto elapsed_nanos = TimePoint::ElapsedNanos(request_monotonic_start, TimePoint::Tick());
+					    info.time_to_fst_byte_sec =
+					        elapsed_nanos > 0 ? static_cast<double>(elapsed_nanos) / 1e9 : 0;
+				    }
+				    total_bytes += data_length;
 				    if (state) {
 					    state->total_bytes_received += data_length;
 				    }
 				    return info.content_handler(const_data_ptr_cast(data), data_length);
 			    }));
+			info.bytes_received = total_bytes;
+			return result;
 		}
 	}
 	unique_ptr<HTTPResponse> Put(PutRequestInfo &info) override {
@@ -92,6 +107,11 @@ public:
 		}
 		auto headers = TransformHeaders(info.headers, info.params);
 		return TransformResult(client->Delete(info.path, headers));
+	}
+
+	unique_ptr<HTTPResponse> Options(OptionsRequestInfo &info) override {
+		auto headers = TransformHeaders(info.headers, info.params);
+		return TransformResult(client->Options(info.path, headers));
 	}
 
 	unique_ptr<HTTPResponse> Post(PostRequestInfo &info) override {
