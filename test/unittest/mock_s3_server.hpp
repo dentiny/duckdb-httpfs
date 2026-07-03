@@ -12,7 +12,8 @@ enum class MockS3RefreshTarget : uint8_t {
 	MULTIPART_INITIATE_POST,
 	MULTIPART_COMPLETE_POST,
 	BULK_DELETE_POST,
-	DELETE
+	DELETE,
+	LIST_OBJECTS_GET
 };
 
 struct MockS3ServerConfig {

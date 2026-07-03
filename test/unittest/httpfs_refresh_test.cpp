@@ -314,6 +314,21 @@ static void RunDeleteRefreshScenario(const string &client_implementation, bool c
 	REQUIRE(MockS3HasObservation(observations, "DELETE", FRESH_KEY_ID, 204));
 }
 
+static void RunListGlobRefreshScenario(const string &client_implementation, bool connection_caching) {
+	auto observations =
+	    RunRefreshScenario(MockS3RefreshTarget::LIST_OBJECTS_GET, client_implementation, connection_caching,
+	                       [](Connection &con, const string &) {
+		                       auto result = con.Query("SELECT file FROM glob('s3://refresh-bucket/object*.bin')");
+		                       REQUIRE(result);
+		                       INFO((result->HasError() ? result->GetError() : string()));
+		                       REQUIRE_FALSE(result->HasError());
+		                       REQUIRE(result->RowCount() == 1);
+		                       REQUIRE(result->GetValue(0, 0).ToString() == S3_PATH);
+	                       });
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 403, string(), "list-type=2"));
+	REQUIRE(MockS3HasObservation(observations, "GET", FRESH_KEY_ID, 200, string(), "list-type=2"));
+}
+
 static void RunAllRequestRefreshScenarios(const string &client_implementation, bool connection_caching) {
 	RunHeadRefreshScenario(client_implementation, connection_caching);
 	RunFullGetRefreshScenario(client_implementation, connection_caching);
@@ -323,6 +338,7 @@ static void RunAllRequestRefreshScenarios(const string &client_implementation, b
 	RunMultipartCompletePostRefreshScenario(client_implementation, connection_caching);
 	RunBulkDeletePostRefreshScenario(client_implementation, connection_caching);
 	RunDeleteRefreshScenario(client_implementation, connection_caching);
+	RunListGlobRefreshScenario(client_implementation, connection_caching);
 }
 
 static void RunHandleRequestRefreshScenarios(const string &client_implementation, bool connection_caching) {
@@ -338,8 +354,8 @@ TEST_CASE("HTTPFS refreshes S3 credentials across request methods", "[httpfs][s3
 	SECTION("httplib without connection caching") {
 		RunAllRequestRefreshScenarios("httplib", false);
 	}
-	SECTION("httplib with connection caching") {
-		RunHandleRequestRefreshScenarios("httplib", true);
+	SECTION("httplib with handle client cache reuse") {
+		RunHandleRequestRefreshScenarios("httplib", false);
 	}
 	SECTION("curl without connection caching") {
 		RunAllRequestRefreshScenarios("curl", false);

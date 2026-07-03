@@ -107,6 +107,8 @@ struct MockS3Server::Impl {
 			return request.method == "POST" && request.target.find("delete") != string::npos;
 		case MockS3RefreshTarget::DELETE:
 			return request.method == "DELETE";
+		case MockS3RefreshTarget::LIST_OBJECTS_GET:
+			return request.method == "GET" && request.target.find("list-type=2") != string::npos;
 		default:
 			throw InternalException("Unknown refresh target");
 		}
@@ -173,6 +175,28 @@ struct MockS3Server::Impl {
 		Record(request, response.status);
 	}
 
+	void SendListObjectsSuccess(const httplib::Request &request, httplib::Response &response) const {
+		response.status = 200;
+		auto unquoted_etag = StringUtil::Replace(config.etag, "\"", "");
+		response.set_content(StringUtil::Format("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+		                                        "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+		                                        "<Name>%s</Name>"
+		                                        "<Prefix></Prefix>"
+		                                        "<KeyCount>1</KeyCount>"
+		                                        "<MaxKeys>1000</MaxKeys>"
+		                                        "<IsTruncated>false</IsTruncated>"
+		                                        "<Contents>"
+		                                        "<Key>%s</Key>"
+		                                        "<ETag>&quot;%s&quot;</ETag>"
+		                                        "<Size>%llu</Size>"
+		                                        "</Contents>"
+		                                        "</ListBucketResult>",
+		                                        config.bucket, config.object_key, unquoted_etag,
+		                                        static_cast<unsigned long long>(config.object_data.size())),
+		                     "application/xml");
+		Record(request, response.status);
+	}
+
 	void RegisterRoutes() {
 		const string path = StringUtil::Format("/%s/%s", config.bucket, config.object_key);
 		const string bucket_path = StringUtil::Format("/%s", config.bucket);
@@ -219,6 +243,21 @@ struct MockS3Server::Impl {
 			response.set_content(config.object_data, "application/octet-stream");
 			Record(request, response.status);
 		});
+
+		auto list_objects = [this](const httplib::Request &request, httplib::Response &response) {
+			if (request.target.find("list-type=2") == string::npos) {
+				response.status = 404;
+				Record(request, response.status);
+				return;
+			}
+			if (ShouldRejectStaleCredentials(request)) {
+				SendForbidden(request, response);
+				return;
+			}
+			SendListObjectsSuccess(request, response);
+		};
+		server.Get(bucket_path, list_objects);
+		server.Get(bucket_path_with_slash, list_objects);
 
 		server.Put(path, [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
@@ -304,6 +343,8 @@ string MockS3RefreshTargetName(MockS3RefreshTarget target) {
 		return "BULK_DELETE_POST";
 	case MockS3RefreshTarget::DELETE:
 		return "DELETE";
+	case MockS3RefreshTarget::LIST_OBJECTS_GET:
+		return "LIST_OBJECTS_GET";
 	default:
 		throw InternalException("Unknown refresh target");
 	}
