@@ -305,8 +305,8 @@ static void RunBulkDeletePostRefreshScenario(const string &client_implementation
 }
 
 static void RunDeleteRefreshScenario(const string &client_implementation, bool connection_caching) {
-	auto observations = RunRefreshScenario(MockS3RefreshTarget::DELETE, client_implementation, connection_caching,
-	                                       [](Connection &con, const string &) {
+	auto observations = RunRefreshScenario(MockS3RefreshTarget::DELETE_OBJECT, client_implementation,
+	                                       connection_caching, [](Connection &con, const string &) {
 		                                       auto &fs = FileSystem::GetFileSystem(*con.context);
 		                                       fs.RemoveFile(S3_PATH);
 	                                       });

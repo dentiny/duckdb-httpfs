@@ -105,7 +105,7 @@ struct MockS3Server::Impl {
 			return request.method == "POST" && request.target.find("uploadId") != string::npos;
 		case MockS3RefreshTarget::BULK_DELETE_POST:
 			return request.method == "POST" && request.target.find("delete") != string::npos;
-		case MockS3RefreshTarget::DELETE:
+		case MockS3RefreshTarget::DELETE_OBJECT:
 			return request.method == "DELETE";
 		case MockS3RefreshTarget::LIST_OBJECTS_GET:
 			return request.method == "GET" && request.target.find("list-type=2") != string::npos;
@@ -341,7 +341,7 @@ string MockS3RefreshTargetName(MockS3RefreshTarget target) {
 		return "MULTIPART_COMPLETE_POST";
 	case MockS3RefreshTarget::BULK_DELETE_POST:
 		return "BULK_DELETE_POST";
-	case MockS3RefreshTarget::DELETE:
+	case MockS3RefreshTarget::DELETE_OBJECT:
 		return "DELETE";
 	case MockS3RefreshTarget::LIST_OBJECTS_GET:
 		return "LIST_OBJECTS_GET";
