@@ -189,6 +189,17 @@ static bool HasRequestWithKey(const vector<MockS3RequestObservation> &observatio
 	return false;
 }
 
+static idx_t CountObservations(const vector<MockS3RequestObservation> &observations, const string &method,
+                               const string &key_id, int status) {
+	idx_t result = 0;
+	for (auto &observation : observations) {
+		if (observation.method == method && observation.key_id == key_id && observation.status == status) {
+			result++;
+		}
+	}
+	return result;
+}
+
 template <class OPERATION>
 static vector<MockS3RequestObservation> RunRefreshScenario(MockS3RefreshTarget refresh_target,
                                                            const string &client_implementation, bool connection_caching,
@@ -420,6 +431,43 @@ static void RunListGlobRefreshDisabledScenario() {
 	AssertNoRefresh(test_id);
 }
 
+static void RunMultipleStaleHandlesSingleRefreshScenario() {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::RANGE_GET;
+	auto object_data = config.object_data;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto test_id = ConfigureRefreshTest(db, con, server, "httplib", false);
+
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	vector<unique_ptr<FileHandle>> handles;
+	for (idx_t i = 0; i < 4; i++) {
+		handles.push_back(fs.OpenFile(S3_PATH, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO));
+		REQUIRE(handles.back());
+	}
+
+	const idx_t offset = 7;
+	const idx_t read_size = 9;
+	for (auto &handle : handles) {
+		string buffer(read_size, '\0');
+		handle->Read(QueryContext(*con.context), &buffer[0], read_size, offset);
+		REQUIRE(buffer == object_data.substr(offset, read_size));
+	}
+	RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(CountObservations(observations, "GET", STALE_KEY_ID, 403) >= handles.size());
+	REQUIRE(CountObservations(observations, "GET", FRESH_KEY_ID, 206) == handles.size());
+	AssertSingleRefresh(test_id);
+}
+
 } // namespace
 
 TEST_CASE("HTTPFS refreshes S3 credentials across request methods", "[httpfs][s3][refresh]") {
@@ -441,6 +489,10 @@ TEST_CASE("HTTPFS can disable S3 credential refresh", "[httpfs][s3][refresh]") {
 	SECTION("list glob fails without refresh") {
 		RunListGlobRefreshDisabledScenario();
 	}
+}
+
+TEST_CASE("HTTPFS reuses one S3 credential refresh across stale handles", "[httpfs][s3][refresh]") {
+	RunMultipleStaleHandlesSingleRefreshScenario();
 }
 
 } // namespace duckdb
