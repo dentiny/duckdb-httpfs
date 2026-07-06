@@ -46,7 +46,14 @@ public:
 		state = http_params.state;
 	}
 
+	static void AddUserAgentIfAvailable(HTTPFSParams &http_params, HTTPHeaders &header_map) {
+		if (!http_params.user_agent.empty()) {
+			header_map.Insert("User-Agent", http_params.user_agent);
+		}
+	}
+
 	unique_ptr<HTTPResponse> Get(GetRequestInfo &info) override {
+		AddUserAgentIfAvailable(static_cast<HTTPFSParams &>(info.params), info.headers);
 		if (state) {
 			state->get_count++;
 		}
@@ -69,6 +76,7 @@ public:
 		}
 	}
 	unique_ptr<HTTPResponse> Put(PutRequestInfo &info) override {
+		AddUserAgentIfAvailable(static_cast<HTTPFSParams &>(info.params), info.headers);
 		if (state) {
 			state->put_count++;
 			state->total_bytes_sent += info.buffer_in_len;
@@ -79,6 +87,7 @@ public:
 	}
 
 	unique_ptr<HTTPResponse> Head(HeadRequestInfo &info) override {
+		AddUserAgentIfAvailable(static_cast<HTTPFSParams &>(info.params), info.headers);
 		if (state) {
 			state->head_count++;
 		}
@@ -87,6 +96,7 @@ public:
 	}
 
 	unique_ptr<HTTPResponse> Delete(DeleteRequestInfo &info) override {
+		AddUserAgentIfAvailable(static_cast<HTTPFSParams &>(info.params), info.headers);
 		if (state) {
 			state->delete_count++;
 		}
@@ -95,6 +105,7 @@ public:
 	}
 
 	unique_ptr<HTTPResponse> Post(PostRequestInfo &info) override {
+		AddUserAgentIfAvailable(static_cast<HTTPFSParams &>(info.params), info.headers);
 		if (state) {
 			state->post_count++;
 			state->total_bytes_sent += info.buffer_in_len;

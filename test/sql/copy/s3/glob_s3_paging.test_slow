@@ -113,6 +113,14 @@ SELECT count(*) FROM glob('s3://test-bucket/parquet_glob*/paging/*');
 
 endloop
 
+# every logged request must carry a User-Agent that identifies duckdb
+query I
+SELECT count(*) FROM duckdb_logs_parsed('HTTP')
+WHERE request.headers['User-Agent'] IS NULL
+   OR NOT starts_with(request.headers['User-Agent'], 'duckdb')
+----
+0
+
 query IIIII
 FROM (FROM duckdb_logs_parsed('HTTP') SELECT count(*), sum(request.type == 'HEAD') head, sum(request.type == 'GET') get, sum(request.type == 'POST') post, sum(request.type == 'PUT') put GROUP BY context_id ORDER BY context_id) WHERE post == 0;
 ----
