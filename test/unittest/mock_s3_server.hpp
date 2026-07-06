@@ -23,6 +23,8 @@ struct MockS3ServerConfig {
 	string stale_key_id = "STALE_KEY";
 	string etag = "\"httpfs-refresh-test-etag\"";
 	MockS3RefreshTarget refresh_target = MockS3RefreshTarget::HEAD;
+	//! Answer this many leading ListObjectsV2 requests with HTTP 503 SlowDown
+	idx_t transient_503_lists = 0;
 };
 
 struct MockS3RequestObservation {

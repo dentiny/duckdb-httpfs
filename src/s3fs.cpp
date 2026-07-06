@@ -1894,11 +1894,16 @@ string AWSListObjectV2::Request(const string &path, HTTPParams &http_params, S3A
 		} else {
 			actual_path += "/" + listobjectv2_url;
 		}
-		std::stringstream response;
+		std::stringstream response_body;
 		ErrorData error;
 		GetRequestInfo get_request(
 		    actual_path, header_map, http_params,
 		    [&](const HTTPResponse &response) {
+			    // This handler runs once per retry attempt: reset state from a previous
+			    // failed attempt so a transient error (e.g. an S3 503) is not thrown
+			    // below after a retry has already succeeded
+			    response_body.str("");
+			    error = ErrorData();
 			    if (static_cast<int>(response.status) >= 400) {
 				    string trimmed_path = path;
 				    StringUtil::RTrim(trimmed_path, "/");
@@ -1907,7 +1912,7 @@ string AWSListObjectV2::Request(const string &path, HTTPParams &http_params, S3A
 			    return true;
 		    },
 		    [&](const_data_ptr_t data, idx_t data_length) {
-			    response << string(const_char_ptr_cast(data), data_length);
+			    response_body << string(const_char_ptr_cast(data), data_length);
 			    return true;
 		    });
 		auto result = http_params.http_util.Request(get_request);
@@ -1963,7 +1968,7 @@ string AWSListObjectV2::Request(const string &path, HTTPParams &http_params, S3A
 			retried_region = true;
 			continue;
 		}
-		return response.str();
+		return response_body.str();
 	}
 	throw InvalidInputException(
 	    "Exceeded retry count in AWSListObjectV2::Request while retrying region redirects or credential refresh");
