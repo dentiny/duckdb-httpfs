@@ -133,7 +133,8 @@ static string NextTestId() {
 }
 
 static string ConfigureRefreshTest(DuckDB &db, Connection &con, MockS3Server &server,
-                                   const string &client_implementation, bool connection_caching) {
+                                   const string &client_implementation, bool connection_caching,
+                                   bool refresh_enabled = true) {
 	auto test_id = NextTestId();
 
 	LoadHTTPFSExtension(db);
@@ -141,6 +142,8 @@ static string ConfigureRefreshTest(DuckDB &db, Connection &con, MockS3Server &se
 
 	RequireQueryOk(con, StringUtil::Format("SET httpfs_client_implementation='%s'", client_implementation));
 	RequireQueryOk(con, StringUtil::Format("SET httpfs_connection_caching=%s", connection_caching ? "true" : "false"));
+	RequireQueryOk(con,
+	               StringUtil::Format("SET httpfs_enable_credential_refresh=%s", refresh_enabled ? "true" : "false"));
 	RequireQueryOk(con, StringUtil::Format("SET s3_endpoint='%s'", server.Endpoint()));
 	RequireQueryOk(con, "SET s3_region='us-east-1'");
 	RequireQueryOk(con, "SET s3_use_ssl=false");
@@ -169,6 +172,21 @@ static void AssertSingleRefresh(const string &test_id) {
 	auto stats = GetProviderStats(test_id);
 	REQUIRE(stats.initial_creations == 1);
 	REQUIRE(stats.refresh_creations == 1);
+}
+
+static void AssertNoRefresh(const string &test_id) {
+	auto stats = GetProviderStats(test_id);
+	REQUIRE(stats.initial_creations == 1);
+	REQUIRE(stats.refresh_creations == 0);
+}
+
+static bool HasRequestWithKey(const vector<MockS3RequestObservation> &observations, const string &key_id) {
+	for (auto &observation : observations) {
+		if (observation.key_id == key_id) {
+			return true;
+		}
+	}
+	return false;
 }
 
 template <class OPERATION>
@@ -348,6 +366,60 @@ static void RunHandleRequestRefreshScenarios(const string &client_implementation
 	RunDeleteRefreshScenario(client_implementation, connection_caching);
 }
 
+static void RunRangeRefreshDisabledScenario() {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::RANGE_GET;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto test_id = ConfigureRefreshTest(db, con, server, "httplib", false, false);
+
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto handle = fs.OpenFile(S3_PATH, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+
+	const idx_t offset = 7;
+	const idx_t read_size = 9;
+	string buffer(read_size, '\0');
+	REQUIRE_THROWS(handle->Read(QueryContext(*con.context), &buffer[0], read_size, offset));
+	RequireQueryOk(con, "ROLLBACK");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 403, "bytes=7-15"));
+	REQUIRE_FALSE(HasRequestWithKey(observations, FRESH_KEY_ID));
+	AssertNoRefresh(test_id);
+}
+
+static void RunListGlobRefreshDisabledScenario() {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::LIST_OBJECTS_GET;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto test_id = ConfigureRefreshTest(db, con, server, "httplib", false, false);
+
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto result = con.Query("SELECT file FROM glob('s3://refresh-bucket/object*.bin')");
+	REQUIRE(result);
+	REQUIRE(result->HasError());
+	RequireQueryOk(con, "ROLLBACK");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 403, string(), "list-type=2"));
+	REQUIRE_FALSE(HasRequestWithKey(observations, FRESH_KEY_ID));
+	AssertNoRefresh(test_id);
+}
+
 } // namespace
 
 TEST_CASE("HTTPFS refreshes S3 credentials across request methods", "[httpfs][s3][refresh]") {
@@ -359,6 +431,15 @@ TEST_CASE("HTTPFS refreshes S3 credentials across request methods", "[httpfs][s3
 	}
 	SECTION("curl without connection caching") {
 		RunAllRequestRefreshScenarios("curl", false);
+	}
+}
+
+TEST_CASE("HTTPFS can disable S3 credential refresh", "[httpfs][s3][refresh]") {
+	SECTION("range reads fail without refresh") {
+		RunRangeRefreshDisabledScenario();
+	}
+	SECTION("list glob fails without refresh") {
+		RunListGlobRefreshDisabledScenario();
 	}
 }
 

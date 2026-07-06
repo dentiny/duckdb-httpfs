@@ -231,11 +231,23 @@ static bool TryRefreshS3SecretForPath(ClientContext &context, const string &path
 	return refreshed_secret;
 }
 
-static bool TryRefreshS3AuthMaterial(ClientContext *context, optional_ptr<FileOpener> opener, const string &path,
-                                     S3AuthParams &auth_params, HTTPFSParams &http_params,
+static bool IsS3CredentialRefreshEnabled(optional_ptr<FileOpener> opener) {
+	Value value;
+	if (FileOpener::TryGetCurrentSetting(opener, "httpfs_enable_credential_refresh", value)) {
+		return value.GetValue<bool>();
+	}
+	return true;
+}
+
+static bool TryRefreshS3AuthMaterial(optional_ptr<ClientContext> context, optional_ptr<FileOpener> opener,
+                                     const string &path, S3AuthParams &auth_params, HTTPFSParams &http_params,
                                      const S3AuthParams &request_auth_params,
                                      const S3RefreshableHTTPParams &request_http_params,
-                                     HTTPClientCache *client_cache = nullptr, bool preserve_region = false) {
+                                     bool credential_refresh_enabled, HTTPClientCache *client_cache = nullptr,
+                                     bool preserve_region = false) {
+	if (!credential_refresh_enabled) {
+		return false;
+	}
 	if (!S3AuthParamsMatch(auth_params, request_auth_params) ||
 	    !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(http_params), request_http_params)) {
 		return true;
@@ -649,14 +661,15 @@ void S3FileHandle::SetRegion(string region_p) {
 
 bool S3FileHandle::TryRefreshAuthParams(S3AuthParams request_auth_params, S3RefreshableHTTPParams request_http_params) {
 	lock_guard<mutex> lck(mu);
+	auto refresh_enabled = credential_refresh_enabled;
 	auto context = client_context.lock();
 	if (!context) {
 		return TryRefreshS3AuthMaterial(nullptr, nullptr, path, auth_params, http_params, request_auth_params,
-		                                request_http_params, &client_cache, region_redirected);
+		                                request_http_params, refresh_enabled, &client_cache, region_redirected);
 	}
 	ClientContextFileOpener opener(*context);
 	return TryRefreshS3AuthMaterial(context.get(), opener, path, auth_params, http_params, request_auth_params,
-	                                request_http_params, &client_cache, region_redirected);
+	                                request_http_params, refresh_enabled, &client_cache, region_redirected);
 }
 
 void S3HTTPInput::SetRegion(string region_p) {
@@ -667,14 +680,15 @@ void S3HTTPInput::SetRegion(string region_p) {
 bool S3HTTPInput::TryRefreshAuthParams(const string &path, S3AuthParams request_auth_params,
                                        S3RefreshableHTTPParams request_http_params) {
 	lock_guard<mutex> lck(mu);
+	auto refresh_enabled = credential_refresh_enabled;
 	auto context = client_context.lock();
 	if (!context) {
 		return TryRefreshS3AuthMaterial(nullptr, nullptr, path, auth_params, http_params, request_auth_params,
-		                                request_http_params, nullptr, region_redirected);
+		                                request_http_params, refresh_enabled, nullptr, region_redirected);
 	}
 	ClientContextFileOpener opener(*context);
 	return TryRefreshS3AuthMaterial(context.get(), opener, path, auth_params, http_params, request_auth_params,
-	                                request_http_params, nullptr, region_redirected);
+	                                request_http_params, refresh_enabled, nullptr, region_redirected);
 }
 
 static bool TryRefreshS3AuthParams(optional_ptr<FileOpener> opener, const string &path, HTTPParams &http_params,
@@ -682,8 +696,9 @@ static bool TryRefreshS3AuthParams(optional_ptr<FileOpener> opener, const string
                                    const S3RefreshableHTTPParams &request_http_params, bool preserve_region = false) {
 	auto &httpfs_params = http_params.Cast<HTTPFSParams>();
 	auto context = FileOpener::TryGetClientContext(opener);
-	return TryRefreshS3AuthMaterial(context.get(), opener, path, auth_params, httpfs_params, request_auth_params,
-	                                request_http_params, nullptr, preserve_region);
+	return TryRefreshS3AuthMaterial(context, opener, path, auth_params, httpfs_params, request_auth_params,
+	                                request_http_params, IsS3CredentialRefreshEnabled(opener), nullptr,
+	                                preserve_region);
 }
 
 S3ConfigParams S3ConfigParams::ReadFrom(optional_ptr<FileOpener> opener) {
@@ -1000,15 +1015,25 @@ HTTPMetadataCacheEntry S3FileHandle::GetCacheEntry() const {
 
 void S3FileHandle::Initialize(optional_ptr<FileOpener> opener) {
 	auto context = FileOpener::TryGetClientContext(opener);
+	auto refresh_enabled = IsS3CredentialRefreshEnabled(opener);
 	auto &s3_input = http_input->Cast<S3HTTPInput>();
-	if (context) {
-		client_context = context->shared_from_this();
+	{
+		lock_guard<mutex> lck(mu);
+		credential_refresh_enabled = refresh_enabled;
+		if (context && refresh_enabled) {
+			client_context = context->shared_from_this();
+		} else {
+			client_context.reset();
+		}
+	}
+	{
 		lock_guard<mutex> input_lck(s3_input.mu);
-		s3_input.client_context = context->shared_from_this();
-	} else {
-		client_context.reset();
-		lock_guard<mutex> input_lck(s3_input.mu);
-		s3_input.client_context.reset();
+		s3_input.credential_refresh_enabled = refresh_enabled;
+		if (context && refresh_enabled) {
+			s3_input.client_context = context->shared_from_this();
+		} else {
+			s3_input.client_context.reset();
+		}
 	}
 	try {
 		HTTPFileHandle::Initialize(opener);
@@ -1230,7 +1255,7 @@ static bool HasRefreshableS3Secret(optional_ptr<FileOpener> opener, const string
 
 static void AddDeleteBatchRefreshKeyParts(S3DeleteBatchKeyBuilder &key_builder, optional_ptr<FileOpener> opener,
                                           const string &path) {
-	if (HasRefreshableS3Secret(opener, path)) {
+	if (IsS3CredentialRefreshEnabled(opener) && HasRefreshableS3Secret(opener, path)) {
 		key_builder.AddString(GetDeleteBatchLookupDirectory(path));
 	} else {
 		key_builder.AddString("");

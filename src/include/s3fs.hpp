@@ -145,6 +145,7 @@ private:
 	mutex mu;
 	weak_ptr<ClientContext> client_context;
 	bool region_redirected = false;
+	bool credential_refresh_enabled = true;
 
 	bool TryRefreshAuthParams(const string &path, S3AuthParams request_auth_params,
 	                          S3RefreshableHTTPParams request_http_params);
@@ -183,6 +184,7 @@ private:
 
 	weak_ptr<ClientContext> client_context;
 	bool region_redirected = false;
+	bool credential_refresh_enabled = true;
 };
 
 class S3FileSystem : public HTTPFileSystem {
