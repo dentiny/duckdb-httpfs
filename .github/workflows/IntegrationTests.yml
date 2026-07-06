@@ -74,6 +74,12 @@ jobs:
         shell: bash
         run: make
 
+      - name: Run HTTPFS C++ unit tests
+        shell: bash
+        run: |
+          cmake --build build/release --target unittest_httpfs
+          ./build/release/test/unittest_httpfs "[httpfs][s3][refresh]"
+
       - name: Install test server
         shell: bash
         run: |

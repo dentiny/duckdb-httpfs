@@ -147,7 +147,7 @@ CreateSecretInput CreateS3SecretFunctions::GenerateRefreshSecretInfo(const Secre
 
 	CreateSecretInput result;
 	result.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
-	result.persist_type = SecretPersistType::TEMPORARY;
+	result.persist_type = secret_entry.persist_type;
 
 	result.type = kv_secret.GetType();
 	result.name = kv_secret.GetName();
@@ -167,6 +167,23 @@ CreateSecretInput CreateS3SecretFunctions::GenerateRefreshSecretInfo(const Secre
 	return result;
 }
 
+static bool SecretCredentialMaterialChanged(const KeyValueSecret &old_secret, const KeyValueSecret &new_secret) {
+	for (auto &key : {"key_id", "secret", "session_token", "region", "endpoint", "kms_key_id", "url_style", "use_ssl",
+	                  "url_compatibility_mode", "requester_pays", "bearer_token", "account_id"}) {
+		Value old_value;
+		Value new_value;
+		auto old_has_value = old_secret.TryGetValue(key, old_value);
+		auto new_has_value = new_secret.TryGetValue(key, new_value);
+		if (old_has_value != new_has_value) {
+			return true;
+		}
+		if (old_has_value && !Value::NotDistinctFrom(old_value, new_value)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 //! Function that will automatically try to refresh a secret
 bool CreateS3SecretFunctions::TryRefreshS3Secret(ClientContext &context, const SecretEntry &secret_to_refresh) {
 	const auto &kv_secret = dynamic_cast<const KeyValueSecret &>(*secret_to_refresh.secret);
@@ -182,8 +199,10 @@ bool CreateS3SecretFunctions::TryRefreshS3Secret(ClientContext &context, const S
 	try {
 		auto res = secret_manager.CreateSecret(context, refresh_input);
 		auto &new_secret = dynamic_cast<const KeyValueSecret &>(*res->secret);
-		DUCKDB_LOG_INFO(context, "Successfully refreshed secret: %s, new key_id: %s",
-		                secret_to_refresh.secret->GetName(), new_secret.TryGetValue("key_id").ToString());
+		if (SecretCredentialMaterialChanged(kv_secret, new_secret)) {
+			DUCKDB_LOG_INFO(context, "Successfully refreshed secret: %s, new key_id: %s",
+			                secret_to_refresh.secret->GetName(), new_secret.TryGetValue("key_id").ToString());
+		}
 		return true;
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
