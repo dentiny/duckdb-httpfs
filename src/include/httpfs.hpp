@@ -94,6 +94,7 @@ public:
 	bool write_overwrite_mode = false;
 
 	// When using full file download, the full file will be written to a cached file handle
+	mutex full_download_mutex;
 	unique_ptr<CachedFileHandle> cached_file_handle;
 
 	// Read info
