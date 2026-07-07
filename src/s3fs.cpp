@@ -759,6 +759,7 @@ void S3FileHandle::Initialize(optional_ptr<FileOpener> opener) {
 			    path, auth_params.region, correct_region);
 			SetRegion(std::move(correct_region));
 		}
+		ResetDownloadState();
 		HTTPFileHandle::Initialize(opener);
 	}
 
