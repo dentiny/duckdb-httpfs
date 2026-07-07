@@ -772,11 +772,17 @@ void HTTPFileHandle::FullDownload(HTTPFileSystem &hfs, bool &should_write_cache)
 	const auto &cache_entry = http_params.state->GetCachedFile(path);
 	cached_file_handle = cache_entry->GetHandle();
 	if (!cached_file_handle->Initialized()) {
-		const auto full_download_result = hfs.GetRequest(*this, path, {});
-		if (full_download_result->status != HTTPStatusCode::OK_200) {
-			throw HTTPException(*full_download_result, "Full download failed to to URL \"%s\": %d (%s)",
-			                    full_download_result->url, static_cast<int>(full_download_result->status),
-			                    full_download_result->GetError());
+		try {
+			auto full_download_result = hfs.GetRequest(*this, path, {});
+			if (full_download_result->status != HTTPStatusCode::OK_200) {
+				throw HTTPException(*full_download_result, "Full download failed to to URL \"%s\": %d (%s)",
+				                    full_download_result->url, static_cast<int>(full_download_result->status),
+				                    full_download_result->GetError());
+			}
+		} catch (...) {
+			ResetDownloadState();
+			cached_file_handle.reset();
+			throw;
 		}
 		cached_file_handle->SetInitialized(length);
 	} else {
@@ -826,6 +832,13 @@ optional_idx TryParseContentLength(const HTTPHeaders &headers) {
 	} catch (...) {
 		return optional_idx();
 	}
+}
+
+void HTTPFileHandle::ResetDownloadState() {
+	if (cached_file_handle) {
+		cached_file_handle->ResetBuffer();
+	}
+	length = 0;
 }
 
 void HTTPFileHandle::LoadFileInfo() {
