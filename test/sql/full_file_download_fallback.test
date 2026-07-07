@@ -41,6 +41,10 @@ true
 statement ok
 set auto_fallback_to_full_download=false
 
+# The successful fallback above can populate the external file cache. Disable it so the negative check below still attempts an HTTP range request.
+statement ok
+set enable_external_file_cache=false
+
 statement error
 pragma tpch(6);
 ----
