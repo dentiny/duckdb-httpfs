@@ -485,8 +485,7 @@ void HTTPFileHandle::AddStatistics(idx_t read_offset, idx_t read_length, idx_t r
 	range_request_statistics.push_back({read_offset, read_length, read_duration});
 }
 
-void HTTPFileHandle::RecordNetworkSample(double total_seconds, idx_t bytes, bool sample_has_ttfb,
-                                         double ttfb_seconds) {
+void HTTPFileHandle::RecordNetworkSample(double total_seconds, idx_t bytes, bool sample_has_ttfb, double ttfb_seconds) {
 	if (!(total_seconds > 0)) {
 		return;
 	}

@@ -54,7 +54,8 @@ public:
 		if (!info.response_handler && !info.content_handler) {
 			return TransformResult(client->Get(info.path, headers));
 		} else {
-			// The httplib client streams per chunk, so the first chunk gives us TTFB, used by the prefetch cost model as the latency estimate.
+			// The httplib client streams per chunk, so the first chunk gives us TTFB, used by the prefetch cost model
+			// as the latency estimate.
 			const auto request_monotonic_start = TimePoint::Tick();
 			idx_t total_bytes = 0;
 			bool first_chunk = true;
@@ -70,8 +71,7 @@ public:
 					    info.have_time_to_fst_byte = true;
 					    // Time to first byte is the duration from issuing the request until the first chunk arrives.
 					    const auto elapsed_nanos = TimePoint::ElapsedNanos(request_monotonic_start, TimePoint::Tick());
-					    info.time_to_fst_byte_sec =
-					        elapsed_nanos > 0 ? static_cast<double>(elapsed_nanos) / 1e9 : 0;
+					    info.time_to_fst_byte_sec = elapsed_nanos > 0 ? static_cast<double>(elapsed_nanos) / 1e9 : 0;
 				    }
 				    total_bytes += data_length;
 				    if (state) {
