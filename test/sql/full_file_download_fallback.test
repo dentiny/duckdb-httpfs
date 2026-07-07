@@ -31,10 +31,12 @@ pragma tpch(6);
 ----
 123141078.22829981
 
+# Parallel readers may all observe the unsupported range request before the first
+# full download finishes, so the exact warning count depends on scheduling.
 query I
-select count(*) from duckdb_logs where log_level='WARNING' and message like '%Falling back to full%'
+select count(*) > 0 from duckdb_logs where log_level='WARNING' and message like '%Falling back to full%'
 ----
-2
+true
 
 statement ok
 set auto_fallback_to_full_download=false
