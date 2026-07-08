@@ -11,17 +11,6 @@ require-env PYTHON_HTTP_SERVER_URL
 
 require-env PYTHON_HTTP_SERVER_DIR
 
-# FIXME: SKIP — this test triggers a confirmed deadlock in duckdb CORE, a regression
-# from bumping the duckdb submodule to main. MultiFileFunction::ClaimNextJob holds
-# gstate.lock across TryInitializeScan, under which the external file cache runs a
-# NESTED executor.WorkOnTasks() whose FetchBlockTask -> httpfs FullDownload acquires
-# CachedFile::lock. On a small worker pool (CI runners; reproduced locally at
-# threads=2) the pool starves and every thread futex-parks. The fix must land upstream
-# in duckdb/duckdb — httpfs cannot break the core lock cycle. Skipping so CI is not
-# wedged and any downstream failures can surface. See bump_to_main worker memory
-# (2026-07-06 "ROOT CAUSE FOUND + REPRODUCED").
-mode skip
-
 statement ok
 CALL enable_logging();
 
@@ -42,13 +31,19 @@ pragma tpch(6);
 ----
 123141078.22829981
 
+# Parallel readers may all observe the unsupported range request before the first
+# full download finishes, so the exact warning count depends on scheduling.
 query I
-select count(*) from duckdb_logs where log_level='WARNING' and message like '%Falling back to full%'
+select count(*) > 0 from duckdb_logs where log_level='WARNING' and message like '%Falling back to full%'
 ----
-2
+true
 
 statement ok
 set auto_fallback_to_full_download=false
+
+# The successful fallback above can populate the external file cache. Disable it so the negative check below still attempts an HTTP range request.
+statement ok
+set enable_external_file_cache=false
 
 statement error
 pragma tpch(6);

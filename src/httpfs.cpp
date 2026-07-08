@@ -806,13 +806,15 @@ static optional_ptr<HTTPMetadataCache> TryGetMetadataCache(optional_ptr<FileOpen
 }
 
 void HTTPFileHandle::FullDownload(HTTPFileSystem &hfs, bool &should_write_cache) {
-	// We are going to download the file at full, we don't need to do no head request.
+	lock_guard<mutex> guard(full_download_mutex);
+	if (cached_file_handle && cached_file_handle->Initialized()) {
+		length = cached_file_handle->GetSize();
+		should_write_cache = false;
+		return;
+	}
 	const auto &cache_entry = http_params.state->GetCachedFile(path);
 	cached_file_handle = cache_entry->GetHandle();
 	if (!cached_file_handle->Initialized()) {
-		// Try to fully download the file first. On any failure we reset the buffer and release the
-		// handle (and with it the lock on the cached file) so the download can be retried from
-		// scratch with a fresh handle, without deadlocking on the still-held lock.
 		try {
 			auto full_download_result = hfs.GetRequest(*this, path, {});
 			if (full_download_result->status != HTTPStatusCode::OK_200) {
@@ -825,15 +827,11 @@ void HTTPFileHandle::FullDownload(HTTPFileSystem &hfs, bool &should_write_cache)
 			cached_file_handle.reset();
 			throw;
 		}
-		// Mark the file as initialized, set its final length, and unlock it to allowing parallel reads
 		cached_file_handle->SetInitialized(length);
-		// We shouldn't write these to cache
-		should_write_cache = false;
 	} else {
 		length = cached_file_handle->GetSize();
-		// No need to cache metadata for fully downloaded files
-		should_write_cache = false;
 	}
+	should_write_cache = false;
 }
 
 bool HTTPFileSystem::TryParseLastModifiedTime(const string &timestamp, timestamp_t &result) {
