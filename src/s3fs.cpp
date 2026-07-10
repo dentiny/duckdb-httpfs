@@ -458,10 +458,16 @@ static void SleepForTransientRetry(const HTTPFSParams &http_params, idx_t transi
 	wait_ms *= http_params.retry_backoff;
 }
 
+// Transient retries replay the whole request, so restrict them to idempotent methods. POST is excluded:
+// replaying multipart-init would orphan a second upload, and multipart-complete/bulk-delete are ambiguous.
+static bool IsTransientRetryEligibleMethod(const string &method) {
+	return method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE";
+}
+
 template <class CREATE_DATA, class REQUEST, class REFRESH, class SET_REGION>
-static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefreshInternal(const string &s3_url, CREATE_DATA create_data,
-                                                                    REQUEST request, REFRESH refresh_auth_params,
-                                                                    SET_REGION set_region) {
+static unique_ptr<HTTPResponse>
+RunS3RequestWithAuthRefreshInternal(const string &s3_url, bool transient_retry_eligible, CREATE_DATA create_data,
+                                    REQUEST request, REFRESH refresh_auth_params, SET_REGION set_region) {
 	// Auth refresh and region redirect are one-shot; transient S3 errors are retried with backoff up to http_retries.
 	bool retried_auth_refresh = false;
 	bool retried_region = false;
@@ -485,7 +491,8 @@ static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefreshInternal(const string
 				continue;
 			}
 			string s3_error_code;
-			if (result && transient_retries < http_params.retries && IsTransientS3Error(*result, s3_error_code)) {
+			if (transient_retry_eligible && result && transient_retries < http_params.retries &&
+			    IsTransientS3Error(*result, s3_error_code)) {
 				SleepForTransientRetry(http_params, transient_retries, transient_wait_ms);
 				transient_retries++;
 				continue;
@@ -505,7 +512,8 @@ static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefreshInternal(const string
 				continue;
 			}
 			string s3_error_code;
-			if (transient_retries < http_params.retries && IsTransientS3Error(error, s3_error_code)) {
+			if (transient_retry_eligible && transient_retries < http_params.retries &&
+			    IsTransientS3Error(error, s3_error_code)) {
 				SleepForTransientRetry(http_params, transient_retries, transient_wait_ms);
 				transient_retries++;
 				continue;
@@ -521,7 +529,7 @@ S3FileSystem::RunS3InputRequestWithAuthRefresh(S3HTTPInput &s3_input, const stri
                                                const string &query_string, const string &payload_hash,
                                                const string &content_type, REQUEST request) {
 	return RunS3RequestWithAuthRefreshInternal(
-	    s3_url,
+	    s3_url, IsTransientRetryEligibleMethod(method),
 	    [&]() {
 		    lock_guard<mutex> lck(s3_input.mu);
 		    return CreateS3RequestData(s3_input.auth_params, s3_input.http_params, s3_url, method, query_string,
@@ -542,7 +550,8 @@ unique_ptr<HTTPResponse> S3FileSystem::RunS3HandleRequestWithAuthRefresh(S3FileH
                                                                          const string &method, bool use_version_id,
                                                                          REQUEST request) {
 	return RunS3RequestWithAuthRefreshInternal(
-	    s3_url, [&]() { return CreateS3HandleRequestData(s3_handle, s3_url, method, use_version_id); }, request,
+	    s3_url, IsTransientRetryEligibleMethod(method),
+	    [&]() { return CreateS3HandleRequestData(s3_handle, s3_url, method, use_version_id); }, request,
 	    [&](const S3AuthParams &request_auth_params, const S3RefreshableHTTPParams &request_http_params) {
 		    return s3_handle.TryRefreshAuthParams(request_auth_params, request_http_params);
 	    },

@@ -304,6 +304,16 @@ static void WriteMultipartPayload(Connection &con) {
 	handle->Close();
 }
 
+// A payload small enough to be a single-shot PUT (no multipart), so the S3 request loop is the only
+// retry layer and the PUT count reflects exactly that loop's behavior.
+static void WriteSinglePutPayload(Connection &con) {
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto handle = fs.OpenFile(S3_PATH, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+	string payload = "single-shot payload";
+	handle->Write(QueryContext(*con.context), &payload[0], payload.size());
+	handle->Close();
+}
+
 static void RunMultipartInitiatePostRefreshScenario(const string &client_implementation, bool connection_caching) {
 	auto observations =
 	    RunRefreshScenario(MockS3RefreshTarget::MULTIPART_INITIATE_POST, client_implementation, connection_caching,
@@ -476,7 +486,6 @@ static void RunTransientPutRetryScenario(const string &client_implementation) {
 	// Use a refresh target that writes never exercise, so credential refresh never triggers here.
 	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
 	config.transient_put_failures = 2;
-	config.put_failure_is_request_timeout = true;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -498,15 +507,53 @@ static void RunTransientPutRetryScenario(const string &client_implementation) {
 	REQUIRE(MockS3HasObservation(observations, "POST", STALE_KEY_ID, 200, string(), "uploadId"));
 }
 
-static void RunNonRetryablePutFailureScenario(const string &client_implementation) {
+static idx_t CountObservationsTarget(const vector<MockS3RequestObservation> &observations, const string &method,
+                                     int status, const string &target_contains) {
+	idx_t result = 0;
+	for (auto &observation : observations) {
+		if (observation.method == method && observation.status == status &&
+		    (target_contains.empty() || observation.target.find(target_contains) != string::npos)) {
+			result++;
+		}
+	}
+	return result;
+}
+
+// A generic (non-RequestTimeout) 400 must fail on the first try. Uses a single-shot PUT so exactly one
+// request is expected, distinguishing "not retried" from "retried N times and still failed".
+static void RunGenericErrorNotRetriedScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
 	config.bucket = BUCKET;
 	config.object_key = OBJECT_KEY;
 	config.stale_key_id = STALE_KEY_ID;
 	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	// Fail every part upload with a non-RequestTimeout 400, which must NOT be retried.
 	config.transient_put_failures = 1000;
-	config.put_failure_is_request_timeout = false;
+	config.failure_is_request_timeout = false;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureRefreshTest(db, con, server, client_implementation, false);
+
+	RequireQueryOk(con, "SET http_retries=3");
+	RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	REQUIRE_THROWS(WriteSinglePutPayload(con));
+	RequireQueryOk(con, "ROLLBACK");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(CountObservations(observations, "PUT", STALE_KEY_ID, 400) == 1);
+}
+
+// Even a retryable RequestTimeout must NOT replay a multipart-init POST (it would orphan an upload id).
+static void RunMultipartInitNotRetriedScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.transient_post_failures = 1000;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -521,9 +568,33 @@ static void RunNonRetryablePutFailureScenario(const string &client_implementatio
 
 	auto observations = server.Observations();
 	INFO(MockS3DescribeObservations(observations));
-	REQUIRE(MockS3HasObservation(observations, "PUT", STALE_KEY_ID, 400, string(), "partNumber"));
-	// A generic 400 is fatal: no part upload is retried into a success.
-	REQUIRE(CountObservations(observations, "PUT", STALE_KEY_ID, 200) == 0);
+	REQUIRE(CountObservationsTarget(observations, "POST", 400, "uploads") == 1);
+}
+
+// A RequestTimeout that never clears exhausts exactly http_retries retries (one initial + http_retries).
+static void RunRetryBudgetScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.transient_put_failures = 1000;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureRefreshTest(db, con, server, client_implementation, false);
+
+	RequireQueryOk(con, "SET http_retries=2");
+	RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	REQUIRE_THROWS(WriteSinglePutPayload(con));
+	RequireQueryOk(con, "ROLLBACK");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	// One initial attempt plus http_retries (2) retries.
+	REQUIRE(CountObservations(observations, "PUT", STALE_KEY_ID, 400) == 3);
 }
 
 static void RunTransientGetRetryScenario(const string &client_implementation) {
@@ -567,8 +638,14 @@ TEST_CASE("HTTPFS retries transient S3 RequestTimeout across request types", "[h
 	SECTION("object read (thrown-exception path) retries and completes") {
 		RunTransientGetRetryScenario("httplib");
 	}
-	SECTION("a non-RequestTimeout 400 is not retried") {
-		RunNonRetryablePutFailureScenario("httplib");
+	SECTION("a generic 400 is not retried") {
+		RunGenericErrorNotRetriedScenario("httplib");
+	}
+	SECTION("a multipart-init POST is not retried even on RequestTimeout") {
+		RunMultipartInitNotRetriedScenario("httplib");
+	}
+	SECTION("retries are bounded by http_retries") {
+		RunRetryBudgetScenario("httplib");
 	}
 }
 
