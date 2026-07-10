@@ -407,16 +407,72 @@ static optional_idx GetRegionRedirect(const ErrorData &error, const S3AuthParams
 	return optional_idx(0);
 }
 
+// Defined later in this file; needed here to read the S3 error <Code> out of an error body.
+optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
+
+// Some S3 conditions are transient but surface as an HTTP status core does not retry (e.g. a stalled
+// socket -> HTTP 400 with <Code>RequestTimeout</Code>). The real reason lives in the S3 error <Code>,
+// which is why this is classified here in the S3 layer rather than in core's status-only retry.
+static bool IsRetryableS3ErrorCode(const string &code) {
+	return code == "RequestTimeout";
+}
+
+static bool ParseTransientS3Error(int status_code, const string &body, string &code_out) {
+	if (status_code < 400 || body.empty()) {
+		return false;
+	}
+	string code;
+	if (!FindTagContents(body, "Code", 0, code).IsValid() || !IsRetryableS3ErrorCode(code)) {
+		return false;
+	}
+	code_out = std::move(code);
+	return true;
+}
+
+static bool IsTransientS3Error(const HTTPResponse &response, string &code_out) {
+	return ParseTransientS3Error(static_cast<int>(response.status), response.body, code_out);
+}
+
+static bool IsTransientS3Error(const ErrorData &error, string &code_out) {
+	auto &extra_info = error.ExtraInfo();
+	auto status_entry = extra_info.find("status_code");
+	auto body_entry = extra_info.find("response_body");
+	if (status_entry == extra_info.end() || body_entry == extra_info.end()) {
+		return false;
+	}
+	int status_code;
+	try {
+		status_code = std::stoi(status_entry->second);
+	} catch (...) {
+		return false;
+	}
+	return ParseTransientS3Error(status_code, body_entry->second, code_out);
+}
+
+// No wait on the first retry, then retry_wait_ms scaled by retry_backoff (mirrors core's backoff).
+static void SleepForTransientRetry(const HTTPFSParams &http_params, idx_t transient_retries, double &wait_ms) {
+	if (transient_retries == 0) {
+		wait_ms = static_cast<double>(http_params.retry_wait_ms);
+		return;
+	}
+	ThreadUtil::SleepMs(static_cast<idx_t>(wait_ms));
+	wait_ms *= http_params.retry_backoff;
+}
+
 template <class CREATE_DATA, class REQUEST, class REFRESH, class SET_REGION>
 static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefreshInternal(const string &s3_url, CREATE_DATA create_data,
                                                                     REQUEST request, REFRESH refresh_auth_params,
                                                                     SET_REGION set_region) {
-	// create_data snapshots signed request material, request sends it,
-	// refresh_auth_params reloads changed credentials, and set_region handles region redirects.
+	// create_data snapshots signed request material, request sends it, refresh_auth_params reloads changed
+	// credentials, set_region handles region redirects, and transient S3 errors are retried with backoff.
+	// auth refresh and region redirect are one-shot; transient retries are bounded by http_retries.
 	bool retried_auth_refresh = false;
 	bool retried_region = false;
-	for (idx_t attempt = 0; attempt < 3; attempt++) {
+	idx_t transient_retries = 0;
+	double transient_wait_ms = 0;
+	for (;;) {
 		auto request_data = create_data();
+		auto &http_params = request_data.http_params->template Cast<HTTPFSParams>();
 		try {
 			auto result = request(request_data);
 			if (result && !retried_auth_refresh && IsAuthRefreshStatus(*result) &&
@@ -429,6 +485,12 @@ static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefreshInternal(const string
 			    GetRegionRedirect(*result, request_data.auth_params, correct_region).IsValid()) {
 				set_region(std::move(correct_region));
 				retried_region = true;
+				continue;
+			}
+			string s3_error_code;
+			if (result && transient_retries < http_params.retries && IsTransientS3Error(*result, s3_error_code)) {
+				SleepForTransientRetry(http_params, transient_retries, transient_wait_ms);
+				transient_retries++;
 				continue;
 			}
 			return result;
@@ -445,10 +507,15 @@ static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefreshInternal(const string
 				retried_region = true;
 				continue;
 			}
+			string s3_error_code;
+			if (transient_retries < http_params.retries && IsTransientS3Error(error, s3_error_code)) {
+				SleepForTransientRetry(http_params, transient_retries, transient_wait_ms);
+				transient_retries++;
+				continue;
+			}
 			throw;
 		}
 	}
-	throw InternalException("Exceeded S3 request retry count for '%s'", s3_url);
 }
 
 template <class REQUEST>

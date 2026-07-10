@@ -27,6 +27,8 @@ struct MockS3ServerConfig {
 	idx_t transient_put_failures = 0;
 	//! When failing a part upload, whether the 400 body is S3's retryable RequestTimeout or a generic error
 	bool put_failure_is_request_timeout = true;
+	//! Number of object GETs to fail with a retryable RequestTimeout 400 before succeeding
+	idx_t transient_get_failures = 0;
 };
 
 struct MockS3RequestObservation {

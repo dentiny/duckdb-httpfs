@@ -1,7 +1,5 @@
 #include "s3_multi_part_upload.hpp"
 
-#include "duckdb/common/chrono.hpp"
-
 #include <thread>
 #ifdef EMSCRIPTEN
 #define SAME_THREAD_UPLOAD
@@ -127,39 +125,19 @@ void S3MultiPartUpload::UploadSingleBuffer(shared_ptr<S3WriteBuffer> write_buffe
 	UploadBufferImplementation(write_buffer, "", true);
 }
 
-// S3 reports a stalled part upload as 400 RequestTimeout (not 408), so core's status-based retry
-// misses it. Re-PUTting a part is idempotent, so retry this specific 400 locally.
-static bool IsTransientS3UploadError(const HTTPResponse &res) {
-	if (res.status != HTTPStatusCode::BadRequest_400) {
-		return false;
-	}
-	return res.body.find("RequestTimeout") != string::npos;
-}
-
 void S3MultiPartUpload::UploadBufferImplementation(shared_ptr<S3WriteBuffer> write_buffer, string query_param,
                                                    bool single_upload) {
 	unique_ptr<HTTPResponse> res;
 	string etag;
-	auto &http_params = http_input->http_params;
 
 	try {
-		// Reuse the core retry knobs; no wait on the first retry, then back off (mirrors core).
-		uint64_t attempt = 0;
-		double wait_ms = static_cast<double>(http_params.retry_wait_ms);
-		for (;;) {
-			res = s3fs.PutRequest(*http_input, path, {}, (char *)write_buffer->Ptr(), write_buffer->idx, query_param);
-			if (res->status == HTTPStatusCode::OK_200) {
-				break;
-			}
-			if (attempt >= http_params.retries || !IsTransientS3UploadError(*res)) {
-				throw HTTPException(*res, "Unable to connect to URL %s: %s (HTTP code %d)", path, res->GetError(),
-				                    static_cast<int>(res->status));
-			}
-			if (attempt > 0) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<uint64_t>(wait_ms)));
-				wait_ms *= http_params.retry_backoff;
-			}
-			attempt++;
+		// Transient S3 errors (e.g. RequestTimeout) are retried inside PutRequest by the shared S3 request
+		// loop; a non-OK status here is therefore already final.
+		res = s3fs.PutRequest(*http_input, path, {}, (char *)write_buffer->Ptr(), write_buffer->idx, query_param);
+
+		if (res->status != HTTPStatusCode::OK_200) {
+			throw HTTPException(*res, "Unable to connect to URL %s: %s (HTTP code %d)%s", path, res->GetError(),
+			                    static_cast<int>(res->status), S3FileSystem::ParseS3Error(res->body));
 		}
 
 		if (!res->headers.HasHeader("ETag")) {

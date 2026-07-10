@@ -526,11 +526,46 @@ static void RunNonRetryablePutFailureScenario(const string &client_implementatio
 	REQUIRE(CountObservations(observations, "PUT", STALE_KEY_ID, 200) == 0);
 }
 
+static void RunTransientGetRetryScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.transient_get_failures = 2;
+	auto object_data = config.object_data;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureRefreshTest(db, con, server, client_implementation, false);
+
+	RequireQueryOk(con, "SET http_retries=3");
+	RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	RequireQueryOk(con, "SET force_download=true");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto handle = fs.OpenFile(S3_PATH, FileFlags::FILE_FLAGS_READ);
+	string buffer(8, '\0');
+	handle->Read(QueryContext(*con.context), &buffer[0], buffer.size(), 0);
+	REQUIRE(buffer == object_data.substr(0, buffer.size()));
+	RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	// The read hit transient RequestTimeout 400s (thrown path) and was retried until it succeeded.
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 400));
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 200));
+}
+
 } // namespace
 
-TEST_CASE("HTTPFS retries transient S3 RequestTimeout on multipart upload", "[httpfs][s3][upload]") {
-	SECTION("httplib retries the stalled part and completes the upload") {
+TEST_CASE("HTTPFS retries transient S3 RequestTimeout across request types", "[httpfs][s3][upload]") {
+	SECTION("multipart part upload (returned-response path) retries and completes") {
 		RunTransientPutRetryScenario("httplib");
+	}
+	SECTION("object read (thrown-exception path) retries and completes") {
+		RunTransientGetRetryScenario("httplib");
 	}
 	SECTION("a non-RequestTimeout 400 is not retried") {
 		RunNonRetryablePutFailureScenario("httplib");
