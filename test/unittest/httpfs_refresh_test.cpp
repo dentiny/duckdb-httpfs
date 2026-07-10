@@ -468,7 +468,74 @@ static void RunMultipleStaleHandlesSingleRefreshScenario() {
 	AssertSingleRefresh(test_id);
 }
 
+static void RunTransientPutRetryScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	// Use a refresh target that writes never exercise, so credential refresh never triggers here.
+	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.transient_put_failures = 2;
+	config.put_failure_is_request_timeout = true;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureRefreshTest(db, con, server, client_implementation, false);
+
+	RequireQueryOk(con, "SET http_retries=3");
+	RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	WriteMultipartPayload(con);
+	RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	// The transient RequestTimeout 400s were surfaced, retried, and the same part eventually succeeded.
+	REQUIRE(MockS3HasObservation(observations, "PUT", STALE_KEY_ID, 400, string(), "partNumber"));
+	REQUIRE(MockS3HasObservation(observations, "PUT", STALE_KEY_ID, 200, string(), "partNumber"));
+	// The multipart upload completed successfully.
+	REQUIRE(MockS3HasObservation(observations, "POST", STALE_KEY_ID, 200, string(), "uploadId"));
+}
+
+static void RunNonRetryablePutFailureScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	// Fail every part upload with a non-RequestTimeout 400, which must NOT be retried.
+	config.transient_put_failures = 1000;
+	config.put_failure_is_request_timeout = false;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureRefreshTest(db, con, server, client_implementation, false);
+
+	RequireQueryOk(con, "SET http_retries=3");
+	RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	REQUIRE_THROWS(WriteMultipartPayload(con));
+	RequireQueryOk(con, "ROLLBACK");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(MockS3HasObservation(observations, "PUT", STALE_KEY_ID, 400, string(), "partNumber"));
+	// A generic 400 is fatal: no part upload is retried into a success.
+	REQUIRE(CountObservations(observations, "PUT", STALE_KEY_ID, 200) == 0);
+}
+
 } // namespace
+
+TEST_CASE("HTTPFS retries transient S3 RequestTimeout on multipart upload", "[httpfs][s3][upload]") {
+	SECTION("httplib retries the stalled part and completes the upload") {
+		RunTransientPutRetryScenario("httplib");
+	}
+	SECTION("a non-RequestTimeout 400 is not retried") {
+		RunNonRetryablePutFailureScenario("httplib");
+	}
+}
 
 TEST_CASE("HTTPFS refreshes S3 credentials across request methods", "[httpfs][s3][refresh]") {
 	SECTION("httplib without connection caching") {

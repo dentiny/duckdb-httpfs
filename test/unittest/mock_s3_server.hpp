@@ -23,6 +23,10 @@ struct MockS3ServerConfig {
 	string stale_key_id = "STALE_KEY";
 	string etag = "\"httpfs-refresh-test-etag\"";
 	MockS3RefreshTarget refresh_target = MockS3RefreshTarget::HEAD;
+	//! Number of multipart part uploads (PUT with partNumber) to fail before succeeding
+	idx_t transient_put_failures = 0;
+	//! When failing a part upload, whether the 400 body is S3's retryable RequestTimeout or a generic error
+	bool put_failure_is_request_timeout = true;
 };
 
 struct MockS3RequestObservation {

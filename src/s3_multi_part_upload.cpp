@@ -1,5 +1,7 @@
 #include "s3_multi_part_upload.hpp"
 
+#include "duckdb/common/chrono.hpp"
+
 #include <thread>
 #ifdef EMSCRIPTEN
 #define SAME_THREAD_UPLOAD
@@ -125,17 +127,41 @@ void S3MultiPartUpload::UploadSingleBuffer(shared_ptr<S3WriteBuffer> write_buffe
 	UploadBufferImplementation(write_buffer, "", true);
 }
 
+// S3 signals a stalled part upload as HTTP 400 with <Code>RequestTimeout</Code> instead of 408, so
+// core's status-based retry (which only retries 408/429/5xx) does not catch it. Re-PUTting a part is
+// idempotent, so treat this specific 400 as transient and retry it locally.
+static bool IsTransientS3UploadError(const HTTPResponse &res) {
+	if (res.status != HTTPStatusCode::BadRequest_400) {
+		return false;
+	}
+	return res.body.find("RequestTimeout") != string::npos;
+}
+
 void S3MultiPartUpload::UploadBufferImplementation(shared_ptr<S3WriteBuffer> write_buffer, string query_param,
                                                    bool single_upload) {
 	unique_ptr<HTTPResponse> res;
 	string etag;
+	auto &http_params = http_input->http_params;
 
 	try {
-		res = s3fs.PutRequest(*http_input, path, {}, (char *)write_buffer->Ptr(), write_buffer->idx, query_param);
-
-		if (res->status != HTTPStatusCode::OK_200) {
-			throw HTTPException(*res, "Unable to connect to URL %s: %s (HTTP code %d)", path, res->GetError(),
-			                    static_cast<int>(res->status));
+		// Retry the S3 RequestTimeout 400 using the same knobs as the core retry loop (no wait on the
+		// first retry, then retry_wait_ms scaled by retry_backoff), since core will not retry a 400.
+		uint64_t attempt = 0;
+		double wait_ms = static_cast<double>(http_params.retry_wait_ms);
+		for (;;) {
+			res = s3fs.PutRequest(*http_input, path, {}, (char *)write_buffer->Ptr(), write_buffer->idx, query_param);
+			if (res->status == HTTPStatusCode::OK_200) {
+				break;
+			}
+			if (attempt >= http_params.retries || !IsTransientS3UploadError(*res)) {
+				throw HTTPException(*res, "Unable to connect to URL %s: %s (HTTP code %d)", path, res->GetError(),
+				                    static_cast<int>(res->status));
+			}
+			if (attempt > 0) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<uint64_t>(wait_ms)));
+				wait_ms *= http_params.retry_backoff;
+			}
+			attempt++;
 		}
 
 		if (!res->headers.HasHeader("ETag")) {
