@@ -131,8 +131,7 @@ void S3MultiPartUpload::UploadBufferImplementation(shared_ptr<S3WriteBuffer> wri
 	string etag;
 
 	try {
-		// Transient S3 errors (e.g. RequestTimeout) are retried inside PutRequest by the shared S3 request
-		// loop; a non-OK status here is therefore already final.
+		// Transient S3 errors are retried inside PutRequest; a non-OK status here is already final.
 		res = s3fs.PutRequest(*http_input, path, {}, (char *)write_buffer->Ptr(), write_buffer->idx, query_param);
 
 		if (res->status != HTTPStatusCode::OK_200) {

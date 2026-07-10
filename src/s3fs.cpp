@@ -407,12 +407,11 @@ static optional_idx GetRegionRedirect(const ErrorData &error, const S3AuthParams
 	return optional_idx(0);
 }
 
-// Defined later in this file; needed here to read the S3 error <Code> out of an error body.
+// Defined later in this file.
 optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
 
-// Some S3 conditions are transient but surface as an HTTP status core does not retry (e.g. a stalled
-// socket -> HTTP 400 with <Code>RequestTimeout</Code>). The real reason lives in the S3 error <Code>,
-// which is why this is classified here in the S3 layer rather than in core's status-only retry.
+// Some transient S3 conditions surface as a status core won't retry (e.g. a stalled socket -> HTTP 400
+// with <Code>RequestTimeout</Code>); the discriminator is only in the S3 error <Code>, hence classified here.
 static bool IsRetryableS3ErrorCode(const string &code) {
 	return code == "RequestTimeout";
 }
@@ -463,9 +462,7 @@ template <class CREATE_DATA, class REQUEST, class REFRESH, class SET_REGION>
 static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefreshInternal(const string &s3_url, CREATE_DATA create_data,
                                                                     REQUEST request, REFRESH refresh_auth_params,
                                                                     SET_REGION set_region) {
-	// create_data snapshots signed request material, request sends it, refresh_auth_params reloads changed
-	// credentials, set_region handles region redirects, and transient S3 errors are retried with backoff.
-	// auth refresh and region redirect are one-shot; transient retries are bounded by http_retries.
+	// Auth refresh and region redirect are one-shot; transient S3 errors are retried with backoff up to http_retries.
 	bool retried_auth_refresh = false;
 	bool retried_region = false;
 	idx_t transient_retries = 0;
