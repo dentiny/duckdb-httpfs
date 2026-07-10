@@ -127,9 +127,8 @@ void S3MultiPartUpload::UploadSingleBuffer(shared_ptr<S3WriteBuffer> write_buffe
 	UploadBufferImplementation(write_buffer, "", true);
 }
 
-// S3 signals a stalled part upload as HTTP 400 with <Code>RequestTimeout</Code> instead of 408, so
-// core's status-based retry (which only retries 408/429/5xx) does not catch it. Re-PUTting a part is
-// idempotent, so treat this specific 400 as transient and retry it locally.
+// S3 reports a stalled part upload as 400 RequestTimeout (not 408), so core's status-based retry
+// misses it. Re-PUTting a part is idempotent, so retry this specific 400 locally.
 static bool IsTransientS3UploadError(const HTTPResponse &res) {
 	if (res.status != HTTPStatusCode::BadRequest_400) {
 		return false;
@@ -144,8 +143,7 @@ void S3MultiPartUpload::UploadBufferImplementation(shared_ptr<S3WriteBuffer> wri
 	auto &http_params = http_input->http_params;
 
 	try {
-		// Retry the S3 RequestTimeout 400 using the same knobs as the core retry loop (no wait on the
-		// first retry, then retry_wait_ms scaled by retry_backoff), since core will not retry a 400.
+		// Reuse the core retry knobs; no wait on the first retry, then back off (mirrors core).
 		uint64_t attempt = 0;
 		double wait_ms = static_cast<double>(http_params.retry_wait_ms);
 		for (;;) {
