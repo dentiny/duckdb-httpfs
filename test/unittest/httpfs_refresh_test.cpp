@@ -629,23 +629,122 @@ static void RunTransientGetRetryScenario(const string &client_implementation) {
 	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 200));
 }
 
+static void RunTransientDeleteRetryScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	// Use a refresh target that deletes never exercise, so credential refresh never triggers here.
+	config.refresh_target = MockS3RefreshTarget::PUT;
+	config.transient_delete_failures = 2;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureRefreshTest(db, con, server, client_implementation, false);
+
+	RequireQueryOk(con, "SET http_retries=3");
+	RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	fs.RemoveFile(S3_PATH);
+	RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(CountObservations(observations, "DELETE", STALE_KEY_ID, 400) == 2);
+	REQUIRE(CountObservations(observations, "DELETE", STALE_KEY_ID, 204) == 1);
+}
+
+// HEAD responses carry no body, so a RequestTimeout 400 cannot be classified as transient:
+// the HEAD is not retried and the open recovers through httpfs's range-GET fallback instead.
+static void RunHeadNotRetriedScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.transient_head_failures = 1000;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureRefreshTest(db, con, server, client_implementation, false);
+
+	RequireQueryOk(con, "SET http_retries=3");
+	RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto handle = fs.OpenFile(S3_PATH, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+	REQUIRE(handle);
+	RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(CountObservations(observations, "HEAD", STALE_KEY_ID, 400) == 1);
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 206, "bytes=0-1"));
+}
+
+// Like multipart-init, a multipart-complete POST must not be replayed even on RequestTimeout.
+static void RunMultipartCompleteNotRetriedScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.transient_complete_post_failures = 1000;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureRefreshTest(db, con, server, client_implementation, false);
+
+	RequireQueryOk(con, "SET http_retries=3");
+	RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	REQUIRE_THROWS(WriteMultipartPayload(con));
+	RequireQueryOk(con, "ROLLBACK");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(CountObservationsTarget(observations, "POST", 400, "uploadId") == 1);
+}
+
+static void RunAllTransientRetryScenarios(const string &client_implementation) {
+	SECTION("multipart part upload (returned-response path) retries and completes") {
+		RunTransientPutRetryScenario(client_implementation);
+	}
+	SECTION("object read (thrown-exception path) retries and completes") {
+		RunTransientGetRetryScenario(client_implementation);
+	}
+	SECTION("object delete retries and completes") {
+		RunTransientDeleteRetryScenario(client_implementation);
+	}
+	SECTION("a generic 400 is not retried") {
+		RunGenericErrorNotRetriedScenario(client_implementation);
+	}
+	SECTION("a multipart-init POST is not retried even on RequestTimeout") {
+		RunMultipartInitNotRetriedScenario(client_implementation);
+	}
+	SECTION("a multipart-complete POST is not retried even on RequestTimeout") {
+		RunMultipartCompleteNotRetriedScenario(client_implementation);
+	}
+	SECTION("a HEAD 400 is not retried because HEAD responses carry no error body") {
+		RunHeadNotRetriedScenario(client_implementation);
+	}
+	SECTION("retries are bounded by http_retries") {
+		RunRetryBudgetScenario(client_implementation);
+	}
+}
+
 } // namespace
 
 TEST_CASE("HTTPFS retries transient S3 RequestTimeout across request types", "[httpfs][s3][upload]") {
-	SECTION("multipart part upload (returned-response path) retries and completes") {
-		RunTransientPutRetryScenario("httplib");
+	SECTION("httplib") {
+		RunAllTransientRetryScenarios("httplib");
 	}
-	SECTION("object read (thrown-exception path) retries and completes") {
-		RunTransientGetRetryScenario("httplib");
-	}
-	SECTION("a generic 400 is not retried") {
-		RunGenericErrorNotRetriedScenario("httplib");
-	}
-	SECTION("a multipart-init POST is not retried even on RequestTimeout") {
-		RunMultipartInitNotRetriedScenario("httplib");
-	}
-	SECTION("retries are bounded by http_retries") {
-		RunRetryBudgetScenario("httplib");
+	SECTION("curl") {
+		RunAllTransientRetryScenarios("curl");
 	}
 }
 

@@ -62,7 +62,10 @@ struct MockS3Server::Impl {
 	explicit Impl(MockS3ServerConfig config_p) : config(std::move(config_p)) {
 		remaining_put_failures = config.transient_put_failures;
 		remaining_get_failures = config.transient_get_failures;
+		remaining_head_failures = config.transient_head_failures;
+		remaining_delete_failures = config.transient_delete_failures;
 		remaining_post_failures = config.transient_post_failures;
+		remaining_complete_post_failures = config.transient_complete_post_failures;
 		RegisterRoutes();
 		port = server.bind_to_any_port("127.0.0.1");
 		if (port <= 0) {
@@ -229,6 +232,11 @@ struct MockS3Server::Impl {
 				SendForbidden(request, response);
 				return httplib::Server::HandlerResponse::Handled;
 			}
+			if (remaining_head_failures.load() > 0) {
+				remaining_head_failures--;
+				SendS3Error400(request, response, config.failure_is_request_timeout);
+				return httplib::Server::HandlerResponse::Handled;
+			}
 			response.status = 200;
 			SetObjectHeaders(response);
 			Record(request, response.status);
@@ -306,6 +314,11 @@ struct MockS3Server::Impl {
 				SendS3Error400(request, response, config.failure_is_request_timeout);
 				return;
 			}
+			if (request.target.find("uploadId") != string::npos && remaining_complete_post_failures.load() > 0) {
+				remaining_complete_post_failures--;
+				SendS3Error400(request, response, config.failure_is_request_timeout);
+				return;
+			}
 			SendMultipartPostSuccess(request, response);
 		});
 
@@ -324,6 +337,11 @@ struct MockS3Server::Impl {
 				SendForbidden(request, response);
 				return;
 			}
+			if (remaining_delete_failures.load() > 0) {
+				remaining_delete_failures--;
+				SendS3Error400(request, response, config.failure_is_request_timeout);
+				return;
+			}
 			response.status = 204;
 			Record(request, response.status);
 		});
@@ -335,7 +353,10 @@ struct MockS3Server::Impl {
 	int port = 0;
 	mutable std::atomic<idx_t> remaining_put_failures {0};
 	mutable std::atomic<idx_t> remaining_get_failures {0};
+	mutable std::atomic<idx_t> remaining_head_failures {0};
+	mutable std::atomic<idx_t> remaining_delete_failures {0};
 	mutable std::atomic<idx_t> remaining_post_failures {0};
+	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
 	mutable std::mutex observation_lock;
 	mutable vector<MockS3RequestObservation> observations;
 };
