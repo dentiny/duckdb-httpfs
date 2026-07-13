@@ -408,7 +408,7 @@ static optional_idx GetRegionRedirect(const ErrorData &error, const S3AuthParams
 }
 
 // Defined later in this file.
-optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
+optional_idx TryFindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
 
 // Some transient S3 conditions surface as a status core won't retry (e.g. a stalled socket -> HTTP 400
 // with <Code>RequestTimeout</Code>); the discriminator is only in the S3 error <Code>, hence classified here.
@@ -421,7 +421,7 @@ static bool ParseTransientS3Error(int status_code, const string &body, string &c
 		return false;
 	}
 	string code;
-	if (!FindTagContents(body, "Code", 0, code).IsValid() || !IsRetryableS3ErrorCode(code)) {
+	if (!TryFindTagContents(body, "Code", 0, code).IsValid() || !IsRetryableS3ErrorCode(code)) {
 		return false;
 	}
 	code_out = std::move(code);
@@ -454,7 +454,9 @@ static void SleepForTransientRetry(const HTTPFSParams &http_params, idx_t transi
 		wait_ms = static_cast<double>(http_params.retry_wait_ms);
 		return;
 	}
+#ifndef DUCKDB_NO_THREADS
 	ThreadUtil::SleepMs(static_cast<idx_t>(wait_ms));
+#endif
 	wait_ms *= http_params.retry_backoff;
 }
 
@@ -562,7 +564,10 @@ static unique_ptr<HTTPResponse> SendS3HandleRequestWithClientCache(S3FileHandle 
                                                                    BaseRequest &request) {
 	auto client_entry = s3_handle.client_cache.GetClientWithGeneration();
 	auto response = params.http_util.Request(request, client_entry.client);
-	if (!s3_handle.client_cache.StoreClient(client_entry)) {
+	string transient_code;
+	// A transient timeout means this connection stalled; don't hand it back to the cache for the retry.
+	if ((response && IsTransientS3Error(*response, transient_code)) ||
+	    !s3_handle.client_cache.StoreClient(client_entry)) {
 		params.http_util.CloseClient(std::move(client_entry.client));
 	}
 	return response;
@@ -1810,7 +1815,9 @@ bool S3FileSystem::ListFilesExtended(const string &directory, const std::functio
 	return true;
 }
 
-optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result) {
+// Tolerant variant for error bodies: a truncated/malformed body must not escalate to a DB-invalidating
+// InternalException, so an unmatched open tag is "not found".
+optional_idx TryFindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result) {
 	string open_tag = "<" + tag + ">";
 	string close_tag = "</" + tag + ">";
 	auto open_tag_pos = response.find(open_tag, cur_pos);
@@ -1820,11 +1827,25 @@ optional_idx FindTagContents(const string &response, const string &tag, idx_t cu
 	}
 	auto close_tag_pos = response.find(close_tag, open_tag_pos + open_tag.size());
 	if (close_tag_pos == string::npos) {
-		throw InternalException("Failed to parse S3 result: found open tag for %s but did not find matching close tag",
-		                        tag);
+		return optional_idx();
 	}
 	result = response.substr(open_tag_pos + open_tag.size(), close_tag_pos - open_tag_pos - open_tag.size());
 	return close_tag_pos + close_tag.size();
+}
+
+optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result) {
+	string open_tag = "<" + tag + ">";
+	auto open_tag_pos = response.find(open_tag, cur_pos);
+	if (open_tag_pos == string::npos) {
+		// tag not found
+		return optional_idx();
+	}
+	auto next_pos = TryFindTagContents(response, tag, cur_pos, result);
+	if (!next_pos.IsValid()) {
+		throw InternalException("Failed to parse S3 result: found open tag for %s but did not find matching close tag",
+		                        tag);
+	}
+	return next_pos;
 }
 
 string S3FileSystem::GetS3BadRequestError(const S3AuthParams &s3_auth_params, string correct_region) {
@@ -1882,26 +1903,26 @@ string S3FileSystem::ParseS3Error(const string &error) {
 	// find <Error> tag
 	string error_xml;
 	idx_t err_pos = 0;
-	auto next_pos = FindTagContents(error, "Error", err_pos, error_xml);
+	auto next_pos = TryFindTagContents(error, "Error", err_pos, error_xml);
 	if (!next_pos.IsValid()) {
 		return string();
 	}
 	// find <Code> and <Message>
 	string error_code, error_message, extra_error_data;
 	idx_t cur_pos = 0;
-	next_pos = FindTagContents(error_xml, "Code", cur_pos, error_code);
+	next_pos = TryFindTagContents(error_xml, "Code", cur_pos, error_code);
 	if (!next_pos.IsValid()) {
 		return string();
 	}
 	cur_pos = 0;
-	next_pos = FindTagContents(error_xml, "Message", cur_pos, error_message);
+	next_pos = TryFindTagContents(error_xml, "Message", cur_pos, error_message);
 	if (!next_pos.IsValid()) {
 		return string();
 	}
 	// depending on Code, find other info
 	if (error_code == "InvalidAccessKeyId") {
 		cur_pos = 0;
-		next_pos = FindTagContents(error_xml, "AWSAccessKeyId", cur_pos, extra_error_data);
+		next_pos = TryFindTagContents(error_xml, "AWSAccessKeyId", cur_pos, extra_error_data);
 		if (next_pos.IsValid()) {
 			extra_error_data = "\nInvalid Access Key: \"" + extra_error_data + "\"";
 		}
