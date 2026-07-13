@@ -160,7 +160,10 @@ struct MockS3Server::Impl {
 
 	void SendS3Error400(const httplib::Request &request, httplib::Response &response, bool request_timeout) const {
 		response.status = 400;
-		if (request_timeout) {
+		if (config.truncated_failure_body) {
+			response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>RequestTimeout",
+			                     "application/xml");
+		} else if (request_timeout) {
 			response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
 			                     "<Error><Code>RequestTimeout</Code><Message>Your socket connection to the server "
 			                     "was not read from or written to within the timeout period.</Message></Error>",

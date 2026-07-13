@@ -37,6 +37,8 @@ struct MockS3ServerConfig {
 	idx_t transient_complete_post_failures = 0;
 	//! Whether injected 400s carry S3's retryable RequestTimeout code or a generic (non-retryable) code
 	bool failure_is_request_timeout = true;
+	//! Whether injected 400 bodies are truncated mid-XML (an open <Code> with no closing tag)
+	bool truncated_failure_body = false;
 };
 
 struct MockS3RequestObservation {

@@ -546,6 +546,44 @@ static void RunGenericErrorNotRetriedScenario(const string &client_implementatio
 	REQUIRE(CountObservations(observations, "PUT", STALE_KEY_ID, 400) == 1);
 }
 
+// A truncated error body (an open <Code> with no closing tag) must degrade to a plain HTTP error:
+// not classified as transient (no retry) and never escalated to a DB-invalidating InternalException.
+static void RunTruncatedErrorBodyScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.transient_put_failures = 1000;
+	config.truncated_failure_body = true;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureRefreshTest(db, con, server, client_implementation, false);
+
+	RequireQueryOk(con, "SET http_retries=3");
+	RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	bool threw = false;
+	bool threw_internal = false;
+	try {
+		WriteSinglePutPayload(con);
+	} catch (std::exception &ex) {
+		threw = true;
+		ErrorData error(ex);
+		threw_internal = error.Type() == ExceptionType::INTERNAL || error.Type() == ExceptionType::FATAL;
+	}
+	REQUIRE(threw);
+	REQUIRE_FALSE(threw_internal);
+	// The database must still be usable (an InternalException would have invalidated it).
+	RequireQueryOk(con, "ROLLBACK");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(CountObservations(observations, "PUT", STALE_KEY_ID, 400) == 1);
+}
+
 // Even a retryable RequestTimeout must NOT replay a multipart-init POST (it would orphan an upload id).
 static void RunMultipartInitNotRetriedScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
@@ -722,6 +760,9 @@ static void RunAllTransientRetryScenarios(const string &client_implementation) {
 	}
 	SECTION("a generic 400 is not retried") {
 		RunGenericErrorNotRetriedScenario(client_implementation);
+	}
+	SECTION("a truncated error body is not retried and does not invalidate the database") {
+		RunTruncatedErrorBodyScenario(client_implementation);
 	}
 	SECTION("a multipart-init POST is not retried even on RequestTimeout") {
 		RunMultipartInitNotRetriedScenario(client_implementation);
