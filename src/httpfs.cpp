@@ -1123,6 +1123,18 @@ void HTTPFSUtil::ClearCachedConnections() {
 	// no-op by default
 }
 
+bool HTTPFSUtil::ShouldRetry(const BaseRequest &request, const HTTPResponse &response) {
+	if (HTTPUtil::ShouldRetry(request, response)) {
+		return true;
+	}
+	// Replaying a request requires idempotency: retrying a multipart-init POST would orphan a second upload,
+	// and multipart-complete/bulk-delete are ambiguous.
+	if (!HTTPUtil::IsIdempotent(request.type)) {
+		return false;
+	}
+	return IsS3RequestTimeout(response);
+}
+
 string HTTPFSUtil::GetName() const {
 	return "HTTPFS";
 }
