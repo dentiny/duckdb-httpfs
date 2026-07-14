@@ -48,6 +48,8 @@ struct MockS3RequestObservation {
 	string range;
 	string key_id;
 	int status = 0;
+	//! Client's ephemeral source port; a new connection shows a new port
+	int remote_port = 0;
 };
 
 class MockS3Server {

@@ -609,6 +609,45 @@ static void RunMultipartInitNotRetriedScenario(const string &client_implementati
 	REQUIRE(CountObservationsTarget(observations, "POST", 400, "uploads") == 1);
 }
 
+// With curl connection caching, the retry must run on a fresh connection instead of the stalled cached one.
+static void RunCachedConnectionRetryScenario() {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.transient_put_failures = 1;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureRefreshTest(db, con, server, "curl", true);
+
+	RequireQueryOk(con, "SET http_retries=3");
+	RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	WriteSinglePutPayload(con);
+	RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	int failed_port = 0;
+	int success_port = 0;
+	for (auto &observation : observations) {
+		if (observation.method != "PUT") {
+			continue;
+		}
+		if (observation.status == 400) {
+			failed_port = observation.remote_port;
+		} else if (observation.status == 200) {
+			success_port = observation.remote_port;
+		}
+	}
+	REQUIRE(failed_port != 0);
+	REQUIRE(success_port != 0);
+	REQUIRE(failed_port != success_port);
+}
+
 // A RequestTimeout that never clears exhausts exactly http_retries retries (one initial + http_retries).
 static void RunRetryBudgetScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
@@ -662,7 +701,7 @@ static void RunTransientGetRetryScenario(const string &client_implementation) {
 
 	auto observations = server.Observations();
 	INFO(MockS3DescribeObservations(observations));
-	// The read hit transient RequestTimeout 400s (thrown path) and was retried until it succeeded.
+	// The read hit transient RequestTimeout 400s and was retried until it succeeded.
 	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 400));
 	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 200));
 }
@@ -749,10 +788,10 @@ static void RunMultipartCompleteNotRetriedScenario(const string &client_implemen
 }
 
 static void RunAllTransientRetryScenarios(const string &client_implementation) {
-	SECTION("multipart part upload (returned-response path) retries and completes") {
+	SECTION("multipart part upload retries and completes") {
 		RunTransientPutRetryScenario(client_implementation);
 	}
-	SECTION("object read (thrown-exception path) retries and completes") {
+	SECTION("object read retries and completes") {
 		RunTransientGetRetryScenario(client_implementation);
 	}
 	SECTION("object delete retries and completes") {
@@ -786,6 +825,9 @@ TEST_CASE("HTTPFS retries transient S3 RequestTimeout across request types", "[h
 	}
 	SECTION("curl") {
 		RunAllTransientRetryScenarios("curl");
+	}
+	SECTION("curl with connection caching retries on a fresh connection") {
+		RunCachedConnectionRetryScenario();
 	}
 }
 

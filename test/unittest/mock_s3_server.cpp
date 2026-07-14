@@ -134,6 +134,7 @@ struct MockS3Server::Impl {
 		observation.range = GetHeader(request, "Range");
 		observation.key_id = ExtractCredentialKey(GetHeader(request, "Authorization"));
 		observation.status = status;
+		observation.remote_port = request.remote_port;
 
 		std::lock_guard<std::mutex> lock(observation_lock);
 		observations.push_back(std::move(observation));
