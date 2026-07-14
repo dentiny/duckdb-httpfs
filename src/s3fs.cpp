@@ -410,74 +410,24 @@ static optional_idx GetRegionRedirect(const ErrorData &error, const S3AuthParams
 // Defined later in this file.
 optional_idx TryFindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
 
-// Some transient S3 conditions surface as a status core won't retry (e.g. a stalled socket -> HTTP 400
-// with <Code>RequestTimeout</Code>); the discriminator is only in the S3 error <Code>, hence classified here.
-static bool IsRetryableS3ErrorCode(const string &code) {
-	return code == "RequestTimeout";
-}
-
-static bool ParseTransientS3Error(int status_code, const string &body, string &code_out) {
-	if (status_code < 400 || body.empty()) {
+// Core's status-based retry can't catch this: the discriminator is only in the S3 error body.
+bool IsS3RequestTimeout(const HTTPResponse &response) {
+	if (response.status != HTTPStatusCode::BadRequest_400 || response.body.empty()) {
 		return false;
 	}
 	string code;
-	if (!TryFindTagContents(body, "Code", 0, code).IsValid() || !IsRetryableS3ErrorCode(code)) {
-		return false;
-	}
-	code_out = std::move(code);
-	return true;
-}
-
-static bool IsTransientS3Error(const HTTPResponse &response, string &code_out) {
-	return ParseTransientS3Error(static_cast<int>(response.status), response.body, code_out);
-}
-
-static bool IsTransientS3Error(const ErrorData &error, string &code_out) {
-	auto &extra_info = error.ExtraInfo();
-	auto status_entry = extra_info.find("status_code");
-	auto body_entry = extra_info.find("response_body");
-	if (status_entry == extra_info.end() || body_entry == extra_info.end()) {
-		return false;
-	}
-	int status_code;
-	try {
-		status_code = std::stoi(status_entry->second);
-	} catch (...) {
-		return false;
-	}
-	return ParseTransientS3Error(status_code, body_entry->second, code_out);
-}
-
-// No wait on the first retry, then retry_wait_ms scaled by retry_backoff (mirrors core's backoff).
-static void SleepForTransientRetry(const HTTPFSParams &http_params, idx_t transient_retries, double &wait_ms) {
-	if (transient_retries == 0) {
-		wait_ms = static_cast<double>(http_params.retry_wait_ms);
-		return;
-	}
-#ifndef DUCKDB_NO_THREADS
-	ThreadUtil::SleepMs(static_cast<idx_t>(wait_ms));
-#endif
-	wait_ms *= http_params.retry_backoff;
-}
-
-// Transient retries replay the whole request, so restrict them to idempotent methods. POST is excluded:
-// replaying multipart-init would orphan a second upload, and multipart-complete/bulk-delete are ambiguous.
-static bool IsTransientRetryEligibleMethod(const string &method) {
-	return method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE";
+	return TryFindTagContents(response.body, "Code", 0, code).IsValid() && code == "RequestTimeout";
 }
 
 template <class CREATE_DATA, class REQUEST, class REFRESH, class SET_REGION>
-static unique_ptr<HTTPResponse>
-RunS3RequestWithAuthRefreshInternal(const string &s3_url, bool transient_retry_eligible, CREATE_DATA create_data,
-                                    REQUEST request, REFRESH refresh_auth_params, SET_REGION set_region) {
-	// Auth refresh and region redirect are one-shot; transient S3 errors are retried with backoff up to http_retries.
+static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefreshInternal(const string &s3_url, CREATE_DATA create_data,
+                                                                    REQUEST request, REFRESH refresh_auth_params,
+                                                                    SET_REGION set_region) {
+	// Auth refresh and region redirect are one-shot.
 	bool retried_auth_refresh = false;
 	bool retried_region = false;
-	idx_t transient_retries = 0;
-	double transient_wait_ms = 0;
 	for (;;) {
 		auto request_data = create_data();
-		auto &http_params = request_data.http_params->template Cast<HTTPFSParams>();
 		try {
 			auto result = request(request_data);
 			if (result && !retried_auth_refresh && IsAuthRefreshStatus(*result) &&
@@ -490,13 +440,6 @@ RunS3RequestWithAuthRefreshInternal(const string &s3_url, bool transient_retry_e
 			    GetRegionRedirect(*result, request_data.auth_params, correct_region).IsValid()) {
 				set_region(std::move(correct_region));
 				retried_region = true;
-				continue;
-			}
-			string s3_error_code;
-			if (transient_retry_eligible && result && transient_retries < http_params.retries &&
-			    IsTransientS3Error(*result, s3_error_code)) {
-				SleepForTransientRetry(http_params, transient_retries, transient_wait_ms);
-				transient_retries++;
 				continue;
 			}
 			return result;
@@ -513,13 +456,6 @@ RunS3RequestWithAuthRefreshInternal(const string &s3_url, bool transient_retry_e
 				retried_region = true;
 				continue;
 			}
-			string s3_error_code;
-			if (transient_retry_eligible && transient_retries < http_params.retries &&
-			    IsTransientS3Error(error, s3_error_code)) {
-				SleepForTransientRetry(http_params, transient_retries, transient_wait_ms);
-				transient_retries++;
-				continue;
-			}
 			throw;
 		}
 	}
@@ -531,7 +467,7 @@ S3FileSystem::RunS3InputRequestWithAuthRefresh(S3HTTPInput &s3_input, const stri
                                                const string &query_string, const string &payload_hash,
                                                const string &content_type, REQUEST request) {
 	return RunS3RequestWithAuthRefreshInternal(
-	    s3_url, IsTransientRetryEligibleMethod(method),
+	    s3_url,
 	    [&]() {
 		    lock_guard<mutex> lck(s3_input.mu);
 		    return CreateS3RequestData(s3_input.auth_params, s3_input.http_params, s3_url, method, query_string,
@@ -552,8 +488,7 @@ unique_ptr<HTTPResponse> S3FileSystem::RunS3HandleRequestWithAuthRefresh(S3FileH
                                                                          const string &method, bool use_version_id,
                                                                          REQUEST request) {
 	return RunS3RequestWithAuthRefreshInternal(
-	    s3_url, IsTransientRetryEligibleMethod(method),
-	    [&]() { return CreateS3HandleRequestData(s3_handle, s3_url, method, use_version_id); }, request,
+	    s3_url, [&]() { return CreateS3HandleRequestData(s3_handle, s3_url, method, use_version_id); }, request,
 	    [&](const S3AuthParams &request_auth_params, const S3RefreshableHTTPParams &request_http_params) {
 		    return s3_handle.TryRefreshAuthParams(request_auth_params, request_http_params);
 	    },
@@ -564,10 +499,7 @@ static unique_ptr<HTTPResponse> SendS3HandleRequestWithClientCache(S3FileHandle 
                                                                    BaseRequest &request) {
 	auto client_entry = s3_handle.client_cache.GetClientWithGeneration();
 	auto response = params.http_util.Request(request, client_entry.client);
-	string transient_code;
-	// A transient timeout means this connection stalled; don't hand it back to the cache for the retry.
-	if ((response && IsTransientS3Error(*response, transient_code)) ||
-	    !s3_handle.client_cache.StoreClient(client_entry)) {
+	if (!s3_handle.client_cache.StoreClient(client_entry)) {
 		params.http_util.CloseClient(std::move(client_entry.client));
 	}
 	return response;
