@@ -59,7 +59,11 @@ public:
 		}
 		auto headers = TransformHeaders(info.headers, info.params);
 		if (!info.response_handler && !info.content_handler) {
-			return TransformResult(client->Get(info.path, headers));
+			auto result = TransformResult(client->Get(info.path, headers));
+			if (state) {
+				state->total_bytes_received += result->body.size();
+			}
+			return result;
 		} else {
 			return TransformResult(client->Get(
 			    info.path.c_str(), headers,

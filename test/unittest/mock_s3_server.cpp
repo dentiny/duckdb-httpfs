@@ -301,6 +301,10 @@ struct MockS3Server::Impl {
 				SendSlowDown(request, response);
 				return;
 			}
+			if (config.transient_400_lists > 0 && transient_400_lists_sent.fetch_add(1) < config.transient_400_lists) {
+				SendS3Error400(request, response, config.failure_is_request_timeout);
+				return;
+			}
 			SendListObjectsSuccess(request, response);
 		};
 		server.Get(bucket_path, list_objects);
@@ -364,6 +368,7 @@ struct MockS3Server::Impl {
 
 	MockS3ServerConfig config;
 	mutable std::atomic<idx_t> transient_503_lists_sent {0};
+	mutable std::atomic<idx_t> transient_400_lists_sent {0};
 	httplib::Server server;
 	std::thread server_thread;
 	int port = 0;

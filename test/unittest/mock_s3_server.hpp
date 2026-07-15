@@ -25,6 +25,8 @@ struct MockS3ServerConfig {
 	MockS3RefreshTarget refresh_target = MockS3RefreshTarget::HEAD;
 	//! Answer this many leading ListObjectsV2 requests with HTTP 503 SlowDown
 	idx_t transient_503_lists = 0;
+	//! Answer this many leading ListObjectsV2 requests with HTTP 400
+	idx_t transient_400_lists = 0;
 	//! Number of object PUTs to fail with a 400 before succeeding
 	idx_t transient_put_failures = 0;
 	//! Number of object GETs to fail with a 400 before succeeding
