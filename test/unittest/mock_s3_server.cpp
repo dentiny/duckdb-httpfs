@@ -5,6 +5,7 @@
 
 #include "httplib.hpp"
 
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -59,6 +60,12 @@ static string GetHeader(const httplib::Request &request, const string &header) {
 
 struct MockS3Server::Impl {
 	explicit Impl(MockS3ServerConfig config_p) : config(std::move(config_p)) {
+		remaining_put_failures = config.transient_put_failures;
+		remaining_get_failures = config.transient_get_failures;
+		remaining_head_failures = config.transient_head_failures;
+		remaining_delete_failures = config.transient_delete_failures;
+		remaining_post_failures = config.transient_post_failures;
+		remaining_complete_post_failures = config.transient_complete_post_failures;
 		RegisterRoutes();
 		port = server.bind_to_any_port("127.0.0.1");
 		if (port <= 0) {
@@ -127,6 +134,7 @@ struct MockS3Server::Impl {
 		observation.range = GetHeader(request, "Range");
 		observation.key_id = ExtractCredentialKey(GetHeader(request, "Authorization"));
 		observation.status = status;
+		observation.remote_port = request.remote_port;
 
 		std::lock_guard<std::mutex> lock(observation_lock);
 		observations.push_back(std::move(observation));
@@ -148,6 +156,24 @@ struct MockS3Server::Impl {
 	void SendPutSuccess(const httplib::Request &request, httplib::Response &response) const {
 		response.status = 200;
 		response.set_header("ETag", "\"httpfs-refresh-test-upload-etag\"");
+		Record(request, response.status);
+	}
+
+	void SendS3Error400(const httplib::Request &request, httplib::Response &response, bool request_timeout) const {
+		response.status = 400;
+		if (config.truncated_failure_body) {
+			response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>RequestTimeout",
+			                     "application/xml");
+		} else if (request_timeout) {
+			response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+			                     "<Error><Code>RequestTimeout</Code><Message>Your socket connection to the server "
+			                     "was not read from or written to within the timeout period.</Message></Error>",
+			                     "application/xml");
+		} else {
+			response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+			                     "<Error><Code>InvalidRequest</Code><Message>malformed request</Message></Error>",
+			                     "application/xml");
+		}
 		Record(request, response.status);
 	}
 
@@ -210,6 +236,11 @@ struct MockS3Server::Impl {
 				SendForbidden(request, response);
 				return httplib::Server::HandlerResponse::Handled;
 			}
+			if (remaining_head_failures.load() > 0) {
+				remaining_head_failures--;
+				SendS3Error400(request, response, config.failure_is_request_timeout);
+				return httplib::Server::HandlerResponse::Handled;
+			}
 			response.status = 200;
 			SetObjectHeaders(response);
 			Record(request, response.status);
@@ -219,6 +250,11 @@ struct MockS3Server::Impl {
 		server.Get(path, [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
 				SendForbidden(request, response);
+				return;
+			}
+			if (remaining_get_failures.load() > 0) {
+				remaining_get_failures--;
+				SendS3Error400(request, response, config.failure_is_request_timeout);
 				return;
 			}
 
@@ -264,12 +300,27 @@ struct MockS3Server::Impl {
 				SendForbidden(request, response);
 				return;
 			}
+			if (remaining_put_failures.load() > 0) {
+				remaining_put_failures--;
+				SendS3Error400(request, response, config.failure_is_request_timeout);
+				return;
+			}
 			SendPutSuccess(request, response);
 		});
 
 		server.Post(path, [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
 				SendForbidden(request, response);
+				return;
+			}
+			if (request.target.find("uploads") != string::npos && remaining_post_failures.load() > 0) {
+				remaining_post_failures--;
+				SendS3Error400(request, response, config.failure_is_request_timeout);
+				return;
+			}
+			if (request.target.find("uploadId") != string::npos && remaining_complete_post_failures.load() > 0) {
+				remaining_complete_post_failures--;
+				SendS3Error400(request, response, config.failure_is_request_timeout);
 				return;
 			}
 			SendMultipartPostSuccess(request, response);
@@ -290,6 +341,11 @@ struct MockS3Server::Impl {
 				SendForbidden(request, response);
 				return;
 			}
+			if (remaining_delete_failures.load() > 0) {
+				remaining_delete_failures--;
+				SendS3Error400(request, response, config.failure_is_request_timeout);
+				return;
+			}
 			response.status = 204;
 			Record(request, response.status);
 		});
@@ -299,6 +355,12 @@ struct MockS3Server::Impl {
 	httplib::Server server;
 	std::thread server_thread;
 	int port = 0;
+	mutable std::atomic<idx_t> remaining_put_failures {0};
+	mutable std::atomic<idx_t> remaining_get_failures {0};
+	mutable std::atomic<idx_t> remaining_head_failures {0};
+	mutable std::atomic<idx_t> remaining_delete_failures {0};
+	mutable std::atomic<idx_t> remaining_post_failures {0};
+	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
 	mutable std::mutex observation_lock;
 	mutable vector<MockS3RequestObservation> observations;
 };

@@ -23,6 +23,22 @@ struct MockS3ServerConfig {
 	string stale_key_id = "STALE_KEY";
 	string etag = "\"httpfs-refresh-test-etag\"";
 	MockS3RefreshTarget refresh_target = MockS3RefreshTarget::HEAD;
+	//! Number of object PUTs to fail with a 400 before succeeding
+	idx_t transient_put_failures = 0;
+	//! Number of object GETs to fail with a 400 before succeeding
+	idx_t transient_get_failures = 0;
+	//! Number of object HEADs to fail with a 400 before succeeding
+	idx_t transient_head_failures = 0;
+	//! Number of object DELETEs to fail with a 400 before succeeding
+	idx_t transient_delete_failures = 0;
+	//! Number of multipart-init POSTs (uploads=) to fail with a 400 before succeeding
+	idx_t transient_post_failures = 0;
+	//! Number of multipart-complete POSTs (uploadId=) to fail with a 400 before succeeding
+	idx_t transient_complete_post_failures = 0;
+	//! Whether injected 400s carry S3's retryable RequestTimeout code or a generic (non-retryable) code
+	bool failure_is_request_timeout = true;
+	//! Whether injected 400 bodies are truncated mid-XML (an open <Code> with no closing tag)
+	bool truncated_failure_body = false;
 };
 
 struct MockS3RequestObservation {
@@ -32,6 +48,8 @@ struct MockS3RequestObservation {
 	string range;
 	string key_id;
 	int status = 0;
+	//! Client's ephemeral source port; a new connection shows a new port
+	int remote_port = 0;
 };
 
 class MockS3Server {
