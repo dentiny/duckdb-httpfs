@@ -81,6 +81,7 @@ public:
 	unique_ptr<HTTPParams> InitializeParameters(optional_ptr<FileOpener> opener,
 	                                            optional_ptr<FileOpenerInfo> info) override;
 	unique_ptr<HTTPClient> InitializeClient(HTTPParams &http_params, const string &proto_host_port) override;
+	bool ShouldRetry(const BaseRequest &request, const HTTPResponse &response) override;
 
 	//! Clear any cached connections
 	virtual void ClearCachedConnections();

@@ -239,6 +239,34 @@ static bool IsS3CredentialRefreshEnabled(optional_ptr<FileOpener> opener) {
 	return true;
 }
 
+static bool ReloadS3AuthMaterial(optional_ptr<FileOpener> opener, const string &path, S3AuthParams &auth_params,
+                                 HTTPFSParams &http_params, const S3AuthParams &request_auth_params,
+                                 const S3RefreshableHTTPParams &request_http_params, HTTPClientCache *client_cache,
+                                 bool preserve_region) {
+	if (!opener) {
+		return false;
+	}
+
+	auto previous_region = auth_params.region;
+	auto reloaded_auth_params = ReadS3AuthParams(opener, path);
+	if (preserve_region && !previous_region.empty() && reloaded_auth_params.region != previous_region) {
+		reloaded_auth_params.SetRegion(std::move(previous_region));
+	}
+	auto reloaded_http_params = ReadRefreshableHTTPParams(opener, path);
+
+	if (S3AuthParamsMatch(reloaded_auth_params, request_auth_params) &&
+	    S3RefreshableHTTPParamsMatch(reloaded_http_params, request_http_params)) {
+		return false;
+	}
+
+	auth_params = std::move(reloaded_auth_params);
+	ApplyRefreshableHTTPParams(http_params, reloaded_http_params);
+	if (client_cache) {
+		client_cache->Clear();
+	}
+	return true;
+}
+
 static bool TryRefreshS3AuthMaterial(optional_ptr<ClientContext> context, optional_ptr<FileOpener> opener,
                                      const string &path, S3AuthParams &auth_params, HTTPFSParams &http_params,
                                      const S3AuthParams &request_auth_params,
@@ -255,22 +283,22 @@ static bool TryRefreshS3AuthMaterial(optional_ptr<ClientContext> context, option
 	if (!context) {
 		return false;
 	}
+	if (ReloadS3AuthMaterial(opener, path, auth_params, http_params, request_auth_params, request_http_params,
+	                         client_cache, preserve_region)) {
+		return true;
+	}
+
+	auto http_state = HTTPState::TryGetState(*context);
+	lock_guard<mutex> refresh_lck(http_state->CredentialRefreshLock());
+	if (ReloadS3AuthMaterial(opener, path, auth_params, http_params, request_auth_params, request_http_params,
+	                         client_cache, preserve_region)) {
+		return true;
+	}
 	if (!TryRefreshS3SecretForPath(*context, path)) {
 		return false;
 	}
-
-	auto previous_region = auth_params.region;
-	auth_params = ReadS3AuthParams(opener, path);
-	if (preserve_region && !previous_region.empty() && auth_params.region != previous_region) {
-		auth_params.SetRegion(std::move(previous_region));
-	}
-	ApplyRefreshableHTTPParams(http_params, ReadRefreshableHTTPParams(opener, path));
-	if (client_cache) {
-		client_cache->Clear();
-	}
-	// If refresh recreated the same request material, retrying the same failed request only repeats the auth failure.
-	return !S3AuthParamsMatch(auth_params, request_auth_params) ||
-	       !S3RefreshableHTTPParamsMatch(SnapshotRefreshableHTTPParams(http_params), request_http_params);
+	return ReloadS3AuthMaterial(opener, path, auth_params, http_params, request_auth_params, request_http_params,
+	                            client_cache, preserve_region);
 }
 
 static void AddS3HTTPHeaders(HTTPFSParams &http_params, HTTPHeaders &headers) {
@@ -379,15 +407,26 @@ static optional_idx GetRegionRedirect(const ErrorData &error, const S3AuthParams
 	return optional_idx(0);
 }
 
+// Defined later in this file.
+optional_idx TryFindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
+
+// Core's status-based retry can't catch this: the discriminator is only in the S3 error body.
+bool IsS3RequestTimeout(const HTTPResponse &response) {
+	if (response.status != HTTPStatusCode::BadRequest_400 || response.body.empty()) {
+		return false;
+	}
+	string code;
+	return TryFindTagContents(response.body, "Code", 0, code).IsValid() && code == "RequestTimeout";
+}
+
 template <class CREATE_DATA, class REQUEST, class REFRESH, class SET_REGION>
 static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefreshInternal(const string &s3_url, CREATE_DATA create_data,
                                                                     REQUEST request, REFRESH refresh_auth_params,
                                                                     SET_REGION set_region) {
-	// create_data snapshots signed request material, request sends it,
-	// refresh_auth_params reloads changed credentials, and set_region handles region redirects.
+	// Auth refresh and region redirect are one-shot.
 	bool retried_auth_refresh = false;
 	bool retried_region = false;
-	for (idx_t attempt = 0; attempt < 3; attempt++) {
+	for (;;) {
 		auto request_data = create_data();
 		try {
 			auto result = request(request_data);
@@ -420,7 +459,6 @@ static unique_ptr<HTTPResponse> RunS3RequestWithAuthRefreshInternal(const string
 			throw;
 		}
 	}
-	throw InternalException("Exceeded S3 request retry count for '%s'", s3_url);
 }
 
 template <class REQUEST>
@@ -1709,7 +1747,9 @@ bool S3FileSystem::ListFilesExtended(const string &directory, const std::functio
 	return true;
 }
 
-optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result) {
+// Tolerant variant for error bodies: a truncated/malformed body must not escalate to a DB-invalidating
+// InternalException, so an unmatched open tag is "not found".
+optional_idx TryFindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result) {
 	string open_tag = "<" + tag + ">";
 	string close_tag = "</" + tag + ">";
 	auto open_tag_pos = response.find(open_tag, cur_pos);
@@ -1719,11 +1759,25 @@ optional_idx FindTagContents(const string &response, const string &tag, idx_t cu
 	}
 	auto close_tag_pos = response.find(close_tag, open_tag_pos + open_tag.size());
 	if (close_tag_pos == string::npos) {
-		throw InternalException("Failed to parse S3 result: found open tag for %s but did not find matching close tag",
-		                        tag);
+		return optional_idx();
 	}
 	result = response.substr(open_tag_pos + open_tag.size(), close_tag_pos - open_tag_pos - open_tag.size());
 	return close_tag_pos + close_tag.size();
+}
+
+optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result) {
+	string open_tag = "<" + tag + ">";
+	auto open_tag_pos = response.find(open_tag, cur_pos);
+	if (open_tag_pos == string::npos) {
+		// tag not found
+		return optional_idx();
+	}
+	auto next_pos = TryFindTagContents(response, tag, cur_pos, result);
+	if (!next_pos.IsValid()) {
+		throw InternalException("Failed to parse S3 result: found open tag for %s but did not find matching close tag",
+		                        tag);
+	}
+	return next_pos;
 }
 
 string S3FileSystem::GetS3BadRequestError(const S3AuthParams &s3_auth_params, string correct_region) {
@@ -1781,26 +1835,26 @@ string S3FileSystem::ParseS3Error(const string &error) {
 	// find <Error> tag
 	string error_xml;
 	idx_t err_pos = 0;
-	auto next_pos = FindTagContents(error, "Error", err_pos, error_xml);
+	auto next_pos = TryFindTagContents(error, "Error", err_pos, error_xml);
 	if (!next_pos.IsValid()) {
 		return string();
 	}
 	// find <Code> and <Message>
 	string error_code, error_message, extra_error_data;
 	idx_t cur_pos = 0;
-	next_pos = FindTagContents(error_xml, "Code", cur_pos, error_code);
+	next_pos = TryFindTagContents(error_xml, "Code", cur_pos, error_code);
 	if (!next_pos.IsValid()) {
 		return string();
 	}
 	cur_pos = 0;
-	next_pos = FindTagContents(error_xml, "Message", cur_pos, error_message);
+	next_pos = TryFindTagContents(error_xml, "Message", cur_pos, error_message);
 	if (!next_pos.IsValid()) {
 		return string();
 	}
 	// depending on Code, find other info
 	if (error_code == "InvalidAccessKeyId") {
 		cur_pos = 0;
-		next_pos = FindTagContents(error_xml, "AWSAccessKeyId", cur_pos, extra_error_data);
+		next_pos = TryFindTagContents(error_xml, "AWSAccessKeyId", cur_pos, extra_error_data);
 		if (next_pos.IsValid()) {
 			extra_error_data = "\nInvalid Access Key: \"" + extra_error_data + "\"";
 		}

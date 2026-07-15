@@ -280,4 +280,7 @@ struct AWSListObjectV2 {
 HTTPHeaders CreateS3Header(string url, string query, string host, string service, string method,
                            const S3AuthParams &auth_params, string date_now = "", string datetime_now = "",
                            string payload_hash = "", string content_type = "", string content_md5 = "");
+
+//! Whether the response is S3's RequestTimeout error (a stalled socket reported as HTTP 400)
+bool IsS3RequestTimeout(const HTTPResponse &response);
 } // namespace duckdb
