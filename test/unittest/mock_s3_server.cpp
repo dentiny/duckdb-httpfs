@@ -146,6 +146,13 @@ struct MockS3Server::Impl {
 		response.set_header("ETag", config.etag);
 	}
 
+	void SendSlowDown(const httplib::Request &request, httplib::Response &response) const {
+		response.status = 503;
+		response.set_content("<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
+		                     "application/xml");
+		Record(request, response.status);
+	}
+
 	void SendForbidden(const httplib::Request &request, httplib::Response &response) const {
 		response.status = 403;
 		response.set_content("<Error><Code>AccessDenied</Code><Message>stale credentials</Message></Error>",
@@ -290,6 +297,14 @@ struct MockS3Server::Impl {
 				SendForbidden(request, response);
 				return;
 			}
+			if (config.transient_503_lists > 0 && transient_503_lists_sent.fetch_add(1) < config.transient_503_lists) {
+				SendSlowDown(request, response);
+				return;
+			}
+			if (config.transient_400_lists > 0 && transient_400_lists_sent.fetch_add(1) < config.transient_400_lists) {
+				SendS3Error400(request, response, config.failure_is_request_timeout);
+				return;
+			}
 			SendListObjectsSuccess(request, response);
 		};
 		server.Get(bucket_path, list_objects);
@@ -352,6 +367,8 @@ struct MockS3Server::Impl {
 	}
 
 	MockS3ServerConfig config;
+	mutable std::atomic<idx_t> transient_503_lists_sent {0};
+	mutable std::atomic<idx_t> transient_400_lists_sent {0};
 	httplib::Server server;
 	std::thread server_thread;
 	int port = 0;

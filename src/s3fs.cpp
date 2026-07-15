@@ -1948,25 +1948,19 @@ string AWSListObjectV2::Request(const string &path, HTTPParams &http_params, S3A
 		} else {
 			actual_path += "/" + listobjectv2_url;
 		}
-		std::stringstream response;
-		ErrorData error;
-		GetRequestInfo get_request(
-		    actual_path, header_map, http_params,
-		    [&](const HTTPResponse &response) {
-			    if (static_cast<int>(response.status) >= 400) {
-				    string trimmed_path = path;
-				    StringUtil::RTrim(trimmed_path, "/");
-				    error = ErrorData(S3FileSystem::GetS3Error(s3_auth_params, response, trimmed_path));
-			    }
-			    return true;
-		    },
-		    [&](const_data_ptr_t data, idx_t data_length) {
-			    response << string(const_char_ptr_cast(data), data_length);
-			    return true;
-		    });
+		// Buffer the response in HTTPResponse instead of streaming it through callbacks. The retry classifier needs the
+		// complete S3 error body to distinguish RequestTimeout (HTTP 400), and callbacks otherwise retain per-attempt
+		// state across HTTPUtil's internal retry loop.
+		GetRequestInfo get_request(actual_path, header_map, http_params, nullptr, nullptr);
 		auto result = http_params.http_util.Request(get_request);
 		if (result->HasRequestError()) {
 			throw IOException("%s error for HTTP GET to '%s'", result->GetRequestError(), listobjectv2_url);
+		}
+		ErrorData error;
+		if (static_cast<int>(result->status) >= 400) {
+			string trimmed_path = path;
+			StringUtil::RTrim(trimmed_path, "/");
+			error = ErrorData(S3FileSystem::GetS3Error(s3_auth_params, *result, trimmed_path));
 		}
 		// check
 		string updated_bucket_region;
@@ -2017,7 +2011,7 @@ string AWSListObjectV2::Request(const string &path, HTTPParams &http_params, S3A
 			retried_region = true;
 			continue;
 		}
-		return response.str();
+		return std::move(result->body);
 	}
 	throw InvalidInputException(
 	    "Exceeded retry count in AWSListObjectV2::Request while retrying region redirects or credential refresh");
