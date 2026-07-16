@@ -98,8 +98,13 @@ public:
 		Reset();
 	}
 	void WriteProfilingInformation(std::ostream &ss) override;
+	mutex &CredentialRefreshLock() {
+		return credential_refresh_mutex;
+	}
 
 private:
+	//! Serializes credential provider refreshes after auth failures.
+	mutex credential_refresh_mutex;
 	//! Mutex to lock when getting the cached file(Parallel Only)
 	mutex cached_files_mutex;
 	//! In case of fully downloading the file, the cached files of this query
