@@ -78,7 +78,7 @@ jobs:
         shell: bash
         run: |
           cmake --build build/release --target unittest_httpfs
-          ./build/release/test/unittest_httpfs "[httpfs][s3][refresh]"
+          ./build/release/test/unittest_httpfs "[httpfs][s3]"
 
       - name: Install test server
         shell: bash

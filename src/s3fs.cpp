@@ -1406,6 +1406,13 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 				if (!retried_auth_refresh && res && IsAuthRefreshStatus(*res) &&
 				    TryRefreshS3AuthParams(opener, secret_lookup_url, http_input.http_params, url_info.auth_params,
 				                           request_auth_params, request_http_params)) {
+					auto refreshed_url = S3UrlParse(secret_lookup_url, url_info.auth_params);
+					auto refreshed_bucket_path =
+					    refreshed_url.path.substr(0, refreshed_url.path.length() - refreshed_url.key.length());
+					url_info.prefix = refreshed_url.prefix;
+					url_info.http_proto = refreshed_url.http_proto;
+					url_info.host = refreshed_url.host;
+					url_info.path = refreshed_bucket_path.empty() ? "/" : refreshed_bucket_path;
 					retried_auth_refresh = true;
 					continue;
 				}

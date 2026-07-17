@@ -3,6 +3,7 @@
 #include "mock_s3_server.hpp"
 
 #include "create_secret_functions.hpp"
+#include "httpfs_client.hpp"
 #include "httpfs_extension.hpp"
 
 #include "duckdb.hpp"
@@ -12,8 +13,10 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/secret/secret.hpp"
 
+#include <array>
 #include <atomic>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 
 namespace duckdb {
@@ -166,6 +169,40 @@ CREATE SECRET refresh_s3 (
 	                                       TEST_PROVIDER, STALE_KEY_ID, STALE_SECRET, test_id, FRESH_KEY_ID,
 	                                       FRESH_SECRET, test_id));
 	return test_id;
+}
+
+static void ConfigureEndpointRefreshTest(DuckDB &db, Connection &con, MockS3Server &stale_server,
+                                         MockS3Server &fresh_server, const string &client_implementation) {
+	auto test_id = NextTestId();
+
+	LoadHTTPFSExtension(db);
+	RegisterRefreshTestProvider(db);
+
+	RequireQueryOk(con, StringUtil::Format("SET httpfs_client_implementation='%s'", client_implementation));
+	RequireQueryOk(con, "SET httpfs_connection_caching=false");
+	RequireQueryOk(con, "SET httpfs_enable_credential_refresh=true");
+	RequireQueryOk(con, "SET s3_region='us-east-1'");
+	RequireQueryOk(con, "SET s3_use_ssl=false");
+	RequireQueryOk(con, "SET s3_url_style='path'");
+
+	RequireQueryOk(con, StringUtil::Format(R"(
+CREATE SECRET refresh_s3 (
+	TYPE S3,
+	PROVIDER %s,
+	SCOPE 's3://refresh-bucket/',
+	KEY_ID '%s',
+	SECRET '%s',
+	ENDPOINT '%s',
+	TEST_ID '%s',
+	REFRESH_INFO MAP {
+		'KEY_ID': '%s',
+		'SECRET': '%s',
+		'ENDPOINT': '%s',
+		'TEST_ID': '%s'
+	}
+))",
+	                                       TEST_PROVIDER, STALE_KEY_ID, STALE_SECRET, stale_server.Endpoint(), test_id,
+	                                       STALE_KEY_ID, STALE_SECRET, fresh_server.Endpoint(), test_id));
 }
 
 static void AssertSingleRefresh(const string &test_id) {
@@ -341,6 +378,38 @@ static void RunBulkDeletePostRefreshScenario(const string &client_implementation
 	                                       });
 	REQUIRE(MockS3HasObservation(observations, "POST", STALE_KEY_ID, 403, string(), "delete"));
 	REQUIRE(MockS3HasObservation(observations, "POST", FRESH_KEY_ID, 200, string(), "delete"));
+}
+
+static void RunBulkDeleteEndpointRefreshScenario(const string &client_implementation) {
+	MockS3ServerConfig stale_config;
+	stale_config.bucket = BUCKET;
+	stale_config.object_key = OBJECT_KEY;
+	stale_config.stale_key_id = STALE_KEY_ID;
+	stale_config.refresh_target = MockS3RefreshTarget::BULK_DELETE_POST;
+	MockS3Server stale_server(std::move(stale_config));
+
+	MockS3ServerConfig fresh_config;
+	fresh_config.bucket = BUCKET;
+	fresh_config.object_key = OBJECT_KEY;
+	fresh_config.stale_key_id = "NEVER_STALE";
+	fresh_config.refresh_target = MockS3RefreshTarget::BULK_DELETE_POST;
+	MockS3Server fresh_server(std::move(fresh_config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureEndpointRefreshTest(db, con, stale_server, fresh_server, client_implementation);
+
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	fs.RemoveFiles({S3_PATH});
+	RequireQueryOk(con, "COMMIT");
+
+	auto stale_observations = stale_server.Observations();
+	auto fresh_observations = fresh_server.Observations();
+	INFO(MockS3DescribeObservations(stale_observations));
+	INFO(MockS3DescribeObservations(fresh_observations));
+	REQUIRE(CountObservations(stale_observations, "POST", STALE_KEY_ID, 403) == 1);
+	REQUIRE(CountObservations(fresh_observations, "POST", STALE_KEY_ID, 200) == 1);
 }
 
 static void RunDeleteRefreshScenario(const string &client_implementation, bool connection_caching) {
@@ -854,6 +923,29 @@ TEST_CASE("HTTPFS can disable S3 credential refresh", "[httpfs][s3][refresh]") {
 
 TEST_CASE("HTTPFS reuses one S3 credential refresh across stale handles", "[httpfs][s3][refresh]") {
 	RunMultipleStaleHandlesSingleRefreshScenario();
+}
+
+TEST_CASE("HTTPFS bulk delete follows a refreshed S3 endpoint", "[httpfs][s3][refresh]") {
+	SECTION("httplib") {
+		RunBulkDeleteEndpointRefreshScenario("httplib");
+	}
+	SECTION("curl") {
+		RunBulkDeleteEndpointRefreshScenario("curl");
+	}
+}
+
+TEST_CASE("HTTPFS clones parameters without a configured proxy", "[httpfs][s3][params]") {
+	alignas(HTTPFSParams) std::array<uint8_t, sizeof(HTTPFSParams)> storage;
+	storage.fill(0xA5);
+
+	HTTPFSUtil http_util;
+	auto params = new (storage.data()) HTTPFSParams(http_util);
+	auto clone = params->Clone();
+	params->~HTTPFSParams();
+
+	auto &cloned_params = clone->Cast<HTTPFSParams>();
+	REQUIRE(cloned_params.http_proxy.empty());
+	REQUIRE(cloned_params.http_proxy_port == 0);
 }
 
 } // namespace duckdb

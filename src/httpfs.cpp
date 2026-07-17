@@ -128,7 +128,7 @@ unique_ptr<HTTPParams> HTTPFSParams::Clone() const {
 	result->override_verify_ssl = override_verify_ssl;
 	result->verify_ssl = verify_ssl;
 	result->http_proxy = http_proxy;
-	result->http_proxy_port = http_proxy_port;
+	result->http_proxy_port = http_proxy.empty() ? 0 : http_proxy_port;
 	result->http_proxy_username = http_proxy_username;
 	result->http_proxy_password = http_proxy_password;
 	result->extra_headers = extra_headers;
