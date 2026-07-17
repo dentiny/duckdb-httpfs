@@ -934,12 +934,14 @@ TEST_CASE("HTTPFS bulk delete follows a refreshed S3 endpoint", "[httpfs][s3][re
 	}
 }
 
-TEST_CASE("HTTPFS clones parameters without a configured proxy", "[httpfs][s3][params]") {
+TEST_CASE("HTTPFS initializes and clones parameters without a configured proxy", "[httpfs][s3][params]") {
 	alignas(HTTPFSParams) std::array<uint8_t, sizeof(HTTPFSParams)> storage;
 	storage.fill(0xA5);
 
 	HTTPFSUtil http_util;
 	auto params = new (storage.data()) HTTPFSParams(http_util);
+	REQUIRE(params->http_proxy.empty());
+	REQUIRE(params->http_proxy_port == 0);
 	auto clone = params->Clone();
 	params->~HTTPFSParams();
 
