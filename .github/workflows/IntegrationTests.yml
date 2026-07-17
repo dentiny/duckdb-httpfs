@@ -91,28 +91,28 @@ jobs:
         run: |
           source ./scripts/run_s3_test_server.sh
           source ./scripts/set_s3_test_server_variables.sh
-          ./build/release/test/unittest "*" --skip-error-messages "[]"
+          ./build/release/test/unittest "*" --test-config test/configs/httpfs_dynamic.json
 
       - name: Run tests with statically loaded extensions (curl)
         shell: bash
         run: |
           source ./scripts/run_s3_test_server.sh
           source ./scripts/set_s3_test_server_variables.sh
-          ./build/release/test/unittest "*" --skip-error-messages "[]" --statically-loaded-extensions "[httpfs,parquet,core_functions]" --on-init "SET httpfs_client_implementation='curl';" || true
+          ./build/release/test/unittest "*" --test-config test/configs/httpfs_curl.json
 
       - name: Run tests with statically loaded extensions (httplib)
         shell: bash
         run: |
           source ./scripts/run_s3_test_server.sh
           source ./scripts/set_s3_test_server_variables.sh
-          ./build/release/test/unittest "*" --skip-error-messages "[]" --statically-loaded-extensions "[httpfs,parquet,core_functions]" --on-init "SET httpfs_client_implementation='httplib';" || true
+          ./build/release/test/unittest "*" --test-config test/configs/httpfs_httplib.json
 
-      - name: Run tests with statically loaded extensions (connection caching)
+      - name: Run tests with statically loaded extensions (curl connection caching)
         shell: bash
         run: |
           source ./scripts/run_s3_test_server.sh
           source ./scripts/set_s3_test_server_variables.sh
-          ./build/release/test/unittest "*" --skip-error-messages "[]" --statically-loaded-extensions "[httpfs,parquet,core_functions]" --on-init "SET httpfs_connection_caching=true;" || true
+          ./build/release/test/unittest "*" --test-config test/configs/httpfs_connection_caching.json
 
       - name: Stop test server
         if: always()
