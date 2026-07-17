@@ -35,6 +35,9 @@ CREATE SECRET (
 statement ok
 set s3_endpoint='ensure.secret.is.used.instead.of.duckdb.setting.com'
 
+statement ok
+CALL enable_logging('HTTP');
+
 # Simple table that is easy to partition
 statement ok
 CREATE TABLE test as SELECT i%2 as part_col, (i+1)%5 as value_col, i as value2_col from range(0,10) tbl(i);
@@ -172,6 +175,14 @@ SELECT part_col, value_col, value2_col FROM 's3://test-bucket/partitioned7/part_
 0	0	4
 0	2	6
 0	4	8
+
+# every logged request must carry a User-Agent that identifies duckdb
+query I
+SELECT count(*) FROM duckdb_logs_parsed('HTTP')
+WHERE request.headers['User-Agent'] IS NULL
+   OR NOT starts_with(request.headers['User-Agent'], 'duckdb')
+----
+0
 
 query III
 SELECT part_col, value_col, value2_col FROM 's3://test-bucket/partitioned7/part_col=1/*.csv' ORDER BY value2_col;

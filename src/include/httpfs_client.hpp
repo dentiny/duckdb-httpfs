@@ -32,6 +32,8 @@ struct HTTPFSParams : public HTTPParams {
 	HTTPFSParams(HTTPUtil &http_util) : HTTPParams(http_util) {
 	}
 
+	unique_ptr<HTTPParams> Clone() const;
+
 	static constexpr bool DEFAULT_ENABLE_SERVER_CERT_VERIFICATION = false;
 	static constexpr uint64_t DEFAULT_HF_MAX_PER_PAGE = 0;
 	static constexpr bool DEFAULT_FORCE_DOWNLOAD = false;

@@ -38,6 +38,14 @@ select count(*) > 0 from duckdb_logs where log_level='WARNING' and message like 
 ----
 true
 
+# every logged request must carry a User-Agent that identifies duckdb
+query I
+SELECT count(*) FROM duckdb_logs_parsed('HTTP')
+WHERE request.headers['User-Agent'] IS NULL
+   OR NOT starts_with(request.headers['User-Agent'], 'duckdb')
+----
+0
+
 statement ok
 set auto_fallback_to_full_download=false
 

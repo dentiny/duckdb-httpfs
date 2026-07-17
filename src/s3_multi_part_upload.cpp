@@ -131,11 +131,12 @@ void S3MultiPartUpload::UploadBufferImplementation(shared_ptr<S3WriteBuffer> wri
 	string etag;
 
 	try {
+		// Transient S3 errors are retried inside PutRequest; a non-OK status here is already final.
 		res = s3fs.PutRequest(*http_input, path, {}, (char *)write_buffer->Ptr(), write_buffer->idx, query_param);
 
 		if (res->status != HTTPStatusCode::OK_200) {
-			throw HTTPException(*res, "Unable to connect to URL %s: %s (HTTP code %d)", path, res->GetError(),
-			                    static_cast<int>(res->status));
+			throw HTTPException(*res, "Unable to connect to URL %s: %s (HTTP code %d)%s", path, res->GetError(),
+			                    static_cast<int>(res->status), S3FileSystem::ParseS3Error(res->body));
 		}
 
 		if (!res->headers.HasHeader("ETag")) {
