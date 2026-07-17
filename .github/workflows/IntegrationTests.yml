@@ -89,9 +89,27 @@ jobs:
       - name: Start test server & run tests
         shell: bash
         run: |
-          source ./scripts/run_s3_test_server.sh
-          source ./scripts/set_s3_test_server_variables.sh
+          cleanup_test_server() {
+            docker compose -f scripts/minio_s3.yml -p duckdb-minio down --volumes --remove-orphans
+            sudo rm -rf /tmp/minio_test_data /tmp/minio_root_data
+          }
+
+          reset_test_server() {
+            cleanup_test_server
+            source ./scripts/run_s3_test_server.sh
+            source ./scripts/set_s3_test_server_variables.sh
+          }
+
+          trap cleanup_test_server EXIT
+
+          reset_test_server
           ./build/release/test/unittest "*" --skip-error-messages "[]"
+
+          reset_test_server
           ./build/release/test/unittest "*" --skip-error-messages "[]" --statically-loaded-extensions "[httpfs,parquet,core_functions]" --on-init "SET httpfs_client_implementation='curl';" || true
+
+          reset_test_server
           ./build/release/test/unittest "*" --skip-error-messages "[]" --statically-loaded-extensions "[httpfs,parquet,core_functions]" --on-init "SET httpfs_client_implementation='httplib';" || true
+
+          reset_test_server
           ./build/release/test/unittest "*" --skip-error-messages "[]" --statically-loaded-extensions "[httpfs,parquet,core_functions]" --on-init "SET httpfs_connection_caching=true;" || true
