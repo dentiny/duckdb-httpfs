@@ -4,8 +4,7 @@
 if [ ! -f test/test_data/attach.db ]; then
     echo "File test/test_data/attach.db not found, run ./scripts/generate_presigned_url.sh to generate"
 else
-  rm -rf /tmp/minio_test_data
-  rm -rf /tmp/minio_root_data
+  ./scripts/cleanup_s3_test_server.sh
   mkdir -p /tmp/minio_test_data
   mkdir -p /tmp/minio_root_data
   docker compose -f scripts/minio_s3.yml -p duckdb-minio up -d
