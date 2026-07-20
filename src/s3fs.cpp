@@ -1312,6 +1312,11 @@ static string CreateDeleteBatchKey(const S3DeleteBatchUrlInfo &url_info,
 	return key_builder.Build();
 }
 
+static string GetS3BucketPath(const ParsedS3Url &parsed_url) {
+	auto bucket_path = parsed_url.path.substr(0, parsed_url.path.length() - parsed_url.key.length());
+	return bucket_path.empty() ? "/" : bucket_path;
+}
+
 void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpener> opener) {
 	if (paths.empty()) {
 		return;
@@ -1325,10 +1330,7 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 		auto parsed_url = S3UrlParse(path, auth_params);
 		ReadQueryParams(parsed_url.query_param, auth_params);
 
-		string bucket_path = parsed_url.path.substr(0, parsed_url.path.length() - parsed_url.key.length());
-		if (bucket_path.empty()) {
-			bucket_path = "/";
-		}
+		auto bucket_path = GetS3BucketPath(parsed_url);
 		S3DeleteBatchUrlInfo url_info = {parsed_url.prefix, parsed_url.http_proto, parsed_url.host, bucket_path,
 		                                 auth_params};
 		auto refreshable_http_params = ReadRefreshableHTTPParams(opener, path);
@@ -1392,12 +1394,14 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 				auto &http_util = HTTPFSUtil::GetHTTPUtil(opener);
 				auto http_params = http_util.InitializeParameters(opener, info);
 				auto request_http_params = SnapshotRefreshableHTTPParams(http_params->Cast<HTTPFSParams>());
+				auto request_url = S3UrlParse(secret_lookup_url, url_info.auth_params);
+				auto request_path = GetS3BucketPath(request_url);
 				auto headers =
-				    CreateS3Header(url_info.path, http_query_param_for_sig, url_info.host, "s3", "POST",
+				    CreateS3Header(request_path, http_query_param_for_sig, request_url.host, "s3", "POST",
 				                   url_info.auth_params, "", "", payload_hash, "application/xml", content_md5);
 
-				string http_url = url_info.http_proto + url_info.host + S3FileSystem::UrlEncode(url_info.path) + "?" +
-				                  http_query_param_for_url;
+				string http_url = request_url.http_proto + request_url.host + S3FileSystem::UrlEncode(request_path) +
+				                  "?" + http_query_param_for_url;
 				S3HTTPInput http_input(std::move(http_params), url_info.auth_params, S3ConfigParams::ReadFrom(opener));
 
 				result.clear();

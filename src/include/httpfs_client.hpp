@@ -30,6 +30,7 @@ class HTTPState;
 
 struct HTTPFSParams : public HTTPParams {
 	HTTPFSParams(HTTPUtil &http_util) : HTTPParams(http_util) {
+		http_proxy_port = 0;
 	}
 
 	unique_ptr<HTTPParams> Clone() const;
