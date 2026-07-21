@@ -73,7 +73,7 @@ unique_ptr<BaseSecret> CreateS3SecretFunctions::CreateSecretFunctionInternal(Cli
 		} else if (lower_name == "endpoint") {
 			secret->secret_map["endpoint"] = named_param.second.ToString();
 		} else if (lower_name == "url_style") {
-			secret->secret_map["url_style"] = named_param.second.ToString();
+			secret->secret_map["url_style"] = StringUtil::Lower(named_param.second.ToString());
 		} else if (lower_name == "use_ssl") {
 			if (named_param.second.type() != LogicalType::BOOLEAN) {
 				throw InvalidInputException("Invalid type past to secret option: '%s', found '%s', expected: 'BOOLEAN'",
