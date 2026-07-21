@@ -73,7 +73,9 @@ public:
 	//! Reset all counters and cached files
 	void Reset();
 	//! Get cache entry, create if not exists
-	shared_ptr<CachedFile> &GetCachedFile(const string &path);
+	shared_ptr<CachedFile> GetCachedFile(const string &path);
+	//! Erase a cached full download
+	void EraseCachedFile(const string &path);
 	//! Helper functions to get the HTTP state
 	static shared_ptr<HTTPState> TryGetState(ClientContext &context);
 	static shared_ptr<HTTPState> TryGetState(optional_ptr<FileOpener> opener);

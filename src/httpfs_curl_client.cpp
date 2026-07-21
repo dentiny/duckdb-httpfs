@@ -284,7 +284,7 @@ public:
 		}
 
 		const char *data = request_info->body.c_str();
-		if (info.content_handler) {
+		if (info.content_handler && res == CURLcode::CURLE_OK) {
 			info.content_handler(const_data_ptr_cast(data), bytes_received);
 		}
 
