@@ -20,7 +20,7 @@ static void LoadHTTPFSExtension(DuckDB &db) {
 		return;
 	}
 	ExtensionInfo extension_info;
-	ExtensionActiveLoad load_info(*db.instance, extension_info, "httpfs");
+	ExtensionActiveLoad load_info(*db.instance, extension_info, "httpfs", "");
 	ExtensionLoader loader(load_info);
 	HttpfsExtension extension;
 	extension.Load(loader);
