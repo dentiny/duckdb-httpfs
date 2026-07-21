@@ -182,10 +182,13 @@ public:
 			                 0L); // Override default, don't verify that the cert matches the hostname
 		}
 
-		// set read timeout
-		curl_easy_setopt(*curl, CURLOPT_TIMEOUT, http_params.timeout);
 		// set connection timeout
 		curl_easy_setopt(*curl, CURLOPT_CONNECTTIMEOUT, http_params.timeout);
+		// Do NOT impose a hard timeout on the whole transfer
+		curl_easy_setopt(*curl, CURLOPT_TIMEOUT, 0L);                         // no hard timeout for uploads
+		curl_easy_setopt(*curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);              // abort if < 1 KB/s...
+		curl_easy_setopt(*curl, CURLOPT_LOW_SPEED_TIME, http_params.timeout); // ...for 'timeout' consecutive seconds
+
 		// accept content as-is (i.e no decompressing)
 		curl_easy_setopt(*curl, CURLOPT_ACCEPT_ENCODING, NULL);
 		// follow redirects
@@ -291,7 +294,7 @@ public:
 		}
 
 		const char *data = request_info->body.c_str();
-		if (info.content_handler) {
+		if (info.content_handler && res == CURLcode::CURLE_OK) {
 			info.content_handler(const_data_ptr_cast(data), bytes_received);
 		}
 
@@ -322,10 +325,6 @@ public:
 			curl_easy_setopt(*curl, CURLOPT_URL, nullptr);
 			curl_easy_setopt(*curl, CURLOPT_CURLU, url);
 
-			curl_easy_setopt(*curl, CURLOPT_TIMEOUT, 0L);                         // no hard timeout for uploads
-			curl_easy_setopt(*curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);              // abort if < 1 KB/s...
-			curl_easy_setopt(*curl, CURLOPT_LOW_SPEED_TIME, info.params.timeout); // ...for X consecutive seconds
-
 			// Perform PUT
 			curl_easy_setopt(*curl, CURLOPT_CUSTOMREQUEST, "PUT");
 			// Include PUT body
@@ -340,7 +339,6 @@ public:
 			curl_easy_setopt(*curl, CURLOPT_POSTFIELDS, nullptr);
 			curl_easy_setopt(*curl, CURLOPT_POSTFIELDSIZE, 0);
 			curl_url_cleanup(url);
-			curl_easy_setopt(*curl, CURLOPT_TIMEOUT, info.params.timeout);
 		}
 
 		curl_easy_getinfo(*curl, CURLINFO_RESPONSE_CODE, &request_info->response_code);

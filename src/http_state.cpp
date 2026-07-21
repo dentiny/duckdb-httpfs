@@ -110,13 +110,18 @@ void HTTPState::WriteProfilingInformation(std::ostream &ss) {
 }
 
 //! Get cache entry, create if not exists
-shared_ptr<CachedFile> &HTTPState::GetCachedFile(const string &path) {
+shared_ptr<CachedFile> HTTPState::GetCachedFile(const string &path) {
 	lock_guard<mutex> lock(cached_files_mutex);
 	auto &cache_entry_ref = cached_files[path];
 	if (!cache_entry_ref) {
 		cache_entry_ref = make_shared_ptr<CachedFile>();
 	}
 	return cache_entry_ref;
+}
+
+void HTTPState::EraseCachedFile(const string &path) {
+	lock_guard<mutex> lock(cached_files_mutex);
+	cached_files.erase(path);
 }
 
 } // namespace duckdb

@@ -128,7 +128,7 @@ unique_ptr<HTTPParams> HTTPFSParams::Clone() const {
 	result->override_verify_ssl = override_verify_ssl;
 	result->verify_ssl = verify_ssl;
 	result->http_proxy = http_proxy;
-	result->http_proxy_port = http_proxy_port;
+	result->http_proxy_port = http_proxy.empty() ? 0 : http_proxy_port;
 	result->http_proxy_username = http_proxy_username;
 	result->http_proxy_password = http_proxy_password;
 	result->extra_headers = extra_headers;
@@ -358,6 +358,12 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh,
 
 	get_request.try_request = auto_fallback_to_full_file_download;
 	auto response = send_request(get_request);
+	if (response && !response->HasRequestError() && response->Success() && buffer_out != nullptr &&
+	    out_offset != buffer_out_len) {
+		throw IOException("Short read for HTTP GET to '%s': requested range %s (%llu bytes), but received %llu bytes",
+		                  url, range_expr, static_cast<unsigned long long>(buffer_out_len),
+		                  static_cast<unsigned long long>(out_offset));
+	}
 
 	// Feed the prefetch cost model a network measurement for this ranged GET
 	if (response && (response->Success() || response->status == HTTPStatusCode::PartialContent_206 ||
@@ -623,6 +629,19 @@ bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders
 	auto res = GetRangeRequest(handle, url, header_map, file_offset, buffer_out, buffer_out_len);
 
 	if (res) {
+		// Request failed and we have a request error
+		if (res->HasRequestError()) {
+
+			// Special case: we can do a retry with a full file download
+			if (RespondedWithRangeRequestNotSupported(*res)) {
+				if (hfh.http_params.auto_fallback_to_full_download) {
+					return false;
+				}
+			}
+			ErrorData error(res->GetRequestError());
+			error.Throw();
+		}
+
 		// Request succeeded TODO: fix upstream that 206 is not considered success
 		if (res->Success() || res->status == HTTPStatusCode::PartialContent_206 ||
 		    res->status == HTTPStatusCode::Accepted_202) {
@@ -638,19 +657,6 @@ bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders
 			return true;
 		}
 
-		// Request failed and we have a request error
-		if (res->HasRequestError()) {
-
-			// Special case: we can do a retry with a full file download
-			if (RespondedWithRangeRequestNotSupported(*res)) {
-				auto &hfh = handle.Cast<HTTPFileHandle>();
-				if (hfh.http_params.auto_fallback_to_full_download) {
-					return false;
-				}
-			}
-			ErrorData error(res->GetRequestError());
-			error.Throw();
-		}
 		throw HTTPException(*res, "Request returned HTTP %d for HTTP %s to '%s'", static_cast<int>(res->status),
 		                    EnumUtil::ToString(RequestType::GET_REQUEST), url);
 	}
@@ -774,9 +780,21 @@ void HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 	}
 
 	auto &hfh = handle.Cast<HTTPFileHandle>();
+	const auto head_reported_length = hfh.length;
 
 	bool should_write_cache = false;
 	hfh.FullDownload(*this, should_write_cache);
+
+	const auto downloaded_length = hfh.cached_file_handle->GetSize();
+	if (downloaded_length != head_reported_length) {
+		hfh.http_params.state->EraseCachedFile(hfh.path);
+		hfh.cached_file_handle.reset();
+		throw HTTPException(Exception::ConstructMessage(
+		    "The size reported by HEAD for '%s' was %llu bytes, but the full GET downloaded %llu bytes. You can try "
+		    "to resolve this by enabling `SET force_download=true`",
+		    hfh.path, static_cast<unsigned long long>(head_reported_length),
+		    static_cast<unsigned long long>(downloaded_length)));
+	}
 
 	if (!ReadInternal(handle, buffer, nr_bytes, location)) {
 		throw HTTPException("Failed to read from HTTP file after automatically retrying a full file download.");
@@ -882,7 +900,7 @@ void HTTPFileHandle::FullDownload(HTTPFileSystem &hfs, bool &should_write_cache)
 		should_write_cache = false;
 		return;
 	}
-	const auto &cache_entry = http_params.state->GetCachedFile(path);
+	auto cache_entry = http_params.state->GetCachedFile(path);
 	cached_file_handle = cache_entry->GetHandle();
 	if (!cached_file_handle->Initialized()) {
 		try {
@@ -958,7 +976,7 @@ void HTTPFileHandle::LoadFileInfo() {
 
 	// Check if file is already fully cached (e.g., from a prior force_download_threshold open)
 	if (http_params.state) {
-		const auto &cache_entry = http_params.state->GetCachedFile(path);
+		auto cache_entry = http_params.state->GetCachedFile(path);
 		auto handle = cache_entry->GetHandle();
 		if (handle->Initialized()) {
 			length = handle->GetSize();
@@ -1101,7 +1119,7 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 				// If a full file download exists in HTTPState, reuse it
 				// instead of falling through to range requests that may not be supported.
 				if (http_params.state) {
-					auto &cache_entry = http_params.state->GetCachedFile(path);
+					auto cache_entry = http_params.state->GetCachedFile(path);
 					auto handle = cache_entry->GetHandle();
 					if (handle->Initialized()) {
 						cached_file_handle = std::move(handle);
