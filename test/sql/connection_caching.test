@@ -12,8 +12,11 @@ set ignore_error_messages
 statement ok
 SET enable_logging=true;
 
-statement ok
-SET httpfs_connection_caching=true;
+# connection caching is on by default
+query I
+SELECT current_setting('httpfs_connection_caching');
+----
+true
 
 statement ok
 CALL enable_logging('HTTPFSInfo');
