@@ -112,8 +112,9 @@ static void RunExhaustedListRetryTest(const string &client_implementation, int s
 
 	auto observations = server.Observations();
 	INFO(MockS3DescribeObservations(observations));
-	// One initial attempt plus two retries.
-	REQUIRE(CountListObservations(observations, status) == 3);
+	// Core grants five extra retries to 503 throttling responses.
+	const idx_t expected_attempts = status == 503 ? 8 : 3;
+	REQUIRE(CountListObservations(observations, status) == expected_attempts);
 	REQUIRE(CountListObservations(observations, 200) == 0);
 }
 

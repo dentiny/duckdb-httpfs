@@ -265,10 +265,11 @@ unique_ptr<HTTPResponse> HuggingFaceFileSystem::HeadRequest(FileHandle &handle, 
 	return HTTPFileSystem::HeadRequest(handle, http_url, header_map);
 }
 
-unique_ptr<HTTPResponse> HuggingFaceFileSystem::GetRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
+unique_ptr<HTTPResponse> HuggingFaceFileSystem::GetRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
+                                                           CachedFileDownload &download) {
 	auto &hf_handle = handle.Cast<HFFileHandle>();
 	auto http_url = HuggingFaceFileSystem::GetFileUrl(hf_handle.parsed_url);
-	return HTTPFileSystem::GetRequest(handle, http_url, header_map);
+	return HTTPFileSystem::GetRequest(handle, http_url, header_map, download);
 }
 
 unique_ptr<HTTPResponse> HuggingFaceFileSystem::GetRangeRequest(FileHandle &handle, string s3_url,

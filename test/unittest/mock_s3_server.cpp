@@ -6,6 +6,7 @@
 #include "httplib.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -29,7 +30,7 @@ static string ExtractCredentialKey(const string &authorization) {
 	return authorization.substr(credential_pos, end_pos - credential_pos);
 }
 
-static bool ParseRange(const string &range, idx_t object_size) {
+static bool ParseRange(const string &range, idx_t object_size, idx_t &start, idx_t &end) {
 	static constexpr const char *PREFIX = "bytes=";
 	if (range.rfind(PREFIX, 0) != 0) {
 		return false;
@@ -38,8 +39,6 @@ static bool ParseRange(const string &range, idx_t object_size) {
 	if (dash_pos == string::npos) {
 		return false;
 	}
-	idx_t start = 0;
-	idx_t end = 0;
 	try {
 		start = std::stoull(range.substr(strlen(PREFIX), dash_pos - strlen(PREFIX)));
 		end = std::stoull(range.substr(dash_pos + 1));
@@ -47,6 +46,16 @@ static bool ParseRange(const string &range, idx_t object_size) {
 		return false;
 	}
 	return start <= end && end < object_size;
+}
+
+static bool ConsumeBehavior(std::atomic<idx_t> &remaining) {
+	auto current = remaining.load();
+	while (current > 0) {
+		if (remaining.compare_exchange_weak(current, current - 1)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static string GetHeader(const httplib::Request &request, const string &header) {
@@ -62,10 +71,14 @@ struct MockS3Server::Impl {
 	explicit Impl(MockS3ServerConfig config_p) : config(std::move(config_p)) {
 		remaining_put_failures = config.transient_put_failures;
 		remaining_get_failures = config.transient_get_failures;
+		remaining_range_behavior_requests = config.range_behavior_requests;
 		remaining_head_failures = config.transient_head_failures;
 		remaining_delete_failures = config.transient_delete_failures;
 		remaining_post_failures = config.transient_post_failures;
 		remaining_complete_post_failures = config.transient_complete_post_failures;
+		if (config.range_behavior == MockS3RangeBehavior::SHORT_SUCCESS && config.range_behavior_requests > 0) {
+			server.set_keep_alive_max_count(1);
+		}
 		RegisterRoutes();
 		port = server.bind_to_any_port("127.0.0.1");
 		if (port <= 0) {
@@ -90,9 +103,26 @@ struct MockS3Server::Impl {
 		return StringUtil::Format("s3://%s/%s", config.bucket, config.object_key);
 	}
 
+	string HTTPPath() const {
+		return StringUtil::Format("http://%s/%s/%s", Endpoint(), config.bucket, config.object_key);
+	}
+
 	vector<MockS3RequestObservation> Observations() const {
 		std::lock_guard<std::mutex> lock(observation_lock);
 		return observations;
+	}
+
+	bool WaitForFullGet() {
+		std::unique_lock<std::mutex> lock(full_get_lock);
+		return full_get_started.wait_for(lock, std::chrono::seconds(5), [this]() { return full_get_seen; });
+	}
+
+	void ReleaseFullGet() {
+		{
+			std::lock_guard<std::mutex> lock(full_get_lock);
+			full_get_released = true;
+		}
+		full_get_release.notify_all();
 	}
 
 	bool MatchesRefreshTarget(const httplib::Request &request) const {
@@ -141,8 +171,14 @@ struct MockS3Server::Impl {
 	}
 
 	void SetObjectHeaders(httplib::Response &response) const {
-		response.set_header("Accept-Ranges", "bytes");
-		response.set_header("Content-Length", std::to_string(config.object_data.size()));
+		if (config.advertise_ranges) {
+			response.set_header("Accept-Ranges", "bytes");
+		} else {
+			response.set_header("Accept-Ranges", "none");
+		}
+		auto content_length =
+		    config.head_content_length.IsValid() ? config.head_content_length.GetIndex() : config.object_data.size();
+		response.set_header("Content-Length", std::to_string(content_length));
 		response.set_header("ETag", config.etag);
 	}
 
@@ -234,6 +270,17 @@ struct MockS3Server::Impl {
 		const string path = StringUtil::Format("/%s/%s", config.bucket, config.object_key);
 		const string bucket_path = StringUtil::Format("/%s", config.bucket);
 		const string bucket_path_with_slash = bucket_path + "/";
+		server.set_post_routing_handler([this](const httplib::Request &, httplib::Response &response) {
+			if (!response.has_header("X-Mock-Successful-Short-Response")) {
+				return;
+			}
+			auto omitted_bytes = MinValue<idx_t>(config.truncated_range_bytes, response.body.size());
+			response.body.resize(response.body.size() - omitted_bytes);
+			auto content_length = response.headers.equal_range("Content-Length");
+			response.headers.erase(content_length.first, content_length.second);
+			auto marker = response.headers.equal_range("X-Mock-Successful-Short-Response");
+			response.headers.erase(marker.first, marker.second);
+		});
 
 		server.set_pre_routing_handler([this, path](const httplib::Request &request, httplib::Response &response) {
 			if (request.method != "HEAD" || request.path != path) {
@@ -269,20 +316,111 @@ struct MockS3Server::Impl {
 			if (range.empty()) {
 				response.status = 200;
 				response.set_header("ETag", config.etag);
+				if (config.block_full_get_until_released) {
+					response.set_content_provider(
+					    config.object_data.size(), "application/octet-stream",
+					    [this](size_t offset, size_t length, httplib::DataSink &sink) {
+						    if (offset == 0) {
+							    std::unique_lock<std::mutex> lock(full_get_lock);
+							    full_get_seen = true;
+							    full_get_started.notify_all();
+							    if (!full_get_release.wait_for(lock, std::chrono::seconds(5),
+							                                   [this]() { return full_get_released; })) {
+								    return false;
+							    }
+						    }
+						    return sink.write(config.object_data.data() + offset, length);
+					    });
+					Record(request, response.status);
+					return;
+				}
+				if (config.chunked_full_get) {
+					response.set_chunked_content_provider(
+					    "application/octet-stream", [this](size_t offset, httplib::DataSink &sink) {
+						    if (offset >= config.object_data.size()) {
+							    sink.done();
+							    return true;
+						    }
+						    const auto length = MinValue<size_t>(7, config.object_data.size() - offset);
+						    if (!sink.write(config.object_data.data() + offset, length)) {
+							    return false;
+						    }
+						    if (offset + length == config.object_data.size()) {
+							    sink.done();
+						    }
+						    return true;
+					    });
+					Record(request, response.status);
+					return;
+				}
+				response.set_content(config.object_data, "application/octet-stream");
+				Record(request, response.status);
+				return;
+			}
+			if (config.range_behavior == MockS3RangeBehavior::IGNORE_RANGE) {
+				response.status = 200;
+				response.set_header("ETag", config.etag);
 				response.set_content(config.object_data, "application/octet-stream");
 				Record(request, response.status);
 				return;
 			}
 
-			if (!ParseRange(range, config.object_data.size())) {
+			idx_t range_start;
+			idx_t range_end;
+			if (!ParseRange(range, config.object_data.size(), range_start, range_end)) {
 				response.status = 416;
 				Record(request, response.status);
 				return;
 			}
 
+			idx_t range_request_index;
+			{
+				std::lock_guard<std::mutex> lock(range_request_lock);
+				range_request_index = ++range_requests_seen;
+			}
+			range_request_started.notify_all();
 			response.status = 206;
 			response.set_header("Accept-Ranges", "bytes");
 			response.set_header("ETag", config.etag);
+			if (config.block_first_range_body_until_second_range && range_request_index == 1) {
+				const auto range_length = range_end - range_start + 1;
+				response.set_content_provider(
+				    range_length, "application/octet-stream",
+				    [this, range_start](size_t offset, size_t length, httplib::DataSink &sink) {
+					    if (offset == 0) {
+						    std::unique_lock<std::mutex> lock(range_request_lock);
+						    if (!range_request_started.wait_for(lock, std::chrono::seconds(5),
+						                                        [this]() { return range_requests_seen >= 2; })) {
+							    return false;
+						    }
+					    }
+					    return sink.write(config.object_data.data() + range_start + offset, length);
+				    });
+				Record(request, response.status);
+				return;
+			}
+			if (config.range_behavior == MockS3RangeBehavior::SHORT_SUCCESS &&
+			    ConsumeBehavior(remaining_range_behavior_requests)) {
+				response.set_header("X-Mock-Successful-Short-Response", "1");
+				response.set_content(config.object_data, "application/octet-stream");
+				Record(request, response.status);
+				return;
+			}
+			if (config.range_behavior == MockS3RangeBehavior::TRUNCATE_TRANSFER &&
+			    ConsumeBehavior(remaining_range_behavior_requests)) {
+				response.set_content_provider(config.object_data.size(), "application/octet-stream",
+				                              [this](size_t offset, size_t length, httplib::DataSink &sink) {
+					                              auto omitted_bytes =
+					                                  MinValue<idx_t>(config.truncated_range_bytes, length);
+					                              auto emitted_bytes = length - omitted_bytes;
+					                              if (emitted_bytes > 0) {
+						                              sink.write(config.object_data.data() + offset, emitted_bytes);
+					                              }
+					                              return false;
+				                              });
+				Record(request, response.status);
+				return;
+			}
 			response.set_content(config.object_data, "application/octet-stream");
 			Record(request, response.status);
 		});
@@ -374,12 +512,21 @@ struct MockS3Server::Impl {
 	int port = 0;
 	mutable std::atomic<idx_t> remaining_put_failures {0};
 	mutable std::atomic<idx_t> remaining_get_failures {0};
+	mutable std::atomic<idx_t> remaining_range_behavior_requests {0};
 	mutable std::atomic<idx_t> remaining_head_failures {0};
 	mutable std::atomic<idx_t> remaining_delete_failures {0};
 	mutable std::atomic<idx_t> remaining_post_failures {0};
 	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
 	mutable std::mutex observation_lock;
 	mutable vector<MockS3RequestObservation> observations;
+	std::mutex range_request_lock;
+	std::condition_variable range_request_started;
+	idx_t range_requests_seen = 0;
+	std::mutex full_get_lock;
+	std::condition_variable full_get_started;
+	std::condition_variable full_get_release;
+	bool full_get_seen = false;
+	bool full_get_released = false;
 };
 
 MockS3Server::MockS3Server(MockS3ServerConfig config) : impl(make_uniq<Impl>(std::move(config))) {
@@ -396,12 +543,24 @@ string MockS3Server::S3Path() const {
 	return impl->S3Path();
 }
 
+string MockS3Server::HTTPPath() const {
+	return impl->HTTPPath();
+}
+
 const string &MockS3Server::ObjectData() const {
 	return impl->config.object_data;
 }
 
 vector<MockS3RequestObservation> MockS3Server::Observations() const {
 	return impl->Observations();
+}
+
+bool MockS3Server::WaitForFullGet() {
+	return impl->WaitForFullGet();
+}
+
+void MockS3Server::ReleaseFullGet() {
+	impl->ReleaseFullGet();
 }
 
 string MockS3RefreshTargetName(MockS3RefreshTarget target) {

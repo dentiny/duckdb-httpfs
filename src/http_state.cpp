@@ -3,59 +3,117 @@
 
 namespace duckdb {
 
-CachedFileHandle::CachedFileHandle(shared_ptr<CachedFile> &file_p) {
-	// If the file was not yet initialized, we need to grab a lock.
-	if (!file_p->initialized) {
-		lock = unique_ptr<lock_guard<mutex>>(new lock_guard<mutex>(file_p->lock));
+unique_ptr<CachedFileHandle> CachedFile::TryGetHandle() {
+	annotated_lock_guard<annotated_mutex> guard(lock);
+	if (!cached_data) {
+		return nullptr;
 	}
-	file = file_p;
+	return make_uniq<CachedFileHandle>(cached_data);
 }
 
-void CachedFileHandle::SetInitialized(idx_t total_size) {
-	if (file->initialized) {
-		throw InternalException("Cannot set initialized on cached file that was already initialized");
+unique_ptr<CachedFileDownload> CachedFile::StartDownload(Allocator &allocator) {
+	annotated_unique_lock<annotated_mutex> guard(lock);
+	while (downloading) {
+		download_complete.wait(guard, [&]() DUCKDB_REQUIRES(lock) { return !downloading; });
 	}
-	if (!lock) {
-		throw InternalException("Cannot set initialized on cached file without lock");
+	if (cached_data) {
+		return nullptr;
 	}
-	file->size = total_size;
-	file->initialized = true;
-	lock = nullptr;
+	auto result = unique_ptr<CachedFileDownload>(new CachedFileDownload(shared_from_this(), allocator));
+	downloading = true;
+	return result;
 }
 
-void CachedFileHandle::AllocateBuffer(idx_t size) {
-	if (file->initialized) {
-		throw InternalException("Cannot allocate a buffer for a cached file that was already initialized");
-	}
-	file->data = shared_ptr<char>(new char[size], std::default_delete<char[]>());
-	file->capacity = size;
+void CachedFile::Invalidate() {
+	annotated_lock_guard<annotated_mutex> guard(lock);
+	cached_data.reset();
 }
 
-void CachedFileHandle::ResetBuffer() {
-	if (file->initialized) {
-		throw InternalException("Cannot reset a buffer for a cached file that was already initialized");
-	}
-	if (!lock) {
-		throw InternalException("Cannot reset a buffer for a cached file without lock");
-	}
-	file->data.reset();
-	file->capacity = 0;
-	file->size = 0;
+CachedFileHandle::CachedFileHandle(shared_ptr<CachedFileData> file_p) : file(std::move(file_p)) {
 }
 
-void CachedFileHandle::GrowBuffer(idx_t new_capacity, idx_t bytes_to_copy) {
-	// copy shared ptr to old data
-	auto old_data = file->data;
-	// allocate new buffer that can hold the new capacity
-	AllocateBuffer(new_capacity);
-	// copy the old data
-	Write(old_data.get(), bytes_to_copy);
+const char *CachedFileHandle::GetData() const {
+	return const_char_ptr_cast(file->data.get());
 }
 
-void CachedFileHandle::Write(const char *buffer, idx_t length, idx_t offset) {
-	//! Only write to non-initialized files with a lock;
-	D_ASSERT(!file->initialized && lock);
-	memcpy(file->data.get() + offset, buffer, length);
+idx_t CachedFileHandle::GetSize() const {
+	return file->size;
+}
+
+CachedFileDownload::CachedFileDownload(shared_ptr<CachedFile> file_p, Allocator &allocator_p)
+    : file(std::move(file_p)), allocator(allocator_p) {
+}
+
+CachedFileDownload::~CachedFileDownload() {
+	Abort();
+}
+
+void CachedFileDownload::ReserveInternal(idx_t capacity) {
+	if (capacity <= this->capacity) {
+		return;
+	}
+	auto new_data = allocator.Allocate(capacity);
+	if (size > 0) {
+		memcpy(new_data.get(), data.get(), size);
+	}
+	data = std::move(new_data);
+	this->capacity = capacity;
+}
+
+void CachedFileDownload::Reserve(idx_t capacity) {
+	ReserveInternal(capacity);
+}
+
+void CachedFileDownload::Append(const_data_ptr_t data, idx_t length) {
+	if (length == 0) {
+		return;
+	}
+	if (length > NumericLimits<idx_t>::Maximum() - size) {
+		throw OutOfMemoryException("Cached file size exceeds the maximum allocation size");
+	}
+	const auto required_capacity = size + length;
+	if (required_capacity > capacity) {
+		auto new_capacity = MaxValue<idx_t>(capacity, length);
+		while (new_capacity < required_capacity) {
+			if (new_capacity > NumericLimits<idx_t>::Maximum() / 2) {
+				new_capacity = required_capacity;
+				break;
+			}
+			new_capacity *= 2;
+		}
+		ReserveInternal(new_capacity);
+	}
+	memcpy(this->data.get() + size, data, length);
+	size += length;
+}
+
+void CachedFileDownload::Reset() {
+	data.Reset();
+	capacity = 0;
+	size = 0;
+}
+
+unique_ptr<CachedFileHandle> CachedFileDownload::Finalize() {
+	annotated_lock_guard<annotated_mutex> guard(file->lock);
+	D_ASSERT(file->downloading);
+	D_ASSERT(!file->cached_data);
+	auto cached_data = make_shared_ptr<CachedFileData>(std::move(data), size);
+	file->cached_data = cached_data;
+	file->downloading = false;
+	active = false;
+	file->download_complete.notify_all();
+	return make_uniq<CachedFileHandle>(std::move(cached_data));
+}
+
+void CachedFileDownload::Abort() {
+	if (!active) {
+		return;
+	}
+	annotated_lock_guard<annotated_mutex> guard(file->lock);
+	D_ASSERT(file->downloading);
+	file->downloading = false;
+	active = false;
+	file->download_complete.notify_all();
 }
 
 void HTTPState::Reset() {
@@ -68,8 +126,9 @@ void HTTPState::Reset() {
 	total_bytes_received = 0;
 	total_bytes_sent = 0;
 
-	// Reset cached files
-	cached_files.clear();
+	// Reset per-path state
+	annotated_lock_guard<annotated_mutex> lock(file_states_mutex);
+	file_states.clear();
 }
 
 shared_ptr<HTTPState> HTTPState::TryGetState(ClientContext &context) {
@@ -109,14 +168,19 @@ void HTTPState::WriteProfilingInformation(std::ostream &ss) {
 	ss << "└─────────────────────────────────────┘\n";
 }
 
-//! Get cache entry, create if not exists
-shared_ptr<CachedFile> &HTTPState::GetCachedFile(const string &path) {
-	lock_guard<mutex> lock(cached_files_mutex);
-	auto &cache_entry_ref = cached_files[path];
-	if (!cache_entry_ref) {
-		cache_entry_ref = make_shared_ptr<CachedFile>();
+//! Get per-path state, create if it does not exist
+shared_ptr<HTTPFileState> HTTPState::GetFileState(const string &path) {
+	annotated_lock_guard<annotated_mutex> lock(file_states_mutex);
+	auto &file_state = file_states[path];
+	if (!file_state) {
+		file_state = make_shared_ptr<HTTPFileState>();
 	}
-	return cache_entry_ref;
+	return file_state;
+}
+
+void HTTPState::EraseFileState(const string &path) {
+	annotated_lock_guard<annotated_mutex> lock(file_states_mutex);
+	file_states.erase(path);
 }
 
 } // namespace duckdb

@@ -70,11 +70,21 @@ public:
 			const auto request_monotonic_start = TimePoint::Tick();
 			idx_t total_bytes = 0;
 			bool first_chunk = true;
-			auto result = TransformResult(client->Get(
+			unique_ptr<HTTPResponse> deferred_response;
+			unique_ptr<HTTPResponse> stopped_response;
+			auto client_result = client->Get(
 			    info.path.c_str(), headers,
 			    [&](const duckdb_httplib_openssl::Response &response) {
 				    auto http_response = TransformResponse(response);
-				    return info.response_handler(*http_response);
+				    if (static_cast<int>(http_response->status) >= 400) {
+					    deferred_response = std::move(http_response);
+					    return true;
+				    }
+				    if (info.response_handler && !info.response_handler(*http_response)) {
+					    stopped_response = std::move(http_response);
+					    return false;
+				    }
+				    return true;
 			    },
 			    [&](const char *data, size_t data_length) {
 				    if (first_chunk) {
@@ -88,10 +98,23 @@ public:
 				    if (state) {
 					    state->total_bytes_received += data_length;
 				    }
-				    return info.content_handler(const_data_ptr_cast(data), data_length);
-			    }));
+				    if (deferred_response) {
+					    deferred_response->body.append(data, data_length);
+					    return true;
+				    }
+				    return !info.content_handler || info.content_handler(const_data_ptr_cast(data), data_length);
+			    });
 			info.bytes_received = total_bytes;
-			return result;
+			if (deferred_response) {
+				if (info.response_handler) {
+					info.response_handler(*deferred_response);
+				}
+				return deferred_response;
+			}
+			if (stopped_response) {
+				return stopped_response;
+			}
+			return TransformResult(std::move(client_result));
 		}
 	}
 	unique_ptr<HTTPResponse> Put(PutRequestInfo &info) override {

@@ -182,10 +182,13 @@ public:
 			                 0L); // Override default, don't verify that the cert matches the hostname
 		}
 
-		// set read timeout
-		curl_easy_setopt(*curl, CURLOPT_TIMEOUT, http_params.timeout);
 		// set connection timeout
 		curl_easy_setopt(*curl, CURLOPT_CONNECTTIMEOUT, http_params.timeout);
+		// Do NOT impose a hard timeout on the whole transfer
+		curl_easy_setopt(*curl, CURLOPT_TIMEOUT, 0L);                         // no hard timeout for uploads
+		curl_easy_setopt(*curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);              // abort if < 1 KB/s...
+		curl_easy_setopt(*curl, CURLOPT_LOW_SPEED_TIME, http_params.timeout); // ...for 'timeout' consecutive seconds
+
 		// accept content as-is (i.e no decompressing)
 		curl_easy_setopt(*curl, CURLOPT_ACCEPT_ENCODING, NULL);
 		// follow redirects
@@ -224,6 +227,163 @@ public:
 		}
 	}
 
+	class GetTransferState {
+	public:
+		GetTransferState(HTTPFSCurlClient &client_p, GetRequestInfo &request_p)
+		    : client(client_p), request(request_p), stream_content(bool(request.content_handler)) {
+			curl_easy_setopt(*client.curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+			curl_easy_setopt(*client.curl, CURLOPT_HEADERDATA, this);
+			curl_easy_setopt(*client.curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+			curl_easy_setopt(*client.curl, CURLOPT_WRITEDATA, this);
+		}
+
+		~GetTransferState() {
+			curl_easy_setopt(*client.curl, CURLOPT_HEADERFUNCTION, RequestHeaderCallback);
+			curl_easy_setopt(*client.curl, CURLOPT_HEADERDATA, &client.request_info->header_collection);
+			curl_easy_setopt(*client.curl, CURLOPT_WRITEFUNCTION, RequestWriteCallback);
+			curl_easy_setopt(*client.curl, CURLOPT_WRITEDATA, &client.request_info->body);
+		}
+
+		unique_ptr<HTTPResponse> Finish(CURLcode result) {
+			curl_easy_getinfo(*client.curl, CURLINFO_RESPONSE_CODE, &client.request_info->response_code);
+			const bool include_body = !stream_content || client.request_info->response_code >= 400;
+			unique_ptr<HTTPResponse> response;
+			try {
+				if (error) {
+					std::rethrow_exception(error);
+				}
+				if (stopped) {
+					result = CURLE_OK;
+				}
+
+				if (result == CURLE_OK && !response_handler_called) {
+					response_handler_called = true;
+					response = client.TransformResponseCurl(result, include_body);
+					if (request.response_handler) {
+						request.response_handler(*response);
+					}
+				}
+			} catch (...) {
+				RecordMetrics();
+				throw;
+			}
+			RecordMetrics();
+			if (!response) {
+				response = client.TransformResponseCurl(result, include_body);
+			}
+			return response;
+		}
+
+	private:
+		static size_t HeaderCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+			auto &state = *static_cast<GetTransferState *>(userp);
+			const auto total_size = RequestHeaderCallback(
+			    contents, size, nmemb, static_cast<void *>(&state.client.request_info->header_collection));
+			if (total_size == 0 || !state.IsEndOfHeaders(contents, total_size) || state.IsProxyConnectResponse()) {
+				return total_size;
+			}
+			try {
+				if (!state.response_started && !state.StartResponse()) {
+					return state.stopped ? 0 : total_size;
+				}
+			} catch (...) {
+				state.error = std::current_exception();
+				return 0;
+			}
+			return total_size;
+		}
+
+		static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+			auto &state = *static_cast<GetTransferState *>(userp);
+			const auto total_size = size * nmemb;
+			try {
+				return state.Write(contents, total_size);
+			} catch (...) {
+				state.error = std::current_exception();
+				return 0;
+			}
+		}
+
+		bool IsEndOfHeaders(void *contents, idx_t size) const {
+			auto header = static_cast<const char *>(contents);
+			return (size == 2 && header[0] == '\r' && header[1] == '\n') || (size == 1 && header[0] == '\n');
+		}
+
+		bool IsProxyConnectResponse() const {
+			if (client.request_info->header_collection.empty()) {
+				return false;
+			}
+			auto &headers = client.request_info->header_collection.back();
+			if (!headers.HasHeader("__RESPONSE_STATUS__")) {
+				return false;
+			}
+			auto status = StringUtil::Lower(headers.GetHeaderValue("__RESPONSE_STATUS__"));
+			return status.find("connection established") != string::npos;
+		}
+
+		size_t Write(void *contents, idx_t size) {
+			if (!response_started && !StartResponse()) {
+				return stopped ? 0 : size;
+			}
+			if (!stream_content || client.request_info->response_code >= 400) {
+				client.request_info->body.append(static_cast<char *>(contents), size);
+			} else if (!request.content_handler(const_data_ptr_cast(contents), size)) {
+				stopped = true;
+				return 0;
+			}
+			bytes_received += size;
+			return size;
+		}
+
+		bool StartResponse() {
+			long response_code;
+			if (curl_easy_getinfo(*client.curl, CURLINFO_RESPONSE_CODE, &response_code) != CURLE_OK) {
+				throw IOException("Failed to read the HTTP response status");
+			}
+			client.request_info->response_code = NumericCast<uint16_t>(response_code);
+			if (response_code < 200 || (response_code >= 300 && response_code < 400)) {
+				return false;
+			}
+			response_started = true;
+			if (!stream_content || response_code >= 400) {
+				return true;
+			}
+			response_handler_called = true;
+			if (request.response_handler) {
+				auto response = client.TransformResponseCurl(CURLE_OK, false);
+				if (!request.response_handler(*response)) {
+					stopped = true;
+					return false;
+				}
+			}
+			return true;
+		}
+
+		void RecordMetrics() {
+			request.bytes_received = bytes_received;
+			double starttransfer_seconds = 0;
+			if (curl_easy_getinfo(*client.curl, CURLINFO_STARTTRANSFER_TIME, &starttransfer_seconds) == CURLE_OK &&
+			    starttransfer_seconds > 0) {
+				request.have_time_to_fst_byte = true;
+				request.time_to_fst_byte_sec = starttransfer_seconds;
+			}
+
+			if (client.state) {
+				client.state->total_bytes_received += bytes_received;
+			}
+		}
+
+	private:
+		HTTPFSCurlClient &client;
+		GetRequestInfo &request;
+		const bool stream_content;
+		std::exception_ptr error;
+		idx_t bytes_received = 0;
+		bool response_started = false;
+		bool response_handler_called = false;
+		bool stopped = false;
+	};
+
 	unique_ptr<HTTPResponse> Get(GetRequestInfo &info) override {
 		AddUserAgentIfAvailable(static_cast<HTTPFSParams &>(info.params), info.headers);
 		ResetRequestInfo();
@@ -246,56 +406,11 @@ public:
 			curl_easy_setopt(*curl, CURLOPT_URL, nullptr);
 			curl_easy_setopt(*curl, CURLOPT_CURLU, url);
 			curl_easy_setopt(*curl, CURLOPT_HTTPHEADER, curl_headers ? curl_headers.headers : nullptr);
-
+			GetTransferState transfer(*this, info);
 			res = curl->Execute();
 			curl_url_cleanup(url);
+			return transfer.Finish(res);
 		}
-
-		curl_easy_getinfo(*curl, CURLINFO_RESPONSE_CODE, &request_info->response_code);
-
-		const idx_t bytes_received = request_info->body.size();
-
-		//  libcurl reports latency via CURLINFO_STARTTRANSFER_TIME
-		info.bytes_received = bytes_received;
-		double starttransfer_seconds = 0;
-		if (curl_easy_getinfo(*curl, CURLINFO_STARTTRANSFER_TIME, &starttransfer_seconds) == CURLE_OK &&
-		    starttransfer_seconds > 0) {
-			info.have_time_to_fst_byte = true;
-			info.time_to_fst_byte_sec = starttransfer_seconds;
-		}
-
-		if (!request_info->header_collection.empty() &&
-		    request_info->header_collection.back().HasHeader("content-length")) {
-			try {
-				// Use stoull (not stoi) — Content-Length can exceed INT_MAX for files >2GB.
-				const idx_t content_length_received =
-				    std::stoull(request_info->header_collection.back().GetHeaderValue("content-length"));
-				if (bytes_received != content_length_received) {
-					// Something is off, might happen in case of unreliable network
-					// TODO: consider logging this
-				}
-			} catch (const std::exception &) {
-				// Content-Length header contains a non-numeric value — skip validation.
-			}
-		}
-
-		if (state) {
-			state->total_bytes_received += bytes_received;
-		}
-
-		if (info.response_handler) {
-			auto response = TransformResponseCurl(res);
-			if (!info.response_handler(*response)) {
-				return response;
-			}
-		}
-
-		const char *data = request_info->body.c_str();
-		if (info.content_handler) {
-			info.content_handler(const_data_ptr_cast(data), bytes_received);
-		}
-
-		return TransformResponseCurl(res);
 	}
 
 	unique_ptr<HTTPResponse> Put(PutRequestInfo &info) override {
@@ -322,10 +437,6 @@ public:
 			curl_easy_setopt(*curl, CURLOPT_URL, nullptr);
 			curl_easy_setopt(*curl, CURLOPT_CURLU, url);
 
-			curl_easy_setopt(*curl, CURLOPT_TIMEOUT, 0L);                         // no hard timeout for uploads
-			curl_easy_setopt(*curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);              // abort if < 1 KB/s...
-			curl_easy_setopt(*curl, CURLOPT_LOW_SPEED_TIME, info.params.timeout); // ...for X consecutive seconds
-
 			// Perform PUT
 			curl_easy_setopt(*curl, CURLOPT_CUSTOMREQUEST, "PUT");
 			// Include PUT body
@@ -340,7 +451,6 @@ public:
 			curl_easy_setopt(*curl, CURLOPT_POSTFIELDS, nullptr);
 			curl_easy_setopt(*curl, CURLOPT_POSTFIELDSIZE, 0);
 			curl_url_cleanup(url);
-			curl_easy_setopt(*curl, CURLOPT_TIMEOUT, info.params.timeout);
 		}
 
 		curl_easy_getinfo(*curl, CURLINFO_RESPONSE_CODE, &request_info->response_code);
@@ -545,14 +655,16 @@ private:
 		request_info->response_code = 0;
 	}
 
-	unique_ptr<HTTPResponse> TransformResponseCurl(CURLcode res) {
+	unique_ptr<HTTPResponse> TransformResponseCurl(CURLcode res, bool include_body = true) {
 		auto status_code = HTTPStatusCode(request_info->response_code);
 		auto response = make_uniq<HTTPResponse>(status_code);
 		if (res != CURLcode::CURLE_OK) {
 			response->request_error = curl_easy_strerror(res);
 			return response;
 		}
-		response->body = request_info->body;
+		if (include_body) {
+			response->body = request_info->body;
+		}
 		response->url = request_info->url;
 		response->reason = HTTPUtil::GetStatusMessage(HTTPUtil::ToStatusCode(request_info->response_code));
 		if (!request_info->header_collection.empty()) {

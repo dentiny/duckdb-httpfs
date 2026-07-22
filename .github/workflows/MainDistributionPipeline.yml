@@ -17,7 +17,7 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       extension_name: httpfs
-      duckdb_version: 3a3c412af5
+      duckdb_version: 7f4cbcef36
       ci_tools_version: main
 
   duckdb-stable-deploy:
@@ -27,7 +27,7 @@ jobs:
     secrets: inherit
     with:
       extension_name: httpfs
-      duckdb_version: 3a3c412af5
+      duckdb_version: 7f4cbcef36
       ci_tools_version: main
       deploy_latest: ${{ startsWith(github.ref, 'refs/heads/v') }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}
@@ -37,7 +37,7 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
       extension_name: httpfs
-      duckdb_version: 3a3c412af5
+      duckdb_version: 7f4cbcef36
       ci_tools_version: main
       extra_toolchains: 'python3'
       format_checks: 'format'
