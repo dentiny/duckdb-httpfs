@@ -280,6 +280,15 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRequest(HTTPFileHandle &hfh, stri
 	return send_request(get_request);
 }
 
+static void SetRangeRequestNotSupported(HTTPResponse &response) {
+	try {
+		RangeRequestNotSupportedException::Throw();
+	} catch (HTTPException &ex) {
+		response.request_error = ex.what();
+		response.success = false;
+	}
+}
+
 unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh, string url, HTTPHeaders header_map,
                                                             HTTPFSParams &http_params, const string &etag,
                                                             bool auto_fallback_to_full_file_download, idx_t file_offset,
@@ -289,6 +298,14 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh,
 	// send the Range header to read only subset of file
 	string range_expr = "bytes=" + to_string(file_offset) + "-" + to_string(file_offset + buffer_out_len - 1);
 	header_map.Insert("Range", range_expr);
+
+	D_ASSERT(http_params.state);
+	auto range_request = http_params.state->GetFileState(hfh.path)->BeginRangeRequest();
+	if (range_request.Support() == RangeRequestSupport::NOT_SUPPORTED && auto_fallback_to_full_file_download) {
+		auto response = make_uniq<HTTPResponse>(HTTPStatusCode::INVALID);
+		SetRangeRequestNotSupported(*response);
+		return response;
+	}
 
 	idx_t out_offset = 0;
 	bool range_request_not_supported = false;
@@ -338,8 +355,12 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh,
 				    }
 				    if (parsed && (idx_t)content_length != buffer_out_len) {
 					    range_request_not_supported = true;
+					    range_request.MarkNotSupported();
 					    return false;
 				    }
+			    }
+			    if (response.status == HTTPStatusCode::PartialContent_206) {
+				    range_request.MarkSupported();
 			    }
 		    }
 		    return true;
@@ -359,12 +380,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh,
 	get_request.try_request = auto_fallback_to_full_file_download;
 	auto response = send_request(get_request);
 	if (range_request_not_supported) {
-		try {
-			RangeRequestNotSupportedException::Throw();
-		} catch (HTTPException &ex) {
-			response->request_error = ex.what();
-			response->success = false;
-		}
+		SetRangeRequestNotSupported(*response);
 		return response;
 	}
 	if (response && !response->HasRequestError() && response->Success() && buffer_out != nullptr &&
@@ -377,6 +393,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh,
 	// Feed the prefetch cost model a network measurement for this ranged GET
 	if (response && (response->Success() || response->status == HTTPStatusCode::PartialContent_206 ||
 	                 response->status == HTTPStatusCode::Accepted_202)) {
+		range_request.MarkSupported();
 		const auto elapsed_nanos =
 		    TimePoint::ElapsedNanos(get_request.request_monotonic_start, get_request.request_monotonic_end);
 		const double total_seconds = elapsed_nanos > 0 ? static_cast<double>(elapsed_nanos) / 1e9 : 0;
@@ -633,12 +650,6 @@ static bool RespondedWithRangeRequestNotSupported(const HTTPResponse &res) {
 bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map, idx_t file_offset,
                                      char *buffer_out, idx_t buffer_out_len) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
-	auto file_state = hfh.http_params.state->GetFileState(hfh.path);
-	auto range_request = file_state->LockRangeRequestState();
-	if (range_request.Support() == RangeRequestSupport::NOT_SUPPORTED &&
-	    hfh.http_params.auto_fallback_to_full_download) {
-		return false;
-	}
 
 	const auto timestamp_before = std::chrono::steady_clock::now();
 	auto res = GetRangeRequest(handle, url, header_map, file_offset, buffer_out, buffer_out_len);
@@ -648,7 +659,6 @@ bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders
 		if (res->HasRequestError()) {
 			// Special case: we can do a retry with a full file download
 			if (RespondedWithRangeRequestNotSupported(*res)) {
-				range_request.MarkNotSupported();
 				if (hfh.http_params.auto_fallback_to_full_download) {
 					return false;
 				}
@@ -660,8 +670,6 @@ bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders
 		// Request succeeded TODO: fix upstream that 206 is not considered success
 		if (res->Success() || res->status == HTTPStatusCode::PartialContent_206 ||
 		    res->status == HTTPStatusCode::Accepted_202) {
-			range_request.MarkSupported();
-
 			if (!hfh.flags.RequireParallelAccess()) {
 				// Update range request statistics
 				const auto timestamp_after = std::chrono::steady_clock::now();
@@ -1063,6 +1071,13 @@ void HTTPFileHandle::LoadFileInfo() {
 	}
 	if (http_params.s3_version_id_pinning && res->headers.HasHeader("x-amz-version-id")) {
 		version_id = res->headers.GetHeaderValue("x-amz-version-id");
+	}
+	if (res->headers.HasHeader("Accept-Ranges")) {
+		auto accept_ranges = res->headers.GetHeaderValue("Accept-Ranges");
+		StringUtil::Trim(accept_ranges);
+		if (StringUtil::CIEquals(accept_ranges, "bytes")) {
+			http_params.state->GetFileState(path)->MarkRangeRequestsSupported();
+		}
 	}
 	initialized = true;
 }

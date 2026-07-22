@@ -44,6 +44,10 @@ struct MockS3ServerConfig {
 	optional_idx head_content_length;
 	//! Send successful full GETs with chunked transfer encoding and no Content-Length
 	bool chunked_full_get = false;
+	//! Advertise byte-range support on HEAD responses
+	bool advertise_ranges = true;
+	//! Hold the first range response body until a second range request arrives
+	bool block_first_range_body_until_second_range = false;
 	//! Number of object HEADs to fail with a 400 before succeeding
 	idx_t transient_head_failures = 0;
 	//! Number of object DELETEs to fail with a 400 before succeeding

@@ -6,6 +6,7 @@
 #include "httplib.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -29,7 +30,7 @@ static string ExtractCredentialKey(const string &authorization) {
 	return authorization.substr(credential_pos, end_pos - credential_pos);
 }
 
-static bool ParseRange(const string &range, idx_t object_size) {
+static bool ParseRange(const string &range, idx_t object_size, idx_t &start, idx_t &end) {
 	static constexpr const char *PREFIX = "bytes=";
 	if (range.rfind(PREFIX, 0) != 0) {
 		return false;
@@ -38,8 +39,6 @@ static bool ParseRange(const string &range, idx_t object_size) {
 	if (dash_pos == string::npos) {
 		return false;
 	}
-	idx_t start = 0;
-	idx_t end = 0;
 	try {
 		start = std::stoull(range.substr(strlen(PREFIX), dash_pos - strlen(PREFIX)));
 		end = std::stoull(range.substr(dash_pos + 1));
@@ -159,7 +158,9 @@ struct MockS3Server::Impl {
 	}
 
 	void SetObjectHeaders(httplib::Response &response) const {
-		response.set_header("Accept-Ranges", "bytes");
+		if (config.advertise_ranges) {
+			response.set_header("Accept-Ranges", "bytes");
+		}
 		auto content_length =
 		    config.head_content_length.IsValid() ? config.head_content_length.GetIndex() : config.object_data.size();
 		response.set_header("Content-Length", std::to_string(content_length));
@@ -331,15 +332,40 @@ struct MockS3Server::Impl {
 				return;
 			}
 
-			if (!ParseRange(range, config.object_data.size())) {
+			idx_t range_start;
+			idx_t range_end;
+			if (!ParseRange(range, config.object_data.size(), range_start, range_end)) {
 				response.status = 416;
 				Record(request, response.status);
 				return;
 			}
 
+			idx_t range_request_index;
+			{
+				std::lock_guard<std::mutex> lock(range_request_lock);
+				range_request_index = ++range_requests_seen;
+			}
+			range_request_started.notify_all();
 			response.status = 206;
 			response.set_header("Accept-Ranges", "bytes");
 			response.set_header("ETag", config.etag);
+			if (config.block_first_range_body_until_second_range && range_request_index == 1) {
+				const auto range_length = range_end - range_start + 1;
+				response.set_content_provider(
+				    range_length, "application/octet-stream",
+				    [this, range_start](size_t offset, size_t length, httplib::DataSink &sink) {
+					    if (offset == 0) {
+						    std::unique_lock<std::mutex> lock(range_request_lock);
+						    if (!range_request_started.wait_for(lock, std::chrono::seconds(5),
+						                                        [this]() { return range_requests_seen >= 2; })) {
+							    return false;
+						    }
+					    }
+					    return sink.write(config.object_data.data() + range_start + offset, length);
+				    });
+				Record(request, response.status);
+				return;
+			}
 			if (config.range_behavior == MockS3RangeBehavior::SHORT_SUCCESS &&
 			    ConsumeBehavior(remaining_range_behavior_requests)) {
 				response.set_header("X-Mock-Successful-Short-Response", "1");
@@ -460,6 +486,9 @@ struct MockS3Server::Impl {
 	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
 	mutable std::mutex observation_lock;
 	mutable vector<MockS3RequestObservation> observations;
+	std::mutex range_request_lock;
+	std::condition_variable range_request_started;
+	idx_t range_requests_seen = 0;
 };
 
 MockS3Server::MockS3Server(MockS3ServerConfig config) : impl(make_uniq<Impl>(std::move(config))) {

@@ -22,13 +22,29 @@ class RangeRequestState {
 public:
 	class Guard {
 	public:
-		explicit Guard(RangeRequestState &state_p) : state(state_p), support(state.support.load()), lock() {
+		explicit Guard(RangeRequestState &state_p) : state(state_p), support(state.support.load()), owns_probe(false) {
 			if (support == RangeRequestSupport::UNKNOWN) {
-				lock = annotated_unique_lock<annotated_mutex>(state.state_mutex);
-				support = state.support.load();
-				if (support != RangeRequestSupport::UNKNOWN) {
-					lock.unlock();
+				annotated_unique_lock<annotated_mutex> lock(state.state_mutex);
+				while (state.probing && state.support.load() == RangeRequestSupport::UNKNOWN) {
+					state.probe_complete.wait(lock, [&]() DUCKDB_REQUIRES(state.state_mutex) {
+						return !state.probing || state.support.load() != RangeRequestSupport::UNKNOWN;
+					});
 				}
+				support = state.support.load();
+				if (support == RangeRequestSupport::UNKNOWN) {
+					state.probing = true;
+					owns_probe = true;
+				}
+			}
+		}
+		Guard(const Guard &) = delete;
+		Guard &operator=(const Guard &) = delete;
+		Guard(Guard &&other) : state(other.state), support(other.support), owns_probe(other.owns_probe) {
+			other.owns_probe = false;
+		}
+		~Guard() {
+			if (owns_probe) {
+				state.AbortProbe();
 			}
 		}
 
@@ -37,27 +53,45 @@ public:
 		}
 		void MarkSupported() {
 			if (support == RangeRequestSupport::UNKNOWN) {
-				state.support = RangeRequestSupport::SUPPORTED;
+				state.ResolveProbe(RangeRequestSupport::SUPPORTED);
 				support = RangeRequestSupport::SUPPORTED;
+				owns_probe = false;
 			}
 		}
 		void MarkNotSupported() {
-			state.support = RangeRequestSupport::NOT_SUPPORTED;
+			state.ResolveProbe(RangeRequestSupport::NOT_SUPPORTED);
 			support = RangeRequestSupport::NOT_SUPPORTED;
+			owns_probe = false;
 		}
 
 	private:
 		RangeRequestState &state;
 		RangeRequestSupport support;
-		annotated_unique_lock<annotated_mutex> lock;
+		bool owns_probe;
 	};
 
-	Guard Lock() {
+	Guard BeginRequest() {
 		return Guard(*this);
 	}
 
 private:
+	void ResolveProbe(RangeRequestSupport new_support) {
+		annotated_lock_guard<annotated_mutex> lock(state_mutex);
+		support = new_support;
+		probing = false;
+		probe_complete.notify_all();
+	}
+	void AbortProbe() {
+		annotated_lock_guard<annotated_mutex> lock(state_mutex);
+		if (support.load() == RangeRequestSupport::UNKNOWN) {
+			probing = false;
+			probe_complete.notify_all();
+		}
+	}
+
 	annotated_mutex state_mutex;
+	std::condition_variable probe_complete DUCKDB_GUARDED_BY(state_mutex);
+	bool probing DUCKDB_GUARDED_BY(state_mutex) = false;
 	atomic<RangeRequestSupport> support = {RangeRequestSupport::UNKNOWN};
 };
 
@@ -139,8 +173,12 @@ public:
 	unique_ptr<CachedFileDownload> StartCachedFileDownload(Allocator &allocator) {
 		return cached_file->StartDownload(allocator);
 	}
-	RangeRequestState::Guard LockRangeRequestState() {
-		return range_request_state.Lock();
+	RangeRequestState::Guard BeginRangeRequest() {
+		return range_request_state.BeginRequest();
+	}
+	void MarkRangeRequestsSupported() {
+		auto guard = range_request_state.BeginRequest();
+		guard.MarkSupported();
 	}
 
 private:

@@ -1056,6 +1056,8 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_
 unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
                                                        idx_t file_offset, char *buffer_out, idx_t buffer_out_len) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
+	D_ASSERT(s3_handle.http_params.state);
+	s3_handle.http_params.state->GetFileState(s3_handle.path)->MarkRangeRequestsSupported();
 	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "GET", true, [&](S3RequestData &request_data) {
 		auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		return RunGetRangeRequest(

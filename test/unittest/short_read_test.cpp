@@ -11,6 +11,9 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
+#include <atomic>
+#include <thread>
+
 namespace duckdb {
 
 namespace {
@@ -33,9 +36,10 @@ static void RequireQueryOk(Connection &con, const string &query) {
 	REQUIRE_FALSE(result->HasError());
 }
 
-static void ConfigureHTTPTest(DuckDB &db, Connection &con, idx_t retries) {
+static void ConfigureHTTPTest(DuckDB &db, Connection &con, idx_t retries,
+                              const string &client_implementation = "curl") {
 	LoadHTTPFSExtension(db);
-	RequireQueryOk(con, "SET httpfs_client_implementation='curl'");
+	RequireQueryOk(con, "SET httpfs_client_implementation='" + client_implementation + "'");
 	RequireQueryOk(con, "SET httpfs_connection_caching=false");
 	RequireQueryOk(con, "SET http_retries=" + to_string(retries));
 	RequireQueryOk(con, "SET http_retry_wait_ms=1");
@@ -171,6 +175,52 @@ static void RunSuccessfulShortResponse() {
 	REQUIRE(CountRequests(observations, "GET", 206, expected_range) == 1);
 }
 
+static void RunParallelRangeHeaderRelease(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.object_data = string(8192, 'x');
+	config.advertise_ranges = false;
+	config.block_first_range_body_until_second_range = true;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureHTTPTest(db, con, 0, client_implementation);
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto first_handle = fs.OpenFile(server.HTTPPath(), FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+	auto second_handle = fs.OpenFile(server.HTTPPath(), FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+
+	std::atomic<bool> start {false};
+	ReadOutcome first_outcome;
+	ReadOutcome second_outcome;
+	std::thread first_reader([&]() {
+		while (!start.load()) {
+			std::this_thread::yield();
+		}
+		first_outcome = TryReadHandle(con, *first_handle, 0, 1024);
+	});
+	std::thread second_reader([&]() {
+		while (!start.load()) {
+			std::this_thread::yield();
+		}
+		second_outcome = TryReadHandle(con, *second_handle, 1024, 1024);
+	});
+	start = true;
+	first_reader.join();
+	second_reader.join();
+
+	INFO(first_outcome.error);
+	INFO(second_outcome.error);
+	REQUIRE_FALSE(first_outcome.failed);
+	REQUIRE_FALSE(second_outcome.failed);
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(CountRequests(observations, "GET", 206, "bytes=0-1023") == 1);
+	REQUIRE(CountRequests(observations, "GET", 206, "bytes=1024-2047") == 1);
+	RequireQueryOk(con, "COMMIT");
+}
+
 } // namespace
 
 TEST_CASE("HTTP range reads reject truncated response bodies", "[httpfs][short-read]") {
@@ -182,6 +232,15 @@ TEST_CASE("HTTP range reads reject truncated response bodies", "[httpfs][short-r
 	}
 	SECTION("a cleanly terminated short response is rejected") {
 		RunSuccessfulShortResponse();
+	}
+}
+
+TEST_CASE("HTTP range readers resume after the first response headers", "[httpfs][range-probe]") {
+	SECTION("curl") {
+		RunParallelRangeHeaderRelease("curl");
+	}
+	SECTION("httplib") {
+		RunParallelRangeHeaderRelease("httplib");
 	}
 }
 

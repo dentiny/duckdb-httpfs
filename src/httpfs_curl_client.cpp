@@ -231,11 +231,15 @@ public:
 	public:
 		GetTransferState(HTTPFSCurlClient &client_p, GetRequestInfo &request_p)
 		    : client(client_p), request(request_p), stream_content(bool(request.content_handler)) {
+			curl_easy_setopt(*client.curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+			curl_easy_setopt(*client.curl, CURLOPT_HEADERDATA, this);
 			curl_easy_setopt(*client.curl, CURLOPT_WRITEFUNCTION, WriteCallback);
 			curl_easy_setopt(*client.curl, CURLOPT_WRITEDATA, this);
 		}
 
 		~GetTransferState() {
+			curl_easy_setopt(*client.curl, CURLOPT_HEADERFUNCTION, RequestHeaderCallback);
+			curl_easy_setopt(*client.curl, CURLOPT_HEADERDATA, &client.request_info->header_collection);
 			curl_easy_setopt(*client.curl, CURLOPT_WRITEFUNCTION, RequestWriteCallback);
 			curl_easy_setopt(*client.curl, CURLOPT_WRITEDATA, &client.request_info->body);
 		}
@@ -271,6 +275,24 @@ public:
 		}
 
 	private:
+		static size_t HeaderCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+			auto &state = *static_cast<GetTransferState *>(userp);
+			const auto total_size = RequestHeaderCallback(
+			    contents, size, nmemb, static_cast<void *>(&state.client.request_info->header_collection));
+			if (total_size == 0 || !state.IsEndOfHeaders(contents, total_size) || state.IsProxyConnectResponse()) {
+				return total_size;
+			}
+			try {
+				if (!state.response_started && !state.StartResponse()) {
+					return state.stopped ? 0 : total_size;
+				}
+			} catch (...) {
+				state.error = std::current_exception();
+				return 0;
+			}
+			return total_size;
+		}
+
 		static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
 			auto &state = *static_cast<GetTransferState *>(userp);
 			const auto total_size = size * nmemb;
@@ -280,6 +302,23 @@ public:
 				state.error = std::current_exception();
 				return 0;
 			}
+		}
+
+		bool IsEndOfHeaders(void *contents, idx_t size) const {
+			auto header = static_cast<const char *>(contents);
+			return (size == 2 && header[0] == '\r' && header[1] == '\n') || (size == 1 && header[0] == '\n');
+		}
+
+		bool IsProxyConnectResponse() const {
+			if (client.request_info->header_collection.empty()) {
+				return false;
+			}
+			auto &headers = client.request_info->header_collection.back();
+			if (!headers.HasHeader("__RESPONSE_STATUS__")) {
+				return false;
+			}
+			auto status = StringUtil::Lower(headers.GetHeaderValue("__RESPONSE_STATUS__"));
+			return status.find("connection established") != string::npos;
 		}
 
 		size_t Write(void *contents, idx_t size) {
@@ -302,7 +341,7 @@ public:
 				throw IOException("Failed to read the HTTP response status");
 			}
 			client.request_info->response_code = NumericCast<uint16_t>(response_code);
-			if (response_code >= 300 && response_code < 400) {
+			if (response_code < 200 || (response_code >= 300 && response_code < 400)) {
 				return false;
 			}
 			response_started = true;
