@@ -300,6 +300,25 @@ struct MockS3Server::Impl {
 			if (range.empty()) {
 				response.status = 200;
 				response.set_header("ETag", config.etag);
+				if (config.chunked_full_get) {
+					response.set_chunked_content_provider(
+					    "application/octet-stream", [this](size_t offset, httplib::DataSink &sink) {
+						    if (offset >= config.object_data.size()) {
+							    sink.done();
+							    return true;
+						    }
+						    const auto length = MinValue<size_t>(7, config.object_data.size() - offset);
+						    if (!sink.write(config.object_data.data() + offset, length)) {
+							    return false;
+						    }
+						    if (offset + length == config.object_data.size()) {
+							    sink.done();
+						    }
+						    return true;
+					    });
+					Record(request, response.status);
+					return;
+				}
 				response.set_content(config.object_data, "application/octet-stream");
 				Record(request, response.status);
 				return;

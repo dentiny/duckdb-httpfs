@@ -1,83 +1,161 @@
 #pragma once
 
+#include "duckdb/common/allocator.hpp"
 #include "duckdb/common/file_opener.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/main/client_context_state.hpp"
 
+#include <condition_variable>
+
 namespace duckdb {
 
 class CachedFileHandle;
+class CachedFileDownload;
+
+enum class RangeRequestSupport : uint8_t { UNKNOWN, SUPPORTED, NOT_SUPPORTED };
+
+class RangeRequestState {
+public:
+	class Guard {
+	public:
+		explicit Guard(RangeRequestState &state_p) : state(state_p), support(state.support.load()), lock() {
+			if (support == RangeRequestSupport::UNKNOWN) {
+				lock = annotated_unique_lock<annotated_mutex>(state.state_mutex);
+				support = state.support.load();
+				if (support != RangeRequestSupport::UNKNOWN) {
+					lock.unlock();
+				}
+			}
+		}
+
+		RangeRequestSupport Support() const {
+			return support;
+		}
+		void MarkSupported() {
+			if (support == RangeRequestSupport::UNKNOWN) {
+				state.support = RangeRequestSupport::SUPPORTED;
+				support = RangeRequestSupport::SUPPORTED;
+			}
+		}
+		void MarkNotSupported() {
+			state.support = RangeRequestSupport::NOT_SUPPORTED;
+			support = RangeRequestSupport::NOT_SUPPORTED;
+		}
+
+	private:
+		RangeRequestState &state;
+		RangeRequestSupport support;
+		annotated_unique_lock<annotated_mutex> lock;
+	};
+
+	Guard Lock() {
+		return Guard(*this);
+	}
+
+private:
+	annotated_mutex state_mutex;
+	atomic<RangeRequestSupport> support = {RangeRequestSupport::UNKNOWN};
+};
 
 //! Represents a file that is intended to be fully downloaded, then used in parallel by multiple threads
 class CachedFile : public enable_shared_from_this<CachedFile> {
 	friend class CachedFileHandle;
+	friend class CachedFileDownload;
 
 public:
-	unique_ptr<CachedFileHandle> GetHandle() {
-		auto this_ptr = shared_from_this();
-		return make_uniq<CachedFileHandle>(this_ptr);
-	}
+	unique_ptr<CachedFileHandle> GetHandle();
+	unique_ptr<CachedFileDownload> StartDownload(Allocator &allocator);
 
 private:
+	//! Protects the download state and cached data
+	mutable annotated_mutex lock;
+	//! Notifies handles waiting for an in-progress download
+	mutable std::condition_variable download_complete DUCKDB_GUARDED_BY(lock);
 	//! Cached Data
-	shared_ptr<char> data;
+	AllocatedData data DUCKDB_GUARDED_BY(lock);
 	//! Data capacity
-	uint64_t capacity = 0;
+	uint64_t capacity DUCKDB_GUARDED_BY(lock) = 0;
 	//! Size of file
-	idx_t size;
-	//! Lock for initializing the file
-	mutex lock;
-	//! When initialized is set to true, the file is safe for parallel reading without holding the lock
-	atomic<bool> initialized = {false};
+	idx_t size DUCKDB_GUARDED_BY(lock) = 0;
+	//! Whether a download is currently populating the cache
+	bool downloading DUCKDB_GUARDED_BY(lock) = false;
+	//! When initialized is true, the cached data is immutable
+	bool initialized DUCKDB_GUARDED_BY(lock) = false;
 };
 
 //! Handle to a CachedFile
 class CachedFileHandle {
 public:
-	explicit CachedFileHandle(shared_ptr<CachedFile> &file_p);
+	explicit CachedFileHandle(shared_ptr<CachedFile> file_p);
 
-	//! allocate a buffer for the file
-	void AllocateBuffer(idx_t size);
-	//! Reset an uninitialized buffer after a failed full download
-	void ResetBuffer();
-	//! Indicate the file is fully downloaded and safe for parallel reading without lock
-	void SetInitialized(idx_t total_size);
-	//! Grow buffer to new size, copying over `bytes_to_copy` to the new buffer
-	void GrowBuffer(idx_t new_capacity, idx_t bytes_to_copy);
-	//! Write to the buffer
-	void Write(const char *buffer, idx_t length, idx_t offset = 0);
-
-	bool Initialized() {
-		return file->initialized;
-	}
-	const char *GetData() {
-		return file->data.get();
-	}
-	uint64_t GetCapacity() {
-		return file->capacity;
-	}
+	bool Initialized() const;
+	const char *GetData() const;
 	//! Return the size of the initialized file
-	idx_t GetSize() {
-		D_ASSERT(file->initialized);
-		return file->size;
+	idx_t GetSize() const;
+
+private:
+	shared_ptr<CachedFile> file;
+};
+
+//! Exclusive handle for populating an uninitialized CachedFile
+class CachedFileDownload {
+	friend class CachedFile;
+
+public:
+	~CachedFileDownload();
+
+	//! Reserve capacity without changing the number of downloaded bytes
+	void Reserve(idx_t capacity);
+	//! Append downloaded bytes, growing the allocation as needed
+	void Append(const_data_ptr_t data, idx_t length);
+	//! Reset bytes written by a prior request attempt
+	void Reset();
+	//! Indicate the file is fully downloaded and safe for parallel reading
+	void Finalize();
+
+private:
+	CachedFileDownload(shared_ptr<CachedFile> file_p, Allocator &allocator_p);
+	void ReserveInternal(idx_t capacity) DUCKDB_REQUIRES(file->lock);
+	void Abort();
+
+	shared_ptr<CachedFile> file;
+	Allocator &allocator;
+	bool active = true;
+};
+
+//! Per-path state shared by all HTTP file handles in a query
+class HTTPFileState {
+public:
+	HTTPFileState() : cached_file(make_shared_ptr<CachedFile>()) {
+	}
+
+	unique_ptr<CachedFileHandle> GetCachedFileHandle() {
+		return cached_file->GetHandle();
+	}
+	unique_ptr<CachedFileDownload> StartCachedFileDownload(Allocator &allocator) {
+		return cached_file->StartDownload(allocator);
+	}
+	RangeRequestState::Guard LockRangeRequestState() {
+		return range_request_state.Lock();
 	}
 
 private:
-	unique_ptr<lock_guard<mutex>> lock;
-	shared_ptr<CachedFile> file;
+	shared_ptr<CachedFile> cached_file;
+	RangeRequestState range_request_state;
 };
 
 class HTTPState : public ClientContextState {
 public:
-	//! Reset all counters and cached files
+	//! Reset all counters and per-path state
 	void Reset();
-	//! Get cache entry, create if not exists
-	shared_ptr<CachedFile> GetCachedFile(const string &path);
-	//! Erase a cached full download
-	void EraseCachedFile(const string &path);
+	//! Get per-path state, creating it if needed
+	shared_ptr<HTTPFileState> GetFileState(const string &path);
+	//! Erase all state for a path
+	void EraseFileState(const string &path);
 	//! Helper functions to get the HTTP state
 	static shared_ptr<HTTPState> TryGetState(ClientContext &context);
 	static shared_ptr<HTTPState> TryGetState(optional_ptr<FileOpener> opener);
@@ -107,10 +185,10 @@ public:
 private:
 	//! Serializes credential provider refreshes after auth failures.
 	mutex credential_refresh_mutex;
-	//! Mutex to lock when getting the cached file(Parallel Only)
-	mutex cached_files_mutex;
-	//! In case of fully downloading the file, the cached files of this query
-	unordered_map<string, shared_ptr<CachedFile>> cached_files;
+	//! Protects the per-path state map
+	annotated_mutex file_states_mutex;
+	//! Per-path state shared by all file handles in this query
+	unordered_map<string, shared_ptr<HTTPFileState>> file_states DUCKDB_GUARDED_BY(file_states_mutex);
 };
 
 } // namespace duckdb

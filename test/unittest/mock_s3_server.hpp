@@ -42,6 +42,8 @@ struct MockS3ServerConfig {
 	idx_t truncated_range_bytes = 1;
 	//! Override the Content-Length reported by HEAD while keeping the GET body unchanged
 	optional_idx head_content_length;
+	//! Send successful full GETs with chunked transfer encoding and no Content-Length
+	bool chunked_full_get = false;
 	//! Number of object HEADs to fail with a 400 before succeeding
 	idx_t transient_head_failures = 0;
 	//! Number of object DELETEs to fail with a 400 before succeeding

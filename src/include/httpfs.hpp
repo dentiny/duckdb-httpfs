@@ -109,6 +109,8 @@ public:
 	// When using full file download, the full file will be written to a cached file handle
 	mutex full_download_mutex;
 	unique_ptr<CachedFileHandle> cached_file_handle;
+	unique_ptr<CachedFileDownload> cached_file_download;
+	optional_ptr<Allocator> buffer_allocator;
 
 	// Read info
 	idx_t buffer_available;

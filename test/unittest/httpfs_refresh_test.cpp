@@ -485,6 +485,67 @@ static void RunRangeRefreshDisabledScenario() {
 	AssertNoRefresh(test_id);
 }
 
+static void RunFullGetErrorBodyScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::FULL_GET;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto test_id = ConfigureRefreshTest(db, con, server, client_implementation, false, false);
+
+	RequireQueryOk(con, "SET force_download=true");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	string error;
+	try {
+		auto &fs = FileSystem::GetFileSystem(*con.context);
+		fs.OpenFile(S3_PATH, FileFlags::FILE_FLAGS_READ);
+	} catch (std::exception &ex) {
+		error = ex.what();
+	}
+	INFO(error);
+	REQUIRE(error.find("AccessDenied: stale credentials") != string::npos);
+	RequireQueryOk(con, "ROLLBACK");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 403));
+	REQUIRE_FALSE(HasRequestWithKey(observations, FRESH_KEY_ID));
+	AssertNoRefresh(test_id);
+}
+
+static void RunChunkedFullGetScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.chunked_full_get = true;
+	auto object_data = config.object_data;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto test_id = ConfigureRefreshTest(db, con, server, client_implementation, false);
+
+	RequireQueryOk(con, "SET force_download=true");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto handle = fs.OpenFile(S3_PATH, FileFlags::FILE_FLAGS_READ);
+	string result(object_data.size(), '\0');
+	handle->Read(QueryContext(*con.context), &result[0], result.size(), 0);
+	REQUIRE(result == object_data);
+	RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 200));
+	AssertNoRefresh(test_id);
+}
+
 static void RunListGlobRefreshDisabledScenario() {
 	MockS3ServerConfig config;
 	config.bucket = BUCKET;
@@ -918,6 +979,24 @@ TEST_CASE("HTTPFS can disable S3 credential refresh", "[httpfs][s3][refresh]") {
 	}
 	SECTION("list glob fails without refresh") {
 		RunListGlobRefreshDisabledScenario();
+	}
+}
+
+TEST_CASE("HTTPFS preserves S3 error bodies for streamed GETs", "[httpfs][s3][errors]") {
+	SECTION("httplib") {
+		RunFullGetErrorBodyScenario("httplib");
+	}
+	SECTION("curl") {
+		RunFullGetErrorBodyScenario("curl");
+	}
+}
+
+TEST_CASE("HTTPFS streams full GETs without Content-Length", "[httpfs][s3][streaming]") {
+	SECTION("httplib") {
+		RunChunkedFullGetScenario("httplib");
+	}
+	SECTION("curl") {
+		RunChunkedFullGetScenario("curl");
 	}
 }
 
