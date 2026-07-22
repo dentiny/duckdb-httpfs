@@ -22,7 +22,12 @@ class RangeRequestState {
 public:
 	class Guard {
 	public:
-		explicit Guard(RangeRequestState &state_p) : state(state_p), support(state.support.load()), owns_probe(false) {
+		explicit Guard(RangeRequestState &state_p, bool enabled_p)
+		    : state(state_p), support(RangeRequestSupport::SUPPORTED), enabled(enabled_p), owns_probe(false) {
+			if (!enabled) {
+				return;
+			}
+			support = state.support.load();
 			if (support == RangeRequestSupport::UNKNOWN) {
 				annotated_unique_lock<annotated_mutex> lock(state.state_mutex);
 				while (state.probing && state.support.load() == RangeRequestSupport::UNKNOWN) {
@@ -39,7 +44,8 @@ public:
 		}
 		Guard(const Guard &) = delete;
 		Guard &operator=(const Guard &) = delete;
-		Guard(Guard &&other) : state(other.state), support(other.support), owns_probe(other.owns_probe) {
+		Guard(Guard &&other)
+		    : state(other.state), support(other.support), enabled(other.enabled), owns_probe(other.owns_probe) {
 			other.owns_probe = false;
 		}
 		~Guard() {
@@ -52,13 +58,16 @@ public:
 			return support;
 		}
 		void MarkSupported() {
-			if (support == RangeRequestSupport::UNKNOWN) {
+			if (enabled && support == RangeRequestSupport::UNKNOWN) {
 				state.ResolveProbe(RangeRequestSupport::SUPPORTED);
 				support = RangeRequestSupport::SUPPORTED;
 				owns_probe = false;
 			}
 		}
 		void MarkNotSupported() {
+			if (!enabled) {
+				return;
+			}
 			state.ResolveProbe(RangeRequestSupport::NOT_SUPPORTED);
 			support = RangeRequestSupport::NOT_SUPPORTED;
 			owns_probe = false;
@@ -67,11 +76,12 @@ public:
 	private:
 		RangeRequestState &state;
 		RangeRequestSupport support;
+		bool enabled;
 		bool owns_probe;
 	};
 
-	Guard BeginRequest() {
-		return Guard(*this);
+	Guard BeginRequest(bool enabled = true) {
+		return Guard(*this, enabled);
 	}
 
 private:
@@ -101,38 +111,44 @@ class CachedFile : public enable_shared_from_this<CachedFile> {
 	friend class CachedFileDownload;
 
 public:
-	unique_ptr<CachedFileHandle> GetHandle();
+	unique_ptr<CachedFileHandle> TryGetHandle();
 	unique_ptr<CachedFileDownload> StartDownload(Allocator &allocator);
+	void Invalidate();
 
 private:
 	//! Protects the download state and cached data
 	mutable annotated_mutex lock;
 	//! Notifies handles waiting for an in-progress download
 	mutable std::condition_variable download_complete DUCKDB_GUARDED_BY(lock);
-	//! Cached Data
-	AllocatedData data DUCKDB_GUARDED_BY(lock);
-	//! Data capacity
-	uint64_t capacity DUCKDB_GUARDED_BY(lock) = 0;
-	//! Size of file
-	idx_t size DUCKDB_GUARDED_BY(lock) = 0;
+	//! Published immutable file data
+	shared_ptr<class CachedFileData> cached_data DUCKDB_GUARDED_BY(lock);
 	//! Whether a download is currently populating the cache
 	bool downloading DUCKDB_GUARDED_BY(lock) = false;
-	//! When initialized is true, the cached data is immutable
-	bool initialized DUCKDB_GUARDED_BY(lock) = false;
+};
+
+//! Immutable data published after a full download completes
+class CachedFileData {
+public:
+	CachedFileData(AllocatedData data_p, idx_t size_p) : data(std::move(data_p)), size(size_p) {
+	}
+
+private:
+	friend class CachedFileHandle;
+	AllocatedData data;
+	idx_t size;
 };
 
 //! Handle to a CachedFile
 class CachedFileHandle {
 public:
-	explicit CachedFileHandle(shared_ptr<CachedFile> file_p);
+	explicit CachedFileHandle(shared_ptr<CachedFileData> file_p);
 
-	bool Initialized() const;
 	const char *GetData() const;
 	//! Return the size of the initialized file
 	idx_t GetSize() const;
 
 private:
-	shared_ptr<CachedFile> file;
+	shared_ptr<CachedFileData> file;
 };
 
 //! Exclusive handle for populating an uninitialized CachedFile
@@ -149,15 +165,18 @@ public:
 	//! Reset bytes written by a prior request attempt
 	void Reset();
 	//! Indicate the file is fully downloaded and safe for parallel reading
-	void Finalize();
+	unique_ptr<CachedFileHandle> Finalize();
 
 private:
 	CachedFileDownload(shared_ptr<CachedFile> file_p, Allocator &allocator_p);
-	void ReserveInternal(idx_t capacity) DUCKDB_REQUIRES(file->lock);
+	void ReserveInternal(idx_t capacity);
 	void Abort();
 
 	shared_ptr<CachedFile> file;
 	Allocator &allocator;
+	AllocatedData data;
+	idx_t capacity = 0;
+	idx_t size = 0;
 	bool active = true;
 };
 
@@ -167,14 +186,17 @@ public:
 	HTTPFileState() : cached_file(make_shared_ptr<CachedFile>()) {
 	}
 
-	unique_ptr<CachedFileHandle> GetCachedFileHandle() {
-		return cached_file->GetHandle();
+	unique_ptr<CachedFileHandle> TryGetCachedFileHandle() {
+		return cached_file->TryGetHandle();
 	}
 	unique_ptr<CachedFileDownload> StartCachedFileDownload(Allocator &allocator) {
 		return cached_file->StartDownload(allocator);
 	}
-	RangeRequestState::Guard BeginRangeRequest() {
-		return range_request_state.BeginRequest();
+	void InvalidateCachedFile() {
+		cached_file->Invalidate();
+	}
+	RangeRequestState::Guard BeginRangeRequest(bool coordinate_requests = true) {
+		return range_request_state.BeginRequest(coordinate_requests);
 	}
 	void MarkRangeRequestsSupported() {
 		auto guard = range_request_state.BeginRequest();

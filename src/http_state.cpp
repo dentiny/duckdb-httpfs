@@ -3,8 +3,12 @@
 
 namespace duckdb {
 
-unique_ptr<CachedFileHandle> CachedFile::GetHandle() {
-	return make_uniq<CachedFileHandle>(shared_from_this());
+unique_ptr<CachedFileHandle> CachedFile::TryGetHandle() {
+	annotated_lock_guard<annotated_mutex> guard(lock);
+	if (!cached_data) {
+		return nullptr;
+	}
+	return make_uniq<CachedFileHandle>(cached_data);
 }
 
 unique_ptr<CachedFileDownload> CachedFile::StartDownload(Allocator &allocator) {
@@ -12,7 +16,7 @@ unique_ptr<CachedFileDownload> CachedFile::StartDownload(Allocator &allocator) {
 	while (downloading) {
 		download_complete.wait(guard, [&]() DUCKDB_REQUIRES(lock) { return !downloading; });
 	}
-	if (initialized) {
+	if (cached_data) {
 		return nullptr;
 	}
 	auto result = unique_ptr<CachedFileDownload>(new CachedFileDownload(shared_from_this(), allocator));
@@ -20,23 +24,19 @@ unique_ptr<CachedFileDownload> CachedFile::StartDownload(Allocator &allocator) {
 	return result;
 }
 
-CachedFileHandle::CachedFileHandle(shared_ptr<CachedFile> file_p) : file(std::move(file_p)) {
+void CachedFile::Invalidate() {
+	annotated_lock_guard<annotated_mutex> guard(lock);
+	cached_data.reset();
 }
 
-bool CachedFileHandle::Initialized() const {
-	annotated_lock_guard<annotated_mutex> guard(file->lock);
-	return file->initialized;
+CachedFileHandle::CachedFileHandle(shared_ptr<CachedFileData> file_p) : file(std::move(file_p)) {
 }
 
 const char *CachedFileHandle::GetData() const {
-	annotated_lock_guard<annotated_mutex> guard(file->lock);
-	D_ASSERT(file->initialized);
 	return const_char_ptr_cast(file->data.get());
 }
 
 idx_t CachedFileHandle::GetSize() const {
-	annotated_lock_guard<annotated_mutex> guard(file->lock);
-	D_ASSERT(file->initialized);
 	return file->size;
 }
 
@@ -49,19 +49,18 @@ CachedFileDownload::~CachedFileDownload() {
 }
 
 void CachedFileDownload::ReserveInternal(idx_t capacity) {
-	if (capacity <= file->capacity) {
+	if (capacity <= this->capacity) {
 		return;
 	}
 	auto new_data = allocator.Allocate(capacity);
-	if (file->size > 0) {
-		memcpy(new_data.get(), file->data.get(), file->size);
+	if (size > 0) {
+		memcpy(new_data.get(), data.get(), size);
 	}
-	file->data = std::move(new_data);
-	file->capacity = capacity;
+	data = std::move(new_data);
+	this->capacity = capacity;
 }
 
 void CachedFileDownload::Reserve(idx_t capacity) {
-	annotated_lock_guard<annotated_mutex> guard(file->lock);
 	ReserveInternal(capacity);
 }
 
@@ -69,13 +68,12 @@ void CachedFileDownload::Append(const_data_ptr_t data, idx_t length) {
 	if (length == 0) {
 		return;
 	}
-	annotated_lock_guard<annotated_mutex> guard(file->lock);
-	if (length > NumericLimits<idx_t>::Maximum() - file->size) {
+	if (length > NumericLimits<idx_t>::Maximum() - size) {
 		throw OutOfMemoryException("Cached file size exceeds the maximum allocation size");
 	}
-	const auto required_capacity = file->size + length;
-	if (required_capacity > file->capacity) {
-		auto new_capacity = MaxValue<idx_t>(file->capacity, length);
+	const auto required_capacity = size + length;
+	if (required_capacity > capacity) {
+		auto new_capacity = MaxValue<idx_t>(capacity, length);
 		while (new_capacity < required_capacity) {
 			if (new_capacity > NumericLimits<idx_t>::Maximum() / 2) {
 				new_capacity = required_capacity;
@@ -85,25 +83,26 @@ void CachedFileDownload::Append(const_data_ptr_t data, idx_t length) {
 		}
 		ReserveInternal(new_capacity);
 	}
-	memcpy(file->data.get() + file->size, data, length);
-	file->size += length;
+	memcpy(this->data.get() + size, data, length);
+	size += length;
 }
 
 void CachedFileDownload::Reset() {
-	annotated_lock_guard<annotated_mutex> guard(file->lock);
-	file->data.Reset();
-	file->capacity = 0;
-	file->size = 0;
+	data.Reset();
+	capacity = 0;
+	size = 0;
 }
 
-void CachedFileDownload::Finalize() {
+unique_ptr<CachedFileHandle> CachedFileDownload::Finalize() {
 	annotated_lock_guard<annotated_mutex> guard(file->lock);
 	D_ASSERT(file->downloading);
-	D_ASSERT(!file->initialized);
-	file->initialized = true;
+	D_ASSERT(!file->cached_data);
+	auto cached_data = make_shared_ptr<CachedFileData>(std::move(data), size);
+	file->cached_data = cached_data;
 	file->downloading = false;
 	active = false;
 	file->download_complete.notify_all();
+	return make_uniq<CachedFileHandle>(std::move(cached_data));
 }
 
 void CachedFileDownload::Abort() {
@@ -112,9 +111,6 @@ void CachedFileDownload::Abort() {
 	}
 	annotated_lock_guard<annotated_mutex> guard(file->lock);
 	D_ASSERT(file->downloading);
-	file->data.Reset();
-	file->capacity = 0;
-	file->size = 0;
 	file->downloading = false;
 	active = false;
 	file->download_complete.notify_all();

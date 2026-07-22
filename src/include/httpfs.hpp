@@ -106,10 +106,8 @@ public:
 	// In write overwrite mode, we are not interested in the current state of the file: we're overwriting it.
 	bool write_overwrite_mode = false;
 
-	// When using full file download, the full file will be written to a cached file handle
-	mutex full_download_mutex;
-	unique_ptr<CachedFileHandle> cached_file_handle;
-	unique_ptr<CachedFileDownload> cached_file_download;
+	// Per-path download and range-support state shared by all handles in this query
+	shared_ptr<HTTPFileState> file_state;
 	optional_ptr<Allocator> buffer_allocator;
 
 	// Read info
@@ -177,18 +175,11 @@ protected:
 	virtual unique_ptr<HTTPClient> CreateClient();
 	//! Perform a HEAD request to get the file info (if not yet loaded)
 	void LoadFileInfo();
-	//! Reset download state so a full download can be retried from scratch
-	void ResetDownloadState();
-
 	//! TODO: make base function virtual?
 	void TryAddLogger(FileOpener &opener);
 
 	virtual void InitializeFromCacheEntry(const HTTPMetadataCacheEntry &cache_entry);
 	virtual HTTPMetadataCacheEntry GetCacheEntry() const;
-
-public:
-	//! Fully downloads a file
-	void FullDownload(HTTPFileSystem &hfs, bool &should_write_cache);
 };
 
 class HTTPFileSystem : public FileSystem {
@@ -249,13 +240,16 @@ public:
 	virtual unique_ptr<HTTPResponse> GetRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map,
 	                                                 idx_t file_offset, char *buffer_out, idx_t buffer_out_len);
 	// Get Request without a range (i.e., downloads full file)
-	virtual unique_ptr<HTTPResponse> GetRequest(FileHandle &handle, string url, HTTPHeaders header_map);
+	virtual unique_ptr<HTTPResponse> GetRequest(FileHandle &handle, string url, HTTPHeaders header_map,
+	                                            CachedFileDownload &download);
 	// Post Request that can handle variable sized responses without a content-length header (needed for s3 multipart)
 	virtual unique_ptr<HTTPResponse> PostRequest(HTTPInput &input, string url, HTTPHeaders header_map, string &result,
 	                                             char *buffer_in, idx_t buffer_in_len, string params = "");
 	virtual unique_ptr<HTTPResponse> PutRequest(HTTPInput &input, string url, HTTPHeaders header_map, char *buffer_in,
 	                                            idx_t buffer_in_len, string params = "");
 	virtual unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, string url, HTTPHeaders header_map);
+	//! Fully download a file, or wait for an in-progress download of the same path
+	unique_ptr<CachedFileHandle> FullDownload(HTTPFileHandle &handle, bool &should_write_cache);
 
 protected:
 	//! FileSystem extension points used by HTTP handle setup.
@@ -287,8 +281,8 @@ protected:
 	                                       char *buffer_in, idx_t buffer_in_len, const string &content_type,
 	                                       HTTPSendCallback send_request);
 	unique_ptr<HTTPResponse> RunGetRequest(HTTPFileHandle &handle, string url, HTTPHeaders header_map,
-	                                       HTTPFSParams &http_params, HTTPErrorCallback get_error,
-	                                       HTTPSendCallback send_request);
+	                                       HTTPFSParams &http_params, CachedFileDownload &download,
+	                                       HTTPErrorCallback get_error, HTTPSendCallback send_request);
 	unique_ptr<HTTPResponse> RunGetRangeRequest(HTTPFileHandle &handle, string url, HTTPHeaders header_map,
 	                                            HTTPFSParams &http_params, const string &etag,
 	                                            bool auto_fallback_to_full_file_download, idx_t file_offset,

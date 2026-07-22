@@ -368,20 +368,6 @@ public:
 				request.time_to_fst_byte_sec = starttransfer_seconds;
 			}
 
-			if (!client.request_info->header_collection.empty() &&
-			    client.request_info->header_collection.back().HasHeader("content-length")) {
-				try {
-					// Content-Length can exceed INT_MAX for files larger than 2GB.
-					const idx_t content_length_received =
-					    std::stoull(client.request_info->header_collection.back().GetHeaderValue("content-length"));
-					if (bytes_received != content_length_received) {
-						// The caller decides whether a short response is an error.
-					}
-				} catch (const std::exception &) {
-					// Content-Length is not numeric, so skip validation.
-				}
-			}
-
 			if (client.state) {
 				client.state->total_bytes_received += bytes_received;
 			}

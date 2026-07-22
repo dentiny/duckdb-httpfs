@@ -48,6 +48,8 @@ struct MockS3ServerConfig {
 	bool advertise_ranges = true;
 	//! Hold the first range response body until a second range request arrives
 	bool block_first_range_body_until_second_range = false;
+	//! Hold a full GET response body until ReleaseFullGet is called
+	bool block_full_get_until_released = false;
 	//! Number of object HEADs to fail with a 400 before succeeding
 	idx_t transient_head_failures = 0;
 	//! Number of object DELETEs to fail with a 400 before succeeding
@@ -86,6 +88,8 @@ public:
 	string S3Path() const;
 	const string &ObjectData() const;
 	vector<MockS3RequestObservation> Observations() const;
+	bool WaitForFullGet();
+	void ReleaseFullGet();
 
 private:
 	struct Impl;

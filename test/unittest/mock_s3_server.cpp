@@ -112,6 +112,19 @@ struct MockS3Server::Impl {
 		return observations;
 	}
 
+	bool WaitForFullGet() {
+		std::unique_lock<std::mutex> lock(full_get_lock);
+		return full_get_started.wait_for(lock, std::chrono::seconds(5), [this]() { return full_get_seen; });
+	}
+
+	void ReleaseFullGet() {
+		{
+			std::lock_guard<std::mutex> lock(full_get_lock);
+			full_get_released = true;
+		}
+		full_get_release.notify_all();
+	}
+
 	bool MatchesRefreshTarget(const httplib::Request &request) const {
 		auto range = GetHeader(request, "Range");
 		switch (config.refresh_target) {
@@ -160,6 +173,8 @@ struct MockS3Server::Impl {
 	void SetObjectHeaders(httplib::Response &response) const {
 		if (config.advertise_ranges) {
 			response.set_header("Accept-Ranges", "bytes");
+		} else {
+			response.set_header("Accept-Ranges", "none");
 		}
 		auto content_length =
 		    config.head_content_length.IsValid() ? config.head_content_length.GetIndex() : config.object_data.size();
@@ -301,6 +316,24 @@ struct MockS3Server::Impl {
 			if (range.empty()) {
 				response.status = 200;
 				response.set_header("ETag", config.etag);
+				if (config.block_full_get_until_released) {
+					response.set_content_provider(
+					    config.object_data.size(), "application/octet-stream",
+					    [this](size_t offset, size_t length, httplib::DataSink &sink) {
+						    if (offset == 0) {
+							    std::unique_lock<std::mutex> lock(full_get_lock);
+							    full_get_seen = true;
+							    full_get_started.notify_all();
+							    if (!full_get_release.wait_for(lock, std::chrono::seconds(5),
+							                                   [this]() { return full_get_released; })) {
+								    return false;
+							    }
+						    }
+						    return sink.write(config.object_data.data() + offset, length);
+					    });
+					Record(request, response.status);
+					return;
+				}
 				if (config.chunked_full_get) {
 					response.set_chunked_content_provider(
 					    "application/octet-stream", [this](size_t offset, httplib::DataSink &sink) {
@@ -489,6 +522,11 @@ struct MockS3Server::Impl {
 	std::mutex range_request_lock;
 	std::condition_variable range_request_started;
 	idx_t range_requests_seen = 0;
+	std::mutex full_get_lock;
+	std::condition_variable full_get_started;
+	std::condition_variable full_get_release;
+	bool full_get_seen = false;
+	bool full_get_released = false;
 };
 
 MockS3Server::MockS3Server(MockS3ServerConfig config) : impl(make_uniq<Impl>(std::move(config))) {
@@ -515,6 +553,14 @@ const string &MockS3Server::ObjectData() const {
 
 vector<MockS3RequestObservation> MockS3Server::Observations() const {
 	return impl->Observations();
+}
+
+bool MockS3Server::WaitForFullGet() {
+	return impl->WaitForFullGet();
+}
+
+void MockS3Server::ReleaseFullGet() {
+	impl->ReleaseFullGet();
 }
 
 string MockS3RefreshTargetName(MockS3RefreshTarget target) {

@@ -1042,12 +1042,13 @@ unique_ptr<HTTPResponse> S3FileSystem::HeadRequest(FileHandle &handle, string s3
 	});
 }
 
-unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
+unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
+                                                  CachedFileDownload &download) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
 	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "GET", true, [&](S3RequestData &request_data) {
 		auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		return RunGetRequest(
-		    s3_handle, request_data.http_url, request_data.headers, params,
+		    s3_handle, request_data.http_url, request_data.headers, params, download,
 		    [&](const HTTPResponse &response) { return GetS3RequestError(request_data, response); },
 		    [&](BaseRequest &request) { return SendS3HandleRequestWithClientCache(s3_handle, params, request); });
 	});
@@ -1056,8 +1057,6 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_
 unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
                                                        idx_t file_offset, char *buffer_out, idx_t buffer_out_len) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
-	D_ASSERT(s3_handle.http_params.state);
-	s3_handle.http_params.state->GetFileState(s3_handle.path)->MarkRangeRequestsSupported();
 	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "GET", true, [&](S3RequestData &request_data) {
 		auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		return RunGetRangeRequest(
@@ -1178,7 +1177,6 @@ void S3FileHandle::Initialize(optional_ptr<FileOpener> opener) {
 			    path, auth_params.region, correct_region);
 			SetRegion(std::move(correct_region));
 		}
-		ResetDownloadState();
 		HTTPFileHandle::Initialize(opener);
 	}
 

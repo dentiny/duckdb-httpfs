@@ -57,10 +57,21 @@ static idx_t CountRequests(const vector<MockS3RequestObservation> &observations,
 	return count;
 }
 
+static idx_t CountRangeRequests(const vector<MockS3RequestObservation> &observations, int status) {
+	idx_t count = 0;
+	for (auto &observation : observations) {
+		if (observation.method == "GET" && observation.status == status && !observation.range.empty()) {
+			count++;
+		}
+	}
+	return count;
+}
+
 struct ReadOutcome {
 	bool failed = false;
 	bool internal_error = false;
 	string error;
+	string data;
 };
 
 static ReadOutcome TryReadHandle(Connection &con, FileHandle &handle, idx_t offset, idx_t length) {
@@ -68,6 +79,7 @@ static ReadOutcome TryReadHandle(Connection &con, FileHandle &handle, idx_t offs
 	try {
 		string buffer(length, '?');
 		handle.Read(QueryContext(*con.context), &buffer[0], length, offset);
+		outcome.data = std::move(buffer);
 	} catch (std::exception &ex) {
 		outcome.failed = true;
 		outcome.error = ex.what();
@@ -221,6 +233,67 @@ static void RunParallelRangeHeaderRelease(const string &client_implementation) {
 	RequireQueryOk(con, "COMMIT");
 }
 
+static void RunFullDownloadSingleFlight(const string &client_implementation, bool shared_handle) {
+	static constexpr idx_t READ_LENGTH = 1024;
+	const vector<idx_t> offsets {0, 2048, 4096, 6144};
+
+	MockS3ServerConfig config;
+	config.object_data.resize(8192);
+	for (idx_t i = 0; i < config.object_data.size(); i++) {
+		config.object_data[i] = NumericCast<char>('a' + (i % 26));
+	}
+	const auto expected_data = config.object_data;
+	config.advertise_ranges = false;
+	config.range_behavior = MockS3RangeBehavior::IGNORE_RANGE;
+	config.block_full_get_until_released = true;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureHTTPTest(db, con, 0, client_implementation);
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	const auto flags =
+	    FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO | FileFlags::FILE_FLAGS_PARALLEL_ACCESS;
+	vector<unique_ptr<FileHandle>> handles;
+	const auto handle_count = shared_handle ? 1 : offsets.size();
+	for (idx_t i = 0; i < handle_count; i++) {
+		handles.push_back(fs.OpenFile(server.HTTPPath(), flags));
+	}
+
+	std::atomic<bool> start {false};
+	vector<ReadOutcome> outcomes(offsets.size());
+	vector<std::thread> readers;
+	for (idx_t i = 0; i < offsets.size(); i++) {
+		readers.emplace_back([&, i]() {
+			while (!start.load()) {
+				std::this_thread::yield();
+			}
+			auto &handle = shared_handle ? *handles[0] : *handles[i];
+			outcomes[i] = TryReadHandle(con, handle, offsets[i], READ_LENGTH);
+		});
+	}
+	start = true;
+	const auto full_get_started = server.WaitForFullGet();
+	server.ReleaseFullGet();
+	for (auto &reader : readers) {
+		reader.join();
+	}
+
+	REQUIRE(full_get_started);
+	for (idx_t i = 0; i < outcomes.size(); i++) {
+		INFO(outcomes[i].error);
+		REQUIRE_FALSE(outcomes[i].failed);
+		REQUIRE(outcomes[i].data == expected_data.substr(offsets[i], READ_LENGTH));
+	}
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(CountRangeRequests(observations, 200) == 1);
+	REQUIRE(CountRequests(observations, "GET", 200) == 1);
+	RequireQueryOk(con, "COMMIT");
+}
+
 } // namespace
 
 TEST_CASE("HTTP range reads reject truncated response bodies", "[httpfs][short-read]") {
@@ -241,6 +314,21 @@ TEST_CASE("HTTP range readers resume after the first response headers", "[httpfs
 	}
 	SECTION("httplib") {
 		RunParallelRangeHeaderRelease("httplib");
+	}
+}
+
+TEST_CASE("HTTP full-download fallback is single-flight", "[httpfs][full-download][range-probe]") {
+	SECTION("curl with separate handles") {
+		RunFullDownloadSingleFlight("curl", false);
+	}
+	SECTION("curl with a shared handle") {
+		RunFullDownloadSingleFlight("curl", true);
+	}
+	SECTION("httplib with separate handles") {
+		RunFullDownloadSingleFlight("httplib", false);
+	}
+	SECTION("httplib with a shared handle") {
+		RunFullDownloadSingleFlight("httplib", true);
 	}
 }
 

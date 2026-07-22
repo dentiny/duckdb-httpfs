@@ -243,16 +243,15 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunPutRequest(string url, HTTPHeaders h
 }
 
 unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRequest(HTTPFileHandle &hfh, string url, HTTPHeaders header_map,
-                                                       HTTPFSParams &http_params, HTTPErrorCallback get_error,
-                                                       HTTPSendCallback send_request) {
-	D_ASSERT(hfh.cached_file_download);
+                                                       HTTPFSParams &http_params, CachedFileDownload &download,
+                                                       HTTPErrorCallback get_error, HTTPSendCallback send_request) {
 	GetRequestInfo get_request(
 	    url, header_map, http_params,
 	    [&](const HTTPResponse &response) {
 		    if (static_cast<int>(response.status) >= 400) {
 			    throw get_error(response);
 		    }
-		    hfh.cached_file_download->Reset();
+		    download.Reset();
 		    optional_idx content_length;
 		    if (response.HasHeader("Content-Length")) {
 			    try {
@@ -262,7 +261,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRequest(HTTPFileHandle &hfh, stri
 			    }
 		    }
 		    if (content_length.IsValid() && content_length.GetIndex() > 0) {
-			    hfh.cached_file_download->Reserve(content_length.GetIndex());
+			    download.Reserve(content_length.GetIndex());
 		    }
 		    if (http_params.s3_version_id_pinning && response.HasHeader("x-amz-version-id")) {
 			    lock_guard<mutex> lck(hfh.mu);
@@ -273,7 +272,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRequest(HTTPFileHandle &hfh, stri
 		    return true;
 	    },
 	    [&](const_data_ptr_t data, idx_t data_length) {
-		    hfh.cached_file_download->Append(data, data_length);
+		    download.Append(data, data_length);
 		    return true;
 	    });
 
@@ -299,8 +298,8 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh,
 	string range_expr = "bytes=" + to_string(file_offset) + "-" + to_string(file_offset + buffer_out_len - 1);
 	header_map.Insert("Range", range_expr);
 
-	D_ASSERT(http_params.state);
-	auto range_request = http_params.state->GetFileState(hfh.path)->BeginRangeRequest();
+	D_ASSERT(hfh.file_state);
+	auto range_request = hfh.file_state->BeginRangeRequest(auto_fallback_to_full_file_download);
 	if (range_request.Support() == RangeRequestSupport::NOT_SUPPORTED && auto_fallback_to_full_file_download) {
 		auto response = make_uniq<HTTPResponse>(HTTPStatusCode::INVALID);
 		SetRangeRequestNotSupported(*response);
@@ -460,14 +459,15 @@ HTTPException HTTPFileSystem::GetHTTPError(FileHandle &, const HTTPResponse &res
 	return HTTPException(response, error);
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::GetRequest(FileHandle &handle, string url, HTTPHeaders header_map) {
+unique_ptr<HTTPResponse> HTTPFileSystem::GetRequest(FileHandle &handle, string url, HTTPHeaders header_map,
+                                                    CachedFileDownload &download) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
 	AddUserAgentIfAvailable(hfh.http_params, header_map);
 	AddHandleHeaders(hfh.http_params, header_map);
 
 	auto http_client = hfh.GetClient();
 	auto response = RunGetRequest(
-	    hfh, url, header_map, hfh.http_params,
+	    hfh, url, header_map, hfh.http_params, download,
 	    [&](const HTTPResponse &response) { return GetHTTPError(handle, response, url); },
 	    [&](BaseRequest &request) { return hfh.http_params.http_util.Request(request, http_client); });
 	hfh.StoreClient(std::move(http_client));
@@ -690,17 +690,20 @@ bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders
 bool HTTPFileSystem::ReadInternal(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
 
-	D_ASSERT(hfh.http_params.state);
-	if (hfh.cached_file_handle) {
-		if (!hfh.cached_file_handle->Initialized()) {
-			throw InternalException("Cached file not initialized properly");
-		}
-		if (hfh.cached_file_handle->GetSize() < location + nr_bytes) {
+	D_ASSERT(hfh.file_state);
+	auto cached_file = hfh.file_state->TryGetCachedFileHandle();
+	if (cached_file) {
+		if (cached_file->GetSize() < location + nr_bytes) {
 			throw IOException("Cached file length can't satisfy the requested Read. You can try to resolve this by "
 			                  "enabling `SET force_download=true`");
 		}
-		memcpy(buffer, hfh.cached_file_handle->GetData() + location, nr_bytes);
+		memcpy(buffer, cached_file->GetData() + location, nr_bytes);
 		DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
+		if (hfh.flags.RequireParallelAccess()) {
+			std::lock_guard<mutex> lck(hfh.mu);
+			hfh.file_offset = location + nr_bytes;
+			return true;
+		}
 		hfh.file_offset = location + nr_bytes;
 		return true;
 	}
@@ -807,12 +810,12 @@ void HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 	const auto head_reported_length = hfh.length;
 
 	bool should_write_cache = false;
-	hfh.FullDownload(*this, should_write_cache);
+	auto cached_file = FullDownload(hfh, should_write_cache);
 
-	const auto downloaded_length = hfh.cached_file_handle->GetSize();
+	const auto downloaded_length = cached_file->GetSize();
 	if (downloaded_length != head_reported_length) {
+		hfh.file_state->InvalidateCachedFile();
 		hfh.http_params.state->EraseFileState(hfh.path);
-		hfh.cached_file_handle.reset();
 		throw HTTPException(Exception::ConstructMessage(
 		    "The size reported by HEAD for '%s' was %llu bytes, but the full GET downloaded %llu bytes. You can try "
 		    "to resolve this by enabling `SET force_download=true`",
@@ -917,36 +920,28 @@ static optional_ptr<HTTPMetadataCache> TryGetMetadataCache(optional_ptr<FileOpen
 	return nullptr;
 }
 
-void HTTPFileHandle::FullDownload(HTTPFileSystem &hfs, bool &should_write_cache) {
-	lock_guard<mutex> guard(full_download_mutex);
-	if (cached_file_handle && cached_file_handle->Initialized()) {
-		length = cached_file_handle->GetSize();
-		should_write_cache = false;
-		return;
-	}
-	auto file_state = http_params.state->GetFileState(path);
-	cached_file_handle = file_state->GetCachedFileHandle();
-	cached_file_download = file_state->StartCachedFileDownload(*buffer_allocator);
-	if (cached_file_download) {
-		try {
-			auto full_download_result = hfs.GetRequest(*this, path, {});
-			if (full_download_result->status != HTTPStatusCode::OK_200) {
-				throw HTTPException(*full_download_result, "Full download failed to to URL \"%s\": %d (%s)",
-				                    full_download_result->url, static_cast<int>(full_download_result->status),
-				                    full_download_result->GetError());
-			}
-		} catch (...) {
-			ResetDownloadState();
-			cached_file_handle.reset();
-			throw;
-		}
-		cached_file_download->Finalize();
-		cached_file_download.reset();
-		length = cached_file_handle->GetSize();
-	} else {
-		length = cached_file_handle->GetSize();
-	}
+unique_ptr<CachedFileHandle> HTTPFileSystem::FullDownload(HTTPFileHandle &hfh, bool &should_write_cache) {
+	D_ASSERT(hfh.file_state);
+	D_ASSERT(hfh.buffer_allocator);
 	should_write_cache = false;
+
+	while (true) {
+		if (auto cached_file = hfh.file_state->TryGetCachedFileHandle()) {
+			return cached_file;
+		}
+
+		auto download = hfh.file_state->StartCachedFileDownload(*hfh.buffer_allocator);
+		if (!download) {
+			continue;
+		}
+		auto full_download_result = GetRequest(hfh, hfh.path, {}, *download);
+		if (full_download_result->status != HTTPStatusCode::OK_200) {
+			throw HTTPException(*full_download_result, "Full download failed to to URL \"%s\": %d (%s)",
+			                    full_download_result->url, static_cast<int>(full_download_result->status),
+			                    full_download_result->GetError());
+		}
+		return download->Finalize();
+	}
 }
 
 bool HTTPFileSystem::TryParseLastModifiedTime(const string &timestamp, timestamp_t &result) {
@@ -992,23 +987,14 @@ optional_idx TryParseContentLength(const HTTPHeaders &headers) {
 	}
 }
 
-void HTTPFileHandle::ResetDownloadState() {
-	cached_file_download.reset();
-	length = 0;
-}
-
 void HTTPFileHandle::LoadFileInfo() {
 
 	// Check if file is already fully cached (e.g., from a prior force_download_threshold open)
-	if (http_params.state) {
-		auto file_state = http_params.state->GetFileState(path);
-		auto handle = file_state->GetCachedFileHandle();
-		if (handle->Initialized()) {
-			length = handle->GetSize();
-			cached_file_handle = std::move(handle);
-			initialized = true;
-			return;
-		}
+	D_ASSERT(file_state);
+	if (auto cached_file = file_state->TryGetCachedFileHandle()) {
+		length = cached_file->GetSize();
+		initialized = true;
+		return;
 	}
 
 	if (initialized || force_full_download) {
@@ -1076,7 +1062,7 @@ void HTTPFileHandle::LoadFileInfo() {
 		auto accept_ranges = res->headers.GetHeaderValue("Accept-Ranges");
 		StringUtil::Trim(accept_ranges);
 		if (StringUtil::CIEquals(accept_ranges, "bytes")) {
-			http_params.state->GetFileState(path)->MarkRangeRequestsSupported();
+			file_state->MarkRangeRequestsSupported();
 		}
 	}
 	initialized = true;
@@ -1134,6 +1120,7 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 	if (!http_params.state) {
 		http_params.state = make_shared_ptr<HTTPState>();
 	}
+	file_state = http_params.state->GetFileState(path);
 
 	if (opener) {
 		TryAddLogger(*opener);
@@ -1144,7 +1131,7 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 	bool should_write_cache = false;
 	if (flags.OpenForReading()) {
 		if (http_params.force_download) {
-			FullDownload(hfs, should_write_cache);
+			length = hfs.FullDownload(*this, should_write_cache)->GetSize();
 			return;
 		}
 
@@ -1154,16 +1141,6 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 
 			if (found) {
 				InitializeFromCacheEntry(value);
-
-				// If a full file download exists in HTTPState, reuse it
-				// instead of falling through to range requests that may not be supported.
-				if (http_params.state) {
-					auto file_state = http_params.state->GetFileState(path);
-					auto handle = file_state->GetCachedFileHandle();
-					if (handle->Initialized()) {
-						cached_file_handle = std::move(handle);
-					}
-				}
 
 				if (flags.OpenForReading() && !SkipBuffer()) {
 					AllocateReadBuffer(opener);
@@ -1185,7 +1162,7 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 		const auto should_full_download = has_cache_state || meets_threshold || always_download;
 
 		if (should_full_download) {
-			FullDownload(hfs, should_write_cache);
+			length = hfs.FullDownload(*this, should_write_cache)->GetSize();
 		}
 		if (should_write_cache) {
 			current_cache->Insert(path, GetCacheEntry());
