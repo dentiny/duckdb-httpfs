@@ -100,7 +100,7 @@ unique_ptr<BaseSecret> CreateS3SecretFunctions::CreateSecretFunctionInternal(Cli
 			if (refresh) {
 				throw InvalidInputException("Can not set `refresh` and `refresh_info` at the same time");
 			}
-			refresh = named_param.second.GetValue<string>() == "auto";
+			refresh = StringUtil::Lower(named_param.second.GetValue<string>()) == "auto";
 			secret->secret_map["refresh"] = Value("auto");
 			child_list_t<Value> struct_fields;
 			for (const auto &named_param : input.options) {
