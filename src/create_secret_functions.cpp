@@ -74,7 +74,7 @@ unique_ptr<BaseSecret> CreateS3SecretFunctions::CreateSecretFunctionInternal(Cli
 		} else if (lower_name == "endpoint") {
 			secret->secret_map["endpoint"] = named_param.second.ToString();
 		} else if (lower_name == "url_style") {
-			secret->secret_map["url_style"] = named_param.second.ToString();
+			secret->secret_map["url_style"] = StringUtil::Lower(named_param.second.ToString());
 		} else if (lower_name == "use_ssl") {
 			if (named_param.second.type() != LogicalType::BOOLEAN) {
 				throw InvalidInputException("Invalid type past to secret option: '%s', found '%s', expected: 'BOOLEAN'",
@@ -101,7 +101,7 @@ unique_ptr<BaseSecret> CreateS3SecretFunctions::CreateSecretFunctionInternal(Cli
 			if (refresh) {
 				throw InvalidInputException("Can not set `refresh` and `refresh_info` at the same time");
 			}
-			refresh = named_param.second.GetValue<string>() == "auto";
+			refresh = StringUtil::Lower(named_param.second.GetValue<string>()) == "auto";
 			secret->secret_map["refresh"] = Value("auto");
 			child_list_t<Value> struct_fields;
 			for (const auto &named_param : input.options) {
