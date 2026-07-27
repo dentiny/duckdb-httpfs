@@ -16,8 +16,6 @@ SELECT generation_energy_source FROM 's3://pudl.catalyst.coop/nightly/core_eia93
 ----
 battery_storage
 
-restart
-
 statement ok
 SET httpfs_client_implementation='httplib';
 
