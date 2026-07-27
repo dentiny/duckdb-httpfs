@@ -959,10 +959,14 @@ ParsedS3Url S3FileSystem::S3UrlParse(string url, const S3AuthParams &params) {
 
 	// Update host and path according to the url style
 	// See https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html
-	if (params.url_style == "vhost" || params.url_style == "virtual" || params.url_style == "") {
-		host = bucket + "." + host;
-	} else if (params.url_style == "path") {
+	bool use_vhost = params.url_style.empty() || params.url_style == "vhost" || params.url_style == "virtual";
+	// A bucket name containing periods (.) is not addressable vhost-style over TLS. Fallback to path style url
+	bool use_path =
+	    params.url_style == "path" || (use_vhost && params.use_ssl && bucket.find('.') != std::string::npos);
+	if (use_path) {
 		path += "/" + bucket;
+	} else if (use_vhost) {
+		host = bucket + "." + host;
 	}
 
 	// Append key (including leading slash) to the path
