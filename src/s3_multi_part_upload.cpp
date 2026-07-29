@@ -7,7 +7,7 @@
 namespace duckdb {
 
 S3MultiPartUpload::S3MultiPartUpload(S3FileHandle &s3_file_handle)
-    : s3fs(s3_file_handle.file_system.Cast<S3FileSystem>()), http_input(s3_file_handle.http_input),
+    : s3fs(s3_file_handle.file_system.Cast<S3FileSystem>()), request_session(s3_file_handle.request_session),
       path(s3_file_handle.path), config_params(s3_file_handle.config_params), uploads_in_progress(0), parts_uploaded(0),
       upload_finalized(false) {
 }
@@ -58,7 +58,7 @@ string S3MultiPartUpload::InitializeMultipartUpload() {
 	// AWS response is around 300~ chars in docs so this should be enough to not need a resize
 	string result;
 	string query_param = "uploads=";
-	auto res = s3fs.PostRequest(*http_input, path, {}, result, nullptr, 0, query_param);
+	auto res = s3fs.PostRequest(*request_session, path, result, nullptr, 0, query_param);
 
 	if (res->status != HTTPStatusCode::OK_200) {
 		throw HTTPException(*res, "Unable to connect to URL %s: %s (HTTP code %d)", path, res->GetError(),
@@ -104,7 +104,7 @@ void S3MultiPartUpload::FinalizeMultipartUpload() {
 	string result;
 
 	string query_param = "uploadId=" + S3FileSystem::UrlEncode(multipart_upload_id, true);
-	auto res = s3fs.PostRequest(*http_input, path, {}, result, (char *)body.c_str(), body.length(), query_param);
+	auto res = s3fs.PostRequest(*request_session, path, result, (char *)body.c_str(), body.length(), query_param);
 	auto open_tag_pos = result.find("<CompleteMultipartUploadResult", 0);
 	if (open_tag_pos == string::npos) {
 		throw HTTPException(*res, "Unexpected response during S3 multipart upload finalization: %d\n\n%s",
@@ -132,7 +132,7 @@ void S3MultiPartUpload::UploadBufferImplementation(shared_ptr<S3WriteBuffer> wri
 
 	try {
 		// Transient S3 errors are retried inside PutRequest; a non-OK status here is already final.
-		res = s3fs.PutRequest(*http_input, path, {}, (char *)write_buffer->Ptr(), write_buffer->idx, query_param);
+		res = s3fs.PutRequest(*request_session, path, (char *)write_buffer->Ptr(), write_buffer->idx, query_param);
 
 		if (res->status != HTTPStatusCode::OK_200) {
 			throw HTTPException(*res, "Unable to connect to URL %s: %s (HTTP code %d)%s", path, res->GetError(),
@@ -246,8 +246,9 @@ void S3MultiPartUpload::FlushAllBuffers() {
 	if (!initialized_multipart_upload) {
 		// TODO (carlo): unclear how to handle kms_key_id, but given currently they are custom, leave the multiupload
 		// codepath in that case
-		auto &s3_input = http_input->Cast<S3HTTPInput>();
-		if (to_flush.size() == 1 && s3_input.auth_params.kms_key_id.empty()) {
+		auto captured = request_session->Capture();
+		auto &snapshot = captured.snapshot->Cast<S3RequestSnapshot>();
+		if (to_flush.size() == 1 && snapshot.auth_params.kms_key_id.empty()) {
 			UploadSingleBuffer(to_flush[0]);
 			upload_finalized = true;
 			return;

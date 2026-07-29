@@ -25,6 +25,8 @@ struct MockS3ServerConfig {
 	string object_data = "abcdefghijklmnopqrstuvwxyz0123456789";
 	string stale_key_id = "STALE_KEY";
 	string etag = "\"httpfs-refresh-test-etag\"";
+	//! Redirect signed requests to this region when their credential scope uses a different one
+	string required_region;
 	MockS3RefreshTarget refresh_target = MockS3RefreshTarget::HEAD;
 	//! Answer this many leading ListObjectsV2 requests with HTTP 503 SlowDown
 	idx_t transient_503_lists = 0;
@@ -70,6 +72,11 @@ struct MockS3RequestObservation {
 	string target;
 	string range;
 	string key_id;
+	string region;
+	string user_agent;
+	string session_header;
+	idx_t user_agent_count = 0;
+	idx_t session_header_count = 0;
 	int status = 0;
 	//! Client's ephemeral source port; a new connection shows a new port
 	int remote_port = 0;

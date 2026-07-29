@@ -222,12 +222,12 @@ static void RunParallelRangeHeaderRelease(const string &client_implementation) {
 	first_reader.join();
 	second_reader.join();
 
+	auto observations = server.Observations();
 	INFO(first_outcome.error);
 	INFO(second_outcome.error);
+	INFO(MockS3DescribeObservations(observations));
 	REQUIRE_FALSE(first_outcome.failed);
 	REQUIRE_FALSE(second_outcome.failed);
-	auto observations = server.Observations();
-	INFO(MockS3DescribeObservations(observations));
 	REQUIRE(CountRequests(observations, "GET", 206, "bytes=0-1023") == 1);
 	REQUIRE(CountRequests(observations, "GET", 206, "bytes=1024-2047") == 1);
 	RequireQueryOk(con, "COMMIT");

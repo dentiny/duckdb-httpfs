@@ -168,6 +168,11 @@ void HTTPState::WriteProfilingInformation(std::ostream &ss) {
 	ss << "└─────────────────────────────────────┘\n";
 }
 
+bool HTTPState::RunCredentialRefresh(const std::function<bool()> &callback) {
+	annotated_lock_guard<annotated_mutex> guard(credential_refresh_mutex);
+	return callback();
+}
+
 //! Get per-path state, create if it does not exist
 shared_ptr<HTTPFileState> HTTPState::GetFileState(const string &path) {
 	annotated_lock_guard<annotated_mutex> lock(file_states_mutex);

@@ -128,28 +128,20 @@ struct S3RefreshableHTTPParams {
 	string bearer_token;
 };
 
-class S3HTTPInput : public HTTPInput {
-	friend class S3FileHandle;
-	friend class S3FileSystem;
+struct S3RequestSnapshot : public HTTPRequestSnapshot {
+	static constexpr HTTPRequestSnapshotType TYPE = HTTPRequestSnapshotType::S3;
 
-public:
-	S3HTTPInput(unique_ptr<HTTPParams> params, const S3AuthParams &auth_params_p,
-	            const S3ConfigParams &config_params_p);
-	~S3HTTPInput() override;
+	S3RequestSnapshot(const HTTPFSParams &http_params, const S3AuthParams &auth_params_p, string refresh_path_p,
+	                  weak_ptr<ClientContext> client_context_p = {}, bool credential_refresh_enabled_p = true,
+	                  bool region_redirected_p = false);
+
+	bool ClientCompatibleWith(const HTTPRequestSnapshot &other) const override;
 
 	S3AuthParams auth_params;
-	S3ConfigParams config_params;
-
-private:
-	//! Credential refresh helpers used by S3 write/multipart request retries.
-	mutex mu;
+	string refresh_path;
 	weak_ptr<ClientContext> client_context;
-	bool region_redirected = false;
-	bool credential_refresh_enabled = true;
-
-	bool TryRefreshAuthParams(const string &path, S3AuthParams request_auth_params,
-	                          S3RefreshableHTTPParams request_http_params);
-	void SetRegion(string region_p);
+	bool credential_refresh_enabled;
+	bool region_redirected;
 };
 
 class S3FileSystem;
@@ -164,8 +156,7 @@ public:
 	             const S3AuthParams &auth_params_p, const S3ConfigParams &config_params_p);
 	~S3FileHandle() override;
 
-	S3AuthParams &auth_params;
-	const S3ConfigParams &config_params;
+	const S3ConfigParams config_params;
 	shared_ptr<S3MultiPartUpload> multi_part_upload;
 
 	void Close() override;
@@ -173,18 +164,12 @@ public:
 	void FinalizeUpload();
 
 protected:
+	shared_ptr<const HTTPRequestSnapshot> CreateRequestSnapshot(const HTTPFSParams &params) const override;
 	void InitializeFromCacheEntry(const HTTPMetadataCacheEntry &cache_entry) override;
 	HTTPMetadataCacheEntry GetCacheEntry() const override;
-	unique_ptr<HTTPClient> CreateClient() override;
 
 private:
-	//! Credential refresh helpers used by S3 read request retries.
-	bool TryRefreshAuthParams(S3AuthParams request_auth_params, S3RefreshableHTTPParams request_http_params);
 	void SetRegion(string region_p);
-
-	weak_ptr<ClientContext> client_context;
-	bool region_redirected = false;
-	bool credential_refresh_enabled = true;
 };
 
 class S3FileSystem : public HTTPFileSystem {
@@ -217,10 +202,10 @@ public:
 	                                    CachedFileDownload &download) override;
 	unique_ptr<HTTPResponse> GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
 	                                         idx_t file_offset, char *buffer_out, idx_t buffer_out_len) override;
-	unique_ptr<HTTPResponse> PostRequest(HTTPInput &input, string s3_url, HTTPHeaders header_map, string &buffer_out,
-	                                     char *buffer_in, idx_t buffer_in_len, string http_params = "") override;
-	unique_ptr<HTTPResponse> PutRequest(HTTPInput &input, string s3_url, HTTPHeaders header_map, char *buffer_in,
-	                                    idx_t buffer_in_len, string http_params = "") override;
+	unique_ptr<HTTPResponse> PostRequest(HTTPRequestSession &session, string s3_url, string &buffer_out,
+	                                     char *buffer_in, idx_t buffer_in_len, string http_params = "");
+	unique_ptr<HTTPResponse> PutRequest(HTTPRequestSession &session, string s3_url, char *buffer_in,
+	                                    idx_t buffer_in_len, string http_params = "");
 	unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) override;
 	HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) override;
 
@@ -261,21 +246,23 @@ protected:
 private:
 	//! Request retry wrappers that refresh credentials and rebuild signed S3 requests.
 	template <class REQUEST>
-	unique_ptr<HTTPResponse> RunS3InputRequestWithAuthRefresh(S3HTTPInput &s3_input, const string &s3_url,
-	                                                          const string &method, const string &query_string,
-	                                                          const string &payload_hash, const string &content_type,
-	                                                          REQUEST request);
+	unique_ptr<HTTPResponse> RunS3SessionRequestWithAuthRefresh(HTTPRequestSession &session, const string &s3_url,
+	                                                            const string &method, const string &query_string,
+	                                                            const string &payload_hash, const string &content_type,
+	                                                            const string &content_md5, REQUEST request);
 	template <class REQUEST>
 	unique_ptr<HTTPResponse> RunS3HandleRequestWithAuthRefresh(S3FileHandle &s3_handle, const string &s3_url,
 	                                                           const string &method, bool use_version_id,
 	                                                           REQUEST request);
+	unique_ptr<HTTPResponse> RunS3BulkDeleteRequest(HTTPRequestSession &session, const string &secret_lookup_url,
+	                                                const string &body, string &result);
 };
 
 // Helper class to do s3 ListObjectV2 api call https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
 struct AWSListObjectV2 {
-	static string Request(EncryptionUtil &encryption_util, const string &path, HTTPParams &http_params,
-	                      S3AuthParams &s3_auth_params, string &continuation_token, bool use_delimiter = false,
-	                      optional_idx max_keys = optional_idx(), optional_ptr<FileOpener> opener = nullptr);
+	static string Request(EncryptionUtil &encryption_util, HTTPRequestSession &session, const string &path,
+	                      const string &continuation_token, bool use_delimiter = false,
+	                      optional_idx max_keys = optional_idx());
 	static void ParseFileList(string &aws_response, vector<OpenFileInfo> &result);
 	static vector<string> ParseCommonPrefix(string &aws_response);
 	static string ParseContinuationToken(string &aws_response);
