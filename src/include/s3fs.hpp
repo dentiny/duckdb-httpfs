@@ -133,15 +133,14 @@ struct S3RequestSnapshot : public HTTPRequestSnapshot {
 
 	S3RequestSnapshot(const HTTPFSParams &http_params, const S3AuthParams &auth_params_p, string refresh_path_p,
 	                  weak_ptr<ClientContext> client_context_p = {}, bool credential_refresh_enabled_p = true,
-	                  bool region_redirected_p = false);
-
-	bool ClientCompatibleWith(const HTTPRequestSnapshot &other) const override;
+	                  bool region_redirected_p = false, idx_t credential_generation_p = 0);
 
 	S3AuthParams auth_params;
 	string refresh_path;
 	weak_ptr<ClientContext> client_context;
 	bool credential_refresh_enabled;
 	bool region_redirected;
+	idx_t credential_generation;
 };
 
 class S3FileSystem;

@@ -24,6 +24,8 @@ struct MockS3ServerConfig {
 	string object_key = "object.bin";
 	string object_data = "abcdefghijklmnopqrstuvwxyz0123456789";
 	string stale_key_id = "STALE_KEY";
+	int stale_auth_status = 403;
+	string stale_auth_error_code = "AccessDenied";
 	string etag = "\"httpfs-refresh-test-etag\"";
 	//! Redirect signed requests to this region when their credential scope uses a different one
 	string required_region;

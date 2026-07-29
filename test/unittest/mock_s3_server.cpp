@@ -230,9 +230,10 @@ struct MockS3Server::Impl {
 		Record(request, response.status);
 	}
 
-	void SendForbidden(const httplib::Request &request, httplib::Response &response) const {
-		response.status = 403;
-		response.set_content("<Error><Code>AccessDenied</Code><Message>stale credentials</Message></Error>",
+	void SendAuthFailure(const httplib::Request &request, httplib::Response &response) const {
+		response.status = config.stale_auth_status;
+		response.set_content(StringUtil::Format("<Error><Code>%s</Code><Message>stale credentials</Message></Error>",
+		                                        config.stale_auth_error_code),
 		                     "application/xml");
 		Record(request, response.status);
 	}
@@ -339,7 +340,7 @@ struct MockS3Server::Impl {
 				return httplib::Server::HandlerResponse::Handled;
 			}
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return httplib::Server::HandlerResponse::Handled;
 			}
 			if (remaining_head_failures.load() > 0) {
@@ -355,7 +356,7 @@ struct MockS3Server::Impl {
 
 		server.Get(path, [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			if (remaining_get_failures.load() > 0) {
@@ -488,7 +489,7 @@ struct MockS3Server::Impl {
 				return;
 			}
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			if (config.transient_503_lists > 0 && transient_503_lists_sent.fetch_add(1) < config.transient_503_lists) {
@@ -506,7 +507,7 @@ struct MockS3Server::Impl {
 
 		server.Put(path, [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			if (remaining_put_failures.load() > 0) {
@@ -519,7 +520,7 @@ struct MockS3Server::Impl {
 
 		server.Post(path, [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			if (request.target.find("uploads") != string::npos && remaining_post_failures.load() > 0) {
@@ -537,7 +538,7 @@ struct MockS3Server::Impl {
 
 		auto bulk_delete = [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			SendBulkDeleteSuccess(request, response);
@@ -547,7 +548,7 @@ struct MockS3Server::Impl {
 
 		server.Delete(path, [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			if (remaining_delete_failures.load() > 0) {

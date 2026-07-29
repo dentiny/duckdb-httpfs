@@ -38,6 +38,8 @@ public:
 
 			if (!http_params.http_proxy_username.empty()) {
 				client->set_proxy_basic_auth(http_params.http_proxy_username, http_params.http_proxy_password);
+			} else {
+				client->set_proxy_basic_auth("", "");
 			}
 		} else {
 			client->set_proxy("", -1);

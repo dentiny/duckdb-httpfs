@@ -5,9 +5,11 @@
 #include "create_secret_functions.hpp"
 #include "httpfs_client.hpp"
 #include "httpfs_extension.hpp"
+#include "s3fs.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -15,6 +17,7 @@
 
 #include <array>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <new>
 #include <unordered_map>
@@ -39,8 +42,9 @@ struct ProviderStats {
 };
 
 struct ProviderRegistry {
-	std::mutex lock;
-	std::unordered_map<string, ProviderStats> stats;
+	annotated_mutex lock;
+	std::unordered_map<string, ProviderStats> stats DUCKDB_GUARDED_BY(lock);
+	std::unordered_map<string, std::function<void()>> refresh_hooks DUCKDB_GUARDED_BY(lock);
 };
 
 static ProviderRegistry &GetProviderRegistry() {
@@ -61,25 +65,60 @@ static void RecordProviderCall(const string &test_id, const string &key_id) {
 		return;
 	}
 	auto &registry = GetProviderRegistry();
-	std::lock_guard<std::mutex> lock(registry.lock);
-	auto &stats = registry.stats[test_id];
-	stats.key_ids.push_back(key_id);
-	if (key_id == STALE_KEY_ID) {
-		stats.initial_creations++;
-	} else if (key_id == FRESH_KEY_ID) {
-		stats.refresh_creations++;
+	std::function<void()> refresh_hook;
+	{
+		annotated_lock_guard<annotated_mutex> lock(registry.lock);
+		auto &stats = registry.stats[test_id];
+		stats.key_ids.push_back(key_id);
+		if (key_id == STALE_KEY_ID) {
+			stats.initial_creations++;
+		} else if (key_id == FRESH_KEY_ID) {
+			stats.refresh_creations++;
+			auto entry = registry.refresh_hooks.find(test_id);
+			if (entry != registry.refresh_hooks.end()) {
+				refresh_hook = entry->second;
+			}
+		}
+	}
+	if (refresh_hook) {
+		refresh_hook();
 	}
 }
 
 static ProviderStats GetProviderStats(const string &test_id) {
 	auto &registry = GetProviderRegistry();
-	std::lock_guard<std::mutex> lock(registry.lock);
+	annotated_lock_guard<annotated_mutex> lock(registry.lock);
 	auto entry = registry.stats.find(test_id);
 	if (entry == registry.stats.end()) {
 		return ProviderStats();
 	}
 	return entry->second;
 }
+
+static void SetProviderRefreshHook(const string &test_id, std::function<void()> refresh_hook) {
+	auto &registry = GetProviderRegistry();
+	annotated_lock_guard<annotated_mutex> lock(registry.lock);
+	registry.refresh_hooks[test_id] = std::move(refresh_hook);
+}
+
+static void ClearProviderRefreshHook(const string &test_id) {
+	auto &registry = GetProviderRegistry();
+	annotated_lock_guard<annotated_mutex> lock(registry.lock);
+	registry.refresh_hooks.erase(test_id);
+}
+
+class ProviderRefreshHook {
+public:
+	ProviderRefreshHook(string test_id_p, std::function<void()> refresh_hook) : test_id(std::move(test_id_p)) {
+		SetProviderRefreshHook(test_id, std::move(refresh_hook));
+	}
+	~ProviderRefreshHook() {
+		ClearProviderRefreshHook(test_id);
+	}
+
+private:
+	string test_id;
+};
 
 struct TestS3SecretFunctions : public CreateS3SecretFunctions {
 	static void SetTestNamedParams(CreateSecretFunction &function, string type) {
@@ -238,13 +277,15 @@ static idx_t CountObservations(const vector<MockS3RequestObservation> &observati
 }
 
 template <class OPERATION>
-static vector<MockS3RequestObservation> RunRefreshScenario(MockS3RefreshTarget refresh_target,
-                                                           const string &client_implementation, bool connection_caching,
-                                                           OPERATION operation) {
+static vector<MockS3RequestObservation>
+RunRefreshScenario(MockS3RefreshTarget refresh_target, const string &client_implementation, bool connection_caching,
+                   OPERATION operation, int stale_auth_status = 403, string stale_auth_error_code = "AccessDenied") {
 	MockS3ServerConfig config;
 	config.bucket = BUCKET;
 	config.object_key = OBJECT_KEY;
 	config.stale_key_id = STALE_KEY_ID;
+	config.stale_auth_status = stale_auth_status;
+	config.stale_auth_error_code = std::move(stale_auth_error_code);
 	config.refresh_target = refresh_target;
 	auto object_data = config.object_data;
 	MockS3Server server(std::move(config));
@@ -437,6 +478,68 @@ static void RunListGlobRefreshScenario(const string &client_implementation, bool
 	REQUIRE(MockS3HasObservation(observations, "GET", FRESH_KEY_ID, 200, string(), "list-type=2"));
 }
 
+static void RunTokenFullGetRefreshScenario(const string &client_implementation, const string &error_code) {
+	auto observations = RunRefreshScenario(
+	    MockS3RefreshTarget::FULL_GET, client_implementation, false,
+	    [](Connection &con, const string &) {
+		    RequireQueryOk(con, "SET force_download=true");
+		    auto &fs = FileSystem::GetFileSystem(*con.context);
+		    auto handle = fs.OpenFile(S3_PATH, FileFlags::FILE_FLAGS_READ);
+		    REQUIRE(handle);
+	    },
+	    400, error_code);
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 400));
+	REQUIRE(MockS3HasObservation(observations, "GET", FRESH_KEY_ID, 200));
+}
+
+static void RunTokenListRefreshScenario(const string &client_implementation, const string &error_code) {
+	auto observations = RunRefreshScenario(
+	    MockS3RefreshTarget::LIST_OBJECTS_GET, client_implementation, false,
+	    [](Connection &con, const string &) {
+		    auto result = con.Query("SELECT file FROM glob('s3://refresh-bucket/object*.bin')");
+		    REQUIRE(result);
+		    INFO((result->HasError() ? result->GetError() : string()));
+		    REQUIRE_FALSE(result->HasError());
+		    REQUIRE(result->RowCount() == 1);
+	    },
+	    400, error_code);
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 400, string(), "list-type=2"));
+	REQUIRE(MockS3HasObservation(observations, "GET", FRESH_KEY_ID, 200, string(), "list-type=2"));
+}
+
+static void RunNonAuth400NoRefreshScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.stale_auth_status = 400;
+	config.stale_auth_error_code = "InvalidRequest";
+	config.refresh_target = MockS3RefreshTarget::FULL_GET;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto test_id = ConfigureRefreshTest(db, con, server, client_implementation, false);
+	RequireQueryOk(con, "SET force_download=true");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	string error;
+	try {
+		auto &fs = FileSystem::GetFileSystem(*con.context);
+		fs.OpenFile(S3_PATH, FileFlags::FILE_FLAGS_READ);
+	} catch (std::exception &ex) {
+		error = ex.what();
+	}
+	INFO(error);
+	REQUIRE(error.find("InvalidRequest") != string::npos);
+	RequireQueryOk(con, "ROLLBACK");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 400));
+	REQUIRE_FALSE(HasRequestWithKey(observations, FRESH_KEY_ID));
+	AssertNoRefresh(test_id);
+}
+
 static void RunAllRequestRefreshScenarios(const string &client_implementation, bool connection_caching) {
 	RunHeadRefreshScenario(client_implementation, connection_caching);
 	RunFullGetRefreshScenario(client_implementation, connection_caching);
@@ -625,6 +728,7 @@ static void RunS3RegionRedirectScenario(const string &client_implementation, boo
 	LoadHTTPFSExtension(db);
 	RequireQueryOk(con, StringUtil::Format("SET httpfs_client_implementation='%s'", client_implementation));
 	RequireQueryOk(con, "SET httpfs_connection_caching=false");
+	RequireQueryOk(con, "SET enable_logging=true");
 	RequireQueryOk(con, StringUtil::Format(R"(
 CREATE SECRET s3_region_redirect (
 	TYPE S3,
@@ -668,6 +772,12 @@ CREATE SECRET s3_region_redirect (
 	}
 	REQUIRE(saw_redirect);
 	REQUIRE(saw_success);
+
+	auto logs = con.Query("SELECT count(*) FROM duckdb_logs WHERE message LIKE '%incorrect region%'");
+	REQUIRE(logs);
+	INFO((logs->HasError() ? logs->GetError() : string()));
+	REQUIRE_FALSE(logs->HasError());
+	REQUIRE(logs->GetValue(0, 0).GetValue<int64_t>() == 1);
 }
 
 static void RunMultipleStaleHandlesSingleRefreshScenario() {
@@ -704,6 +814,84 @@ static void RunMultipleStaleHandlesSingleRefreshScenario() {
 	INFO(MockS3DescribeObservations(observations));
 	REQUIRE(CountObservations(observations, "GET", STALE_KEY_ID, 403) >= handles.size());
 	REQUIRE(CountObservations(observations, "GET", FRESH_KEY_ID, 206) == handles.size());
+	AssertSingleRefresh(test_id);
+}
+
+static void PublishTestS3Region(const shared_ptr<HTTPRequestSession> &session, const string &region) {
+	for (;;) {
+		auto captured = session->Capture();
+		auto &snapshot = captured.snapshot->Cast<S3RequestSnapshot>();
+		if (snapshot.auth_params.region == region) {
+			return;
+		}
+		auto auth_params = snapshot.auth_params;
+		auth_params.SetRegion(region);
+		auto http_params = snapshot.CreateRequestParams();
+		auto replacement = make_shared_ptr<S3RequestSnapshot>(
+		    *http_params, auth_params, snapshot.refresh_path, snapshot.client_context,
+		    snapshot.credential_refresh_enabled, true, snapshot.credential_generation);
+		if (session->TryPublish(captured.snapshot, std::move(replacement)).published) {
+			return;
+		}
+	}
+}
+
+static void RunRefreshPublicationScenario(const string &client_implementation, bool invalidate_clients,
+                                          bool publish_region) {
+	MockS3ServerConfig config;
+	config.bucket = BUCKET;
+	config.object_key = OBJECT_KEY;
+	config.stale_key_id = STALE_KEY_ID;
+	config.refresh_target = MockS3RefreshTarget::RANGE_GET;
+	auto object_data = config.object_data;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto test_id = ConfigureRefreshTest(db, con, server, client_implementation, false);
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto handle = fs.OpenFile(S3_PATH, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+	REQUIRE(handle);
+	auto session = handle->Cast<S3FileHandle>().request_session;
+	ProviderRefreshHook refresh_hook(test_id, [session, invalidate_clients, publish_region]() {
+		if (invalidate_clients) {
+			session->InvalidateClients();
+		}
+		if (publish_region) {
+			PublishTestS3Region(session, "eu-west-1");
+		}
+	});
+
+	const idx_t offset = 7;
+	const idx_t read_size = 9;
+	string buffer(read_size, '\0');
+	handle->Read(QueryContext(*con.context), &buffer[0], read_size, offset);
+	REQUIRE(buffer == object_data.substr(offset, read_size));
+	RequireQueryOk(con, "COMMIT");
+
+	auto &snapshot = session->Capture().snapshot->Cast<S3RequestSnapshot>();
+	REQUIRE(snapshot.auth_params.access_key_id == FRESH_KEY_ID);
+	REQUIRE(snapshot.credential_generation == 1);
+	if (publish_region) {
+		REQUIRE(snapshot.auth_params.region == "eu-west-1");
+		REQUIRE(snapshot.region_redirected);
+	}
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 403, "bytes=7-15"));
+	REQUIRE(MockS3HasObservation(observations, "GET", FRESH_KEY_ID, 206, "bytes=7-15"));
+	if (publish_region) {
+		bool saw_merged_request = false;
+		for (const auto &observation : observations) {
+			if (observation.method == "GET" && observation.key_id == FRESH_KEY_ID &&
+			    observation.region == "eu-west-1" && observation.status == 206) {
+				saw_merged_request = true;
+			}
+		}
+		REQUIRE(saw_merged_request);
+	}
 	AssertSingleRefresh(test_id);
 }
 
@@ -1072,6 +1260,23 @@ TEST_CASE("HTTPFS refreshes S3 credentials across request methods", "[httpfs][s3
 	}
 }
 
+TEST_CASE("HTTPFS refreshes S3 credentials for token-specific HTTP 400 errors", "[httpfs][s3][refresh]") {
+	for (const string client_implementation : {"httplib", "curl"}) {
+		DYNAMIC_SECTION(client_implementation << " refreshes ExpiredToken during file open") {
+			RunTokenFullGetRefreshScenario(client_implementation, "ExpiredToken");
+		}
+		DYNAMIC_SECTION(client_implementation << " refreshes InvalidToken during LIST") {
+			RunTokenListRefreshScenario(client_implementation, "InvalidToken");
+		}
+		DYNAMIC_SECTION(client_implementation << " refreshes TokenRefreshRequired during LIST") {
+			RunTokenListRefreshScenario(client_implementation, "TokenRefreshRequired");
+		}
+		DYNAMIC_SECTION(client_implementation << " does not refresh a generic HTTP 400") {
+			RunNonAuth400NoRefreshScenario(client_implementation);
+		}
+	}
+}
+
 TEST_CASE("HTTPFS can disable S3 credential refresh", "[httpfs][s3][refresh]") {
 	SECTION("range reads fail without refresh") {
 		RunRangeRefreshDisabledScenario();
@@ -1101,6 +1306,24 @@ TEST_CASE("HTTPFS streams full GETs without Content-Length", "[httpfs][s3][strea
 
 TEST_CASE("HTTPFS reuses one S3 credential refresh across stale handles", "[httpfs][s3][refresh]") {
 	RunMultipleStaleHandlesSingleRefreshScenario();
+}
+
+TEST_CASE("S3 credential publication is independent from client invalidation", "[httpfs][s3][refresh]") {
+	SECTION("httplib") {
+		RunRefreshPublicationScenario("httplib", true, false);
+	}
+	SECTION("curl") {
+		RunRefreshPublicationScenario("curl", true, false);
+	}
+}
+
+TEST_CASE("S3 credential refresh composes with a concurrent region publication", "[httpfs][s3][refresh]") {
+	SECTION("httplib") {
+		RunRefreshPublicationScenario("httplib", false, true);
+	}
+	SECTION("curl") {
+		RunRefreshPublicationScenario("curl", false, true);
+	}
 }
 
 TEST_CASE("HTTPFS bulk delete follows a refreshed S3 endpoint", "[httpfs][s3][refresh]") {

@@ -121,39 +121,7 @@ unique_ptr<HTTPParams> HTTPFSUtil::InitializeParameters(optional_ptr<FileOpener>
 }
 
 unique_ptr<HTTPParams> HTTPFSParams::Clone() const {
-	auto result = make_uniq<HTTPFSParams>(http_util);
-	result->timeout = timeout;
-	result->timeout_usec = timeout_usec;
-	result->retries = retries;
-	result->retry_wait_ms = retry_wait_ms;
-	result->retry_backoff = retry_backoff;
-	result->keep_alive = keep_alive;
-	result->follow_location = follow_location;
-	result->override_verify_ssl = override_verify_ssl;
-	result->verify_ssl = verify_ssl;
-	result->http_proxy = http_proxy;
-	result->http_proxy_port = http_proxy.empty() ? 0 : http_proxy_port;
-	result->http_proxy_username = http_proxy_username;
-	result->http_proxy_password = http_proxy_password;
-	result->extra_headers = extra_headers;
-	result->logger = logger;
-
-	result->force_download = force_download;
-	result->auto_fallback_to_full_download = auto_fallback_to_full_download;
-	result->enable_server_cert_verification = enable_server_cert_verification;
-	result->enable_curl_server_cert_verification = enable_curl_server_cert_verification;
-	result->hf_max_per_page = hf_max_per_page;
-	result->ca_cert_file = ca_cert_file;
-	result->bearer_token = bearer_token;
-	result->unsafe_disable_etag_checks = unsafe_disable_etag_checks;
-	result->s3_version_id_pinning = s3_version_id_pinning;
-	result->state = state;
-	result->user_agent = user_agent;
-	result->pre_merged_headers = pre_merged_headers;
-	result->force_download_threshold = force_download_threshold;
-	result->client_reuse_mode = client_reuse_mode;
-	result->httpfs_util = httpfs_util;
-	return std::move(result);
+	return make_uniq<HTTPFSParams>(*this);
 }
 
 static string StripETagQuotes(const string &etag) {
@@ -589,7 +557,7 @@ bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders
 		if (res->HasRequestError()) {
 			// Special case: we can do a retry with a full file download
 			if (RespondedWithRangeRequestNotSupported(*res)) {
-				if (hfh.request_session->Capture().snapshot->auto_fallback_to_full_download) {
+				if (hfh.request_session->Capture().snapshot->Params().auto_fallback_to_full_download) {
 					return false;
 				}
 			}
@@ -745,7 +713,7 @@ void HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 	const auto downloaded_length = cached_file->GetSize();
 	if (downloaded_length != head_reported_length) {
 		hfh.file_state->InvalidateCachedFile();
-		hfh.request_session->Capture().snapshot->state->EraseFileState(hfh.path);
+		hfh.request_session->Capture().snapshot->Params().state->EraseFileState(hfh.path);
 		throw HTTPException(Exception::ConstructMessage(
 		    "The size reported by HEAD for '%s' was %llu bytes, but the full GET downloaded %llu bytes. You can try "
 		    "to resolve this by enabling `SET force_download=true`",
@@ -965,7 +933,7 @@ void HTTPFileHandle::LoadFileInfo() {
 				    range_res->status != HTTPStatusCode::Accepted_202 && range_res->status != HTTPStatusCode::OK_200) {
 					// It failed again, check whether we can fall back to full download
 					if (RespondedWithRangeRequestNotSupported(*range_res) &&
-					    request_session->Capture().snapshot->auto_fallback_to_full_download) {
+					    request_session->Capture().snapshot->Params().auto_fallback_to_full_download) {
 						force_full_download = true;
 					} else {
 						throw hfs.GetHTTPError(*this, *range_res, path);
@@ -992,7 +960,8 @@ void HTTPFileHandle::LoadFileInfo() {
 	if (res->headers.HasHeader("ETag")) {
 		etag = res->headers.GetHeaderValue("ETag");
 	}
-	if (request_session->Capture().snapshot->s3_version_id_pinning && res->headers.HasHeader("x-amz-version-id")) {
+	if (request_session->Capture().snapshot->Params().s3_version_id_pinning &&
+	    res->headers.HasHeader("x-amz-version-id")) {
 		version_id = res->headers.GetHeaderValue("x-amz-version-id");
 	}
 	if (res->headers.HasHeader("Accept-Ranges")) {
@@ -1059,9 +1028,9 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 	if (!request_params->state) {
 		request_params->state = make_shared_ptr<HTTPState>();
 	}
-	request_session->Publish(captured, CreateRequestSnapshot(*request_params));
+	request_session->TryPublish(captured.snapshot, CreateRequestSnapshot(*request_params));
 	auto request_snapshot = request_session->Capture().snapshot;
-	file_state = request_snapshot->state->GetFileState(path);
+	file_state = request_snapshot->Params().state->GetFileState(path);
 
 	if (opener) {
 		TryAddLogger(*opener);
@@ -1071,7 +1040,7 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 
 	bool should_write_cache = false;
 	if (flags.OpenForReading()) {
-		if (request_snapshot->force_download) {
+		if (request_snapshot->Params().force_download) {
 			length = hfs.FullDownload(*this, should_write_cache)->GetSize();
 			return;
 		}
@@ -1096,9 +1065,9 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 
 	if (flags.OpenForReading()) {
 
-		const auto has_cache_state = (request_snapshot->state != nullptr) && (length == 0);
+		const auto has_cache_state = (request_snapshot->Params().state != nullptr) && (length == 0);
 		const auto always_download = force_full_download;
-		const auto meets_threshold = (length < request_snapshot->force_download_threshold) && (length != 0);
+		const auto meets_threshold = (length < request_snapshot->Params().force_download_threshold) && (length != 0);
 
 		const auto should_full_download = has_cache_state || meets_threshold || always_download;
 
