@@ -25,6 +25,19 @@ static void SetCACertFile(ClientContext &context, SetScope, Value &parameter) {
 	parameter = Value(fs.CanonicalizePath(value, opener));
 }
 
+static void SetExtraHTTPHeaders(ClientContext &, SetScope, Value &parameter) {
+	if (parameter.IsNull()) {
+		throw InvalidInputException("NULL is not a valid option for extra_http_headers");
+	}
+	for (const auto &entry : MapValue::GetChildren(parameter)) {
+		auto key_value = StructValue::GetChildren(entry);
+		if (key_value[1].IsNull()) {
+			throw InvalidInputException("extra_http_headers value for \"%s\" must not be NULL",
+			                            key_value[0].GetValue<string>());
+		}
+	}
+}
+
 static void SetHTTPClientImplementation(ClientContext &context, SetScope, Value &parameter) {
 	auto &config = DBConfig::GetConfig(context);
 	auto value = StringValue::Get(parameter);
@@ -73,6 +86,10 @@ void HTTPSettings::Register(DBConfig &config) {
 	    "http_keep_alive",
 	    "Keep alive connections. Setting this to false can help when running into connection failures",
 	    LogicalType::BOOLEAN, Value(HTTPParams::DEFAULT_KEEP_ALIVE));
+	config.AddExtensionOption("extra_http_headers", "Extra HTTP headers added to every request",
+	                          LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
+	                          Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, {}, {}), SetExtraHTTPHeaders,
+	                          SetScope::GLOBAL);
 	config.AddExtensionOption("force_download", "Forces upfront download of file", LogicalType::BOOLEAN, Value(false));
 	config.AddExtensionOption("force_download_threshold",
 	                          "Forces upfront download of files smaller than the given size in bytes",
