@@ -137,7 +137,8 @@ static unique_ptr<HTTPResponse> SendSessionRequest(HTTPRequestSession &session,
 	auto lease = session.AcquireClient(captured, request_params, request.proto_host_port);
 	try {
 		auto response = request_params.http_util.Request(request, lease.Client());
-		if (response && (response->HasRequestError() || static_cast<int>(response->status) >= 400)) {
+		// A completed HTTP response leaves the transport reusable, regardless of its status.
+		if (response && response->HasRequestError()) {
 			lease.Invalidate();
 		}
 		return response;

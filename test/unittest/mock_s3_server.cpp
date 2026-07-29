@@ -104,6 +104,7 @@ struct MockS3Server::Impl {
 		remaining_get_failures = config.transient_get_failures;
 		remaining_range_behavior_requests = config.range_behavior_requests;
 		remaining_head_failures = config.transient_head_failures;
+		remaining_head_not_found = config.head_not_found_requests;
 		remaining_delete_failures = config.transient_delete_failures;
 		remaining_post_failures = config.transient_post_failures;
 		remaining_complete_post_failures = config.transient_complete_post_failures;
@@ -343,6 +344,12 @@ struct MockS3Server::Impl {
 				SendAuthFailure(request, response);
 				return httplib::Server::HandlerResponse::Handled;
 			}
+			if (remaining_head_not_found.load() > 0) {
+				remaining_head_not_found--;
+				response.status = 404;
+				Record(request, response.status);
+				return httplib::Server::HandlerResponse::Handled;
+			}
 			if (remaining_head_failures.load() > 0) {
 				remaining_head_failures--;
 				SendS3Error400(request, response, config.failure_is_request_timeout);
@@ -571,6 +578,7 @@ struct MockS3Server::Impl {
 	mutable std::atomic<idx_t> remaining_get_failures {0};
 	mutable std::atomic<idx_t> remaining_range_behavior_requests {0};
 	mutable std::atomic<idx_t> remaining_head_failures {0};
+	mutable std::atomic<idx_t> remaining_head_not_found {0};
 	mutable std::atomic<idx_t> remaining_delete_failures {0};
 	mutable std::atomic<idx_t> remaining_post_failures {0};
 	mutable std::atomic<idx_t> remaining_complete_post_failures {0};

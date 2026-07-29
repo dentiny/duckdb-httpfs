@@ -276,6 +276,18 @@ static idx_t CountObservations(const vector<MockS3RequestObservation> &observati
 	return result;
 }
 
+static vector<int> ObservationPorts(const vector<MockS3RequestObservation> &observations, const string &method,
+                                    const string &key_id, int status, const string &range = string()) {
+	vector<int> result;
+	for (auto &observation : observations) {
+		if (observation.method == method && observation.key_id == key_id && observation.status == status &&
+		    observation.range == range) {
+			result.push_back(observation.remote_port);
+		}
+	}
+	return result;
+}
+
 template <class OPERATION>
 static vector<MockS3RequestObservation>
 RunRefreshScenario(MockS3RefreshTarget refresh_target, const string &client_implementation, bool connection_caching,
@@ -1026,8 +1038,8 @@ static void RunMultipartInitNotRetriedScenario(const string &client_implementati
 	REQUIRE(CountObservationsTarget(observations, "POST", 400, "uploads") == 1);
 }
 
-// With curl connection caching, the retry must run on a fresh connection instead of the stalled cached one.
-static void RunCachedConnectionRetryScenario() {
+// A RequestTimeout retry must run on a fresh connection instead of the stalled one.
+static void RunFreshConnectionRetryScenario(const string &client_implementation, bool connection_caching) {
 	MockS3ServerConfig config;
 	config.bucket = BUCKET;
 	config.object_key = OBJECT_KEY;
@@ -1038,7 +1050,7 @@ static void RunCachedConnectionRetryScenario() {
 
 	DuckDB db(nullptr);
 	Connection con(db);
-	ConfigureRefreshTest(db, con, server, "curl", true);
+	ConfigureRefreshTest(db, con, server, client_implementation, connection_caching);
 
 	RequireQueryOk(con, "SET http_retries=3");
 	RequireQueryOk(con, "SET http_retry_wait_ms=1");
@@ -1177,6 +1189,12 @@ static void RunHeadNotRetriedScenario(const string &client_implementation) {
 	INFO(MockS3DescribeObservations(observations));
 	REQUIRE(CountObservations(observations, "HEAD", STALE_KEY_ID, 400) == 1);
 	REQUIRE(MockS3HasObservation(observations, "GET", STALE_KEY_ID, 206, "bytes=0-1"));
+	auto error_ports = ObservationPorts(observations, "HEAD", STALE_KEY_ID, 400);
+	auto success_ports = ObservationPorts(observations, "GET", STALE_KEY_ID, 206, "bytes=0-1");
+	REQUIRE(error_ports.size() == 1);
+	REQUIRE(success_ports.size() == 1);
+	REQUIRE(error_ports[0] != 0);
+	REQUIRE(error_ports[0] == success_ports[0]);
 }
 
 // Like multipart-init, a multipart-complete POST must not be replayed even on RequestTimeout.
@@ -1243,8 +1261,14 @@ TEST_CASE("HTTPFS retries transient S3 RequestTimeout across request types", "[h
 	SECTION("curl") {
 		RunAllTransientRetryScenarios("curl");
 	}
-	SECTION("curl with connection caching retries on a fresh connection") {
-		RunCachedConnectionRetryScenario();
+	SECTION("httplib retries RequestTimeout on a fresh connection") {
+		RunFreshConnectionRetryScenario("httplib", false);
+	}
+	SECTION("session-local curl retries RequestTimeout on a fresh connection") {
+		RunFreshConnectionRetryScenario("curl", false);
+	}
+	SECTION("shared curl retries RequestTimeout on a fresh connection") {
+		RunFreshConnectionRetryScenario("curl", true);
 	}
 }
 

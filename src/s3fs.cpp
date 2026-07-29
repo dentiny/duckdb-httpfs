@@ -614,11 +614,12 @@ static unique_ptr<HTTPResponse> SendS3SessionRequest(HTTPRequestSession &session
 	auto lease = session.AcquireClient(captured, params, request.proto_host_port);
 	try {
 		auto response = params.http_util.Request(request, lease.Client());
-		if (response && (IsS3RequestTimeout(*response) || response->HasRequestError() ||
-		                 static_cast<int>(response->status) >= 400)) {
+		auto request_timeout = response && IsS3RequestTimeout(*response);
+		// A completed S3 response leaves the transport reusable unless it reports a stalled connection.
+		if (response && (request_timeout || response->HasRequestError())) {
 			lease.Invalidate();
 		}
-		if (response && IsS3RequestTimeout(*response)) {
+		if (request_timeout) {
 			invalidate_connections();
 		}
 		return response;

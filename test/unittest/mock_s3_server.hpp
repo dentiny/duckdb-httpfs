@@ -56,6 +56,8 @@ struct MockS3ServerConfig {
 	bool block_full_get_until_released = false;
 	//! Number of object HEADs to fail with a 400 before succeeding
 	idx_t transient_head_failures = 0;
+	//! Number of object HEADs to answer with 404 before succeeding
+	idx_t head_not_found_requests = 0;
 	//! Number of object DELETEs to fail with a 400 before succeeding
 	idx_t transient_delete_failures = 0;
 	//! Number of multipart-init POSTs (uploads=) to fail with a 400 before succeeding
