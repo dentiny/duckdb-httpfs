@@ -10,6 +10,7 @@ endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Werror=thread-safety)
+  add_compile_options(-Werror=mismatched-tags)
 endif()
 
 if (NOT EMSCRIPTEN)

@@ -2,7 +2,7 @@
 
 namespace duckdb {
 
-class DBConfig;
+struct DBConfig;
 
 struct HTTPSettings {
 	static void Register(DBConfig &config);
