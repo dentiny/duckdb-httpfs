@@ -153,7 +153,9 @@ CreateSecretInput CreateS3SecretFunctions::GenerateRefreshSecretInfo(const Secre
 	result.type = kv_secret.GetType();
 	result.name = kv_secret.GetName();
 	result.provider = Identifier(kv_secret.GetProvider());
-	result.storage_type = Identifier(secret_entry.storage_mode);
+	if (result.persist_type != SecretPersistType::TRANSACTION) {
+		result.storage_type = Identifier(secret_entry.storage_mode);
+	}
 	result.scope = kv_secret.GetScope();
 
 	auto result_child_count = StructType::GetChildCount(refresh_info.type());

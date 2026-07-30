@@ -8,12 +8,14 @@
 #include "s3fs.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/secret/secret.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 
 #include <array>
 #include <atomic>
@@ -172,6 +174,26 @@ static void RequireQueryOk(Connection &con, const string &query) {
 static string NextTestId() {
 	static std::atomic<idx_t> next_id(0);
 	return StringUtil::Format("httpfs_refresh_test_%llu", static_cast<unsigned long long>(++next_id));
+}
+
+static CreateSecretInput CreateTransactionRefreshInput(const string &test_id) {
+	CreateSecretInput input;
+	input.type = "s3";
+	input.provider = TEST_PROVIDER;
+	input.name = "transaction_refresh_s3";
+	input.scope = {"s3://refresh-bucket/"};
+	input.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
+	input.persist_type = SecretPersistType::TRANSACTION;
+	input.options["key_id"] = STALE_KEY_ID;
+	input.options["secret"] = STALE_SECRET;
+	input.options["test_id"] = test_id;
+
+	InsertionOrderPreservingMap<string> refresh_info;
+	refresh_info.insert("key_id", FRESH_KEY_ID);
+	refresh_info.insert("secret", FRESH_SECRET);
+	refresh_info.insert("test_id", test_id);
+	input.options["refresh_info"] = Value::MAP(refresh_info);
+	return input;
 }
 
 static string ConfigureRefreshTest(DuckDB &db, Connection &con, MockS3Server &server,
@@ -1282,6 +1304,40 @@ TEST_CASE("HTTPFS refreshes S3 credentials across request methods", "[httpfs][s3
 	SECTION("curl without connection caching") {
 		RunAllRequestRefreshScenarios("curl", false);
 	}
+}
+
+TEST_CASE("HTTPFS preserves transaction-scoped S3 secrets during refresh", "[httpfs][s3][refresh]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	LoadHTTPFSExtension(db);
+	RegisterRefreshTestProvider(db);
+
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto test_id = NextTestId();
+	auto input = CreateTransactionRefreshInput(test_id);
+	auto &secret_manager = SecretManager::Get(*db.instance);
+	auto created_secret = secret_manager.CreateSecret(*con.context, input);
+	REQUIRE(created_secret);
+	REQUIRE(created_secret->persist_type == SecretPersistType::TRANSACTION);
+	REQUIRE(created_secret->storage_mode == SecretManager::TRANSACTION_STORAGE_NAME);
+
+	REQUIRE(CreateS3SecretFunctions::TryRefreshS3Secret(*con.context, *created_secret));
+	AssertSingleRefresh(test_id);
+
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*con.context);
+	auto refreshed_secret = secret_manager.GetSecretByName(transaction, input.name.GetIdentifierName());
+	REQUIRE(refreshed_secret);
+	REQUIRE(refreshed_secret->persist_type == SecretPersistType::TRANSACTION);
+	REQUIRE(refreshed_secret->storage_mode == SecretManager::TRANSACTION_STORAGE_NAME);
+	auto secret_string = refreshed_secret->secret->ToString(SecretDisplayType::UNREDACTED);
+	REQUIRE(StringUtil::Contains(secret_string, StringUtil::Format("key_id=%s", FRESH_KEY_ID)));
+	REQUIRE_FALSE(StringUtil::Contains(secret_string, StringUtil::Format("key_id=%s", STALE_KEY_ID)));
+
+	RequireQueryOk(con, "COMMIT");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto next_transaction = CatalogTransaction::GetSystemCatalogTransaction(*con.context);
+	REQUIRE_FALSE(secret_manager.GetSecretByName(next_transaction, input.name.GetIdentifierName()));
+	RequireQueryOk(con, "ROLLBACK");
 }
 
 TEST_CASE("HTTPFS refreshes S3 credentials for token-specific HTTP 400 errors", "[httpfs][s3][refresh]") {
