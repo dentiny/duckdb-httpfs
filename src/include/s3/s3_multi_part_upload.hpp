@@ -15,7 +15,7 @@ public:
 		uploading = false;
 	}
 
-	void *Ptr() {
+	data_ptr_t Ptr() {
 		return buffer.GetDataMutable();
 	}
 
@@ -64,18 +64,18 @@ public:
 	size_t part_size;
 
 	//! Write buffers for this file
-	mutex write_buffers_lock;
-	unordered_map<uint16_t, shared_ptr<S3WriteBuffer>> write_buffers;
+	annotated_mutex write_buffers_lock;
+	unordered_map<uint16_t, shared_ptr<S3WriteBuffer>> write_buffers DUCKDB_GUARDED_BY(write_buffers_lock);
 
 	//! Synchronization for upload threads
-	mutex uploads_in_progress_lock;
+	annotated_mutex uploads_in_progress_lock;
 	std::condition_variable uploads_in_progress_cv;
 	std::condition_variable final_flush_cv;
-	uint16_t uploads_in_progress;
+	uint16_t uploads_in_progress DUCKDB_GUARDED_BY(uploads_in_progress_lock);
 
 	//! Etags are stored for each part
-	mutex part_etags_lock;
-	unordered_map<uint16_t, string> part_etags;
+	annotated_mutex part_etags_lock;
+	unordered_map<uint16_t, string> part_etags DUCKDB_GUARDED_BY(part_etags_lock);
 
 	//! Info for upload
 	atomic<uint16_t> parts_uploaded;

@@ -67,19 +67,18 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunDeleteRequest(string url, HTTPHeader
 }
 
 unique_ptr<HTTPResponse> HTTPFileSystem::RunPostRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-                                                        string &buffer_out, char *buffer_in, idx_t buffer_in_len,
-                                                        HTTPSendCallback send_request) {
-	PostRequestInfo post_request(url, header_map, http_params, const_data_ptr_cast(buffer_in), buffer_in_len);
+                                                        string &buffer_out, const_data_ptr_t buffer_in,
+                                                        idx_t buffer_in_len, HTTPSendCallback send_request) {
+	PostRequestInfo post_request(url, header_map, http_params, buffer_in, buffer_in_len);
 	auto result = send_request(post_request);
 	buffer_out = std::move(post_request.buffer_out);
 	return result;
 }
 
 unique_ptr<HTTPResponse> HTTPFileSystem::RunPutRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-                                                       char *buffer_in, idx_t buffer_in_len, const string &content_type,
-                                                       HTTPSendCallback send_request) {
-	PutRequestInfo put_request(url, header_map, http_params, const_data_ptr_cast(buffer_in), buffer_in_len,
-	                           content_type);
+                                                       const_data_ptr_t buffer_in, idx_t buffer_in_len,
+                                                       const string &content_type, HTTPSendCallback send_request) {
+	PutRequestInfo put_request(url, header_map, http_params, buffer_in, buffer_in_len, content_type);
 	return send_request(put_request);
 }
 
@@ -133,11 +132,128 @@ static void SetRangeRequestNotSupported(HTTPResponse &response) {
 	}
 }
 
+struct HTTPRangeRequestContext {
+	HTTPRangeRequestContext(HTTPFileHandle &handle_p, const HTTPReadConfig &read_config_p, string url_p,
+	                        string range_expression_p, data_ptr_t buffer_out_p, idx_t buffer_out_len_p,
+	                        RangeRequestState::Guard range_request_p,
+	                        std::function<HTTPException(const HTTPResponse &)> get_error_p,
+	                        std::function<void(const HTTPResponse &)> validate_response_p)
+	    : handle(handle_p), read_config(read_config_p), url(std::move(url_p)),
+	      range_expression(std::move(range_expression_p)), buffer_out(buffer_out_p), buffer_out_len(buffer_out_len_p),
+	      range_request(std::move(range_request_p)), get_error(std::move(get_error_p)),
+	      validate_response(std::move(validate_response_p)) {
+	}
+
+	bool HandleResponse(const HTTPResponse &response) {
+		if (response.status == HTTPStatusCode::PreconditionFailed_412 &&
+		    read_config.condition.type == HTTPReadConditionType::ETAG) {
+			return false;
+		}
+		if (static_cast<int>(response.status) >= 400) {
+			throw get_error(response);
+		}
+		if (static_cast<int>(response.status) >= 300) {
+			return true;
+		}
+
+		out_offset = 0;
+		validate_response(response);
+		if (!ValidateContentLength(response)) {
+			return false;
+		}
+		if (response.status == HTTPStatusCode::PartialContent_206) {
+			range_request.MarkSupported();
+		}
+		return true;
+	}
+
+	bool HandleContent(const_data_ptr_t data, idx_t data_length) {
+		if (!buffer_out) {
+			return true;
+		}
+		if (out_offset > buffer_out_len || data_length > buffer_out_len - out_offset) {
+			throw HTTPException("Server sent back more data than expected, `SET force_download=true` might "
+			                    "help in this case");
+		}
+		memcpy(buffer_out + out_offset, data, data_length);
+		out_offset += data_length;
+		return true;
+	}
+
+	unique_ptr<HTTPResponse> Finalize(unique_ptr<HTTPResponse> response, const GetRequestInfo &request) {
+		if (range_request_not_supported) {
+			D_ASSERT(response);
+			SetRangeRequestNotSupported(*response);
+			return response;
+		}
+		ValidateReadLength(response);
+		if (IsSuccessfulResponse(response)) {
+			range_request.MarkSupported();
+			RecordNetworkSample(request);
+		}
+		return response;
+	}
+
+private:
+	bool ValidateContentLength(const HTTPResponse &response) {
+		if (!response.HasHeader("Content-Length")) {
+			return true;
+		}
+		try {
+			auto content_length = NumericCast<idx_t>(stoull(response.GetHeaderValue("Content-Length")));
+			if (content_length == buffer_out_len) {
+				return true;
+			}
+			range_request_not_supported = true;
+			range_request.MarkNotSupported();
+			return false;
+		} catch (const std::exception &) {
+			// A malformed Content-Length cannot be used to validate range support.
+			return true;
+		}
+	}
+
+	void ValidateReadLength(const unique_ptr<HTTPResponse> &response) const {
+		if (!response || response->HasRequestError() || !response->Success() || !buffer_out ||
+		    out_offset == buffer_out_len) {
+			return;
+		}
+		throw IOException("Short read for HTTP GET to '%s': requested range %s (%llu bytes), but received %llu bytes",
+		                  url, range_expression, static_cast<unsigned long long>(buffer_out_len),
+		                  static_cast<unsigned long long>(out_offset));
+	}
+
+	static bool IsSuccessfulResponse(const unique_ptr<HTTPResponse> &response) {
+		return response && (response->Success() || response->status == HTTPStatusCode::PartialContent_206 ||
+		                    response->status == HTTPStatusCode::Accepted_202);
+	}
+
+	void RecordNetworkSample(const GetRequestInfo &request) {
+		const auto elapsed_nanos =
+		    TimePoint::ElapsedNanos(request.request_monotonic_start, request.request_monotonic_end);
+		const double total_seconds = elapsed_nanos > 0 ? static_cast<double>(elapsed_nanos) / 1e9 : 0;
+		const idx_t bytes = request.bytes_received != 0 ? request.bytes_received : buffer_out_len;
+		handle.RecordNetworkSample(total_seconds, bytes, request.have_time_to_fst_byte, request.time_to_fst_byte_sec);
+	}
+
+	HTTPFileHandle &handle;
+	const HTTPReadConfig &read_config;
+	const string url;
+	const string range_expression;
+	data_ptr_t buffer_out;
+	const idx_t buffer_out_len;
+	RangeRequestState::Guard range_request;
+	std::function<HTTPException(const HTTPResponse &)> get_error;
+	std::function<void(const HTTPResponse &)> validate_response;
+	idx_t out_offset = 0;
+	bool range_request_not_supported = false;
+};
+
 unique_ptr<HTTPResponse>
 HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh, string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-                                   const HTTPReadConfig &read_config, idx_t file_offset, char *buffer_out,
+                                   const HTTPReadConfig &read_config, idx_t file_offset, data_ptr_t buffer_out,
                                    idx_t buffer_out_len, HTTPErrorCallback get_error, HTTPSendCallback send_request) {
-	string range_expr = "bytes=" + to_string(file_offset) + "-" + to_string(file_offset + buffer_out_len - 1);
+	auto range_expr = "bytes=" + to_string(file_offset) + "-" + to_string(file_offset + buffer_out_len - 1);
 	header_map["Range"] = range_expr;
 	ApplyReadCondition(header_map, read_config);
 
@@ -149,79 +265,15 @@ HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh, string url, HTTPHeaders 
 		return response;
 	}
 
-	idx_t out_offset = 0;
-	bool range_request_not_supported = false;
+	HTTPRangeRequestContext context(
+	    hfh, read_config, url, range_expr, buffer_out, buffer_out_len, std::move(range_request), std::move(get_error),
+	    [&](const HTTPResponse &response) { ValidateResponseETag(hfh, read_config, response); });
 	GetRequestInfo get_request(
-	    url, header_map, http_params,
-	    [&](const HTTPResponse &response) {
-		    if (response.status == HTTPStatusCode::PreconditionFailed_412 &&
-		        read_config.condition.type == HTTPReadConditionType::ETAG) {
-			    return false;
-		    }
-		    if (static_cast<int>(response.status) >= 400) {
-			    throw get_error(response);
-		    }
-		    if (static_cast<int>(response.status) < 300) {
-			    out_offset = 0;
-			    ValidateResponseETag(hfh, read_config, response);
-
-			    if (response.HasHeader("Content-Length")) {
-				    unsigned long long content_length;
-				    bool parsed = false;
-				    try {
-					    content_length = stoull(response.GetHeaderValue("Content-Length"));
-					    parsed = true;
-				    } catch (const std::exception &) {
-					    // Content-Length header contains a non-numeric value, so skip validation.
-				    }
-				    if (parsed && (idx_t)content_length != buffer_out_len) {
-					    range_request_not_supported = true;
-					    range_request.MarkNotSupported();
-					    return false;
-				    }
-			    }
-			    if (response.status == HTTPStatusCode::PartialContent_206) {
-				    range_request.MarkSupported();
-			    }
-		    }
-		    return true;
-	    },
-	    [&](const_data_ptr_t data, idx_t data_length) {
-		    if (buffer_out != nullptr) {
-			    if (data_length + out_offset > buffer_out_len) {
-				    throw HTTPException("Server sent back more data than expected, `SET force_download=true` might "
-				                        "help in this case");
-			    }
-			    memcpy(buffer_out + out_offset, data, data_length);
-			    out_offset += data_length;
-		    }
-		    return true;
-	    });
+	    url, header_map, http_params, [&](const HTTPResponse &response) { return context.HandleResponse(response); },
+	    [&](const_data_ptr_t data, idx_t data_length) { return context.HandleContent(data, data_length); });
 
 	get_request.try_request = read_config.auto_fallback_to_full_download;
-	auto response = send_request(get_request);
-	if (range_request_not_supported) {
-		SetRangeRequestNotSupported(*response);
-		return response;
-	}
-	if (response && !response->HasRequestError() && response->Success() && buffer_out != nullptr &&
-	    out_offset != buffer_out_len) {
-		throw IOException("Short read for HTTP GET to '%s': requested range %s (%llu bytes), but received %llu bytes",
-		                  url, range_expr, static_cast<unsigned long long>(buffer_out_len),
-		                  static_cast<unsigned long long>(out_offset));
-	}
-
-	if (response && (response->Success() || response->status == HTTPStatusCode::PartialContent_206 ||
-	                 response->status == HTTPStatusCode::Accepted_202)) {
-		range_request.MarkSupported();
-		const auto elapsed_nanos =
-		    TimePoint::ElapsedNanos(get_request.request_monotonic_start, get_request.request_monotonic_end);
-		const double total_seconds = elapsed_nanos > 0 ? static_cast<double>(elapsed_nanos) / 1e9 : 0;
-		const idx_t bytes = get_request.bytes_received != 0 ? get_request.bytes_received : buffer_out_len;
-		hfh.RecordNetworkSample(total_seconds, bytes, get_request.have_time_to_fst_byte,
-		                        get_request.time_to_fst_byte_sec);
-	}
-	return response;
+	return context.Finalize(send_request(get_request), get_request);
 }
 
 unique_ptr<HTTPResponse> HTTPFileSystem::HeadRequest(FileHandle &handle, string url, HTTPHeaders header_map) {
@@ -301,7 +353,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRequest(FileHandle &handle, string u
 
 unique_ptr<HTTPResponse> HTTPFileSystem::GetRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map,
                                                          const HTTPReadConfig &read_config, idx_t file_offset,
-                                                         char *buffer_out, idx_t buffer_out_len) {
+                                                         data_ptr_t buffer_out, idx_t buffer_out_len) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
 	auto captured = hfh.request_session->Capture();
 	captured.snapshot->AddConfiguredHeaders(header_map);

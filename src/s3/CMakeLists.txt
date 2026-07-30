@@ -5,5 +5,6 @@ target_sources(
           s3_list.cpp
           s3_multi_part_upload.cpp
           s3_request.cpp
+          s3_settings.cpp
           s3_url.cpp
           s3fs.cpp)

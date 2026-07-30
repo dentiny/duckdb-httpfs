@@ -12,7 +12,7 @@ public:
 		Initialize(http_params);
 	}
 	void Initialize(HTTPParams &http_p) override {
-		HTTPFSParams &http_params = (HTTPFSParams &)http_p;
+		auto &http_params = http_p.Cast<HTTPFSParams>();
 		client->set_follow_location(http_params.follow_location);
 		client->set_keep_alive(http_params.keep_alive);
 		if (!http_params.ca_cert_file.empty()) {
@@ -54,8 +54,75 @@ public:
 		}
 	}
 
+	class GetTransferState {
+	public:
+		GetTransferState(HTTPFSClient &client_p, GetRequestInfo &request_p)
+		    : client(client_p), request(request_p), request_monotonic_start(TimePoint::Tick()) {
+		}
+
+		bool HandleResponse(const duckdb_httplib_openssl::Response &response) {
+			auto http_response = client.TransformResponse(response);
+			if (static_cast<int>(http_response->status) >= 400) {
+				deferred_response = std::move(http_response);
+				return true;
+			}
+			if (request.response_handler && !request.response_handler(*http_response)) {
+				stopped_response = std::move(http_response);
+				return false;
+			}
+			return true;
+		}
+
+		bool HandleContent(const char *data, size_t data_length) {
+			RecordFirstByte();
+			auto chunk_size = NumericCast<idx_t>(data_length);
+			total_bytes += chunk_size;
+			if (client.state) {
+				client.state->total_bytes_received += chunk_size;
+			}
+			if (deferred_response) {
+				deferred_response->body.append(data, data_length);
+				return true;
+			}
+			return !request.content_handler || request.content_handler(const_data_ptr_cast(data), chunk_size);
+		}
+
+		unique_ptr<HTTPResponse> Finish(duckdb_httplib_openssl::Result result) {
+			request.bytes_received = total_bytes;
+			if (deferred_response) {
+				if (request.response_handler) {
+					request.response_handler(*deferred_response);
+				}
+				return std::move(deferred_response);
+			}
+			if (stopped_response) {
+				return std::move(stopped_response);
+			}
+			return client.TransformResult(std::move(result));
+		}
+
+	private:
+		void RecordFirstByte() {
+			if (!first_chunk) {
+				return;
+			}
+			first_chunk = false;
+			request.have_time_to_fst_byte = true;
+			const auto elapsed_nanos = TimePoint::ElapsedNanos(request_monotonic_start, TimePoint::Tick());
+			request.time_to_fst_byte_sec = elapsed_nanos > 0 ? static_cast<double>(elapsed_nanos) / 1e9 : 0;
+		}
+
+		HTTPFSClient &client;
+		GetRequestInfo &request;
+		const TimePoint request_monotonic_start;
+		idx_t total_bytes = 0;
+		bool first_chunk = true;
+		unique_ptr<HTTPResponse> deferred_response;
+		unique_ptr<HTTPResponse> stopped_response;
+	};
+
 	unique_ptr<HTTPResponse> Get(GetRequestInfo &info) override {
-		AddUserAgentIfAvailable(static_cast<HTTPFSParams &>(info.params), info.headers);
+		AddUserAgentIfAvailable(info.params.Cast<HTTPFSParams>(), info.headers);
 		if (state) {
 			state->get_count++;
 		}
@@ -66,61 +133,16 @@ public:
 				state->total_bytes_received += result->body.size();
 			}
 			return result;
-		} else {
-			// The httplib client streams per chunk, so the first chunk gives us TTFB, used by the prefetch cost model
-			// as the latency estimate.
-			const auto request_monotonic_start = TimePoint::Tick();
-			idx_t total_bytes = 0;
-			bool first_chunk = true;
-			unique_ptr<HTTPResponse> deferred_response;
-			unique_ptr<HTTPResponse> stopped_response;
-			auto client_result = client->Get(
-			    info.path.c_str(), headers,
-			    [&](const duckdb_httplib_openssl::Response &response) {
-				    auto http_response = TransformResponse(response);
-				    if (static_cast<int>(http_response->status) >= 400) {
-					    deferred_response = std::move(http_response);
-					    return true;
-				    }
-				    if (info.response_handler && !info.response_handler(*http_response)) {
-					    stopped_response = std::move(http_response);
-					    return false;
-				    }
-				    return true;
-			    },
-			    [&](const char *data, size_t data_length) {
-				    if (first_chunk) {
-					    first_chunk = false;
-					    info.have_time_to_fst_byte = true;
-					    // Time to first byte is the duration from issuing the request until the first chunk arrives.
-					    const auto elapsed_nanos = TimePoint::ElapsedNanos(request_monotonic_start, TimePoint::Tick());
-					    info.time_to_fst_byte_sec = elapsed_nanos > 0 ? static_cast<double>(elapsed_nanos) / 1e9 : 0;
-				    }
-				    total_bytes += data_length;
-				    if (state) {
-					    state->total_bytes_received += data_length;
-				    }
-				    if (deferred_response) {
-					    deferred_response->body.append(data, data_length);
-					    return true;
-				    }
-				    return !info.content_handler || info.content_handler(const_data_ptr_cast(data), data_length);
-			    });
-			info.bytes_received = total_bytes;
-			if (deferred_response) {
-				if (info.response_handler) {
-					info.response_handler(*deferred_response);
-				}
-				return deferred_response;
-			}
-			if (stopped_response) {
-				return stopped_response;
-			}
-			return TransformResult(std::move(client_result));
 		}
+		GetTransferState transfer(*this, info);
+		auto result = client->Get(
+		    info.path.c_str(), headers,
+		    [&](const duckdb_httplib_openssl::Response &response) { return transfer.HandleResponse(response); },
+		    [&](const char *data, size_t data_length) { return transfer.HandleContent(data, data_length); });
+		return transfer.Finish(std::move(result));
 	}
 	unique_ptr<HTTPResponse> Put(PutRequestInfo &info) override {
-		AddUserAgentIfAvailable(static_cast<HTTPFSParams &>(info.params), info.headers);
+		AddUserAgentIfAvailable(info.params.Cast<HTTPFSParams>(), info.headers);
 		if (state) {
 			state->put_count++;
 			state->total_bytes_sent += info.buffer_in_len;
@@ -131,7 +153,7 @@ public:
 	}
 
 	unique_ptr<HTTPResponse> Head(HeadRequestInfo &info) override {
-		AddUserAgentIfAvailable(static_cast<HTTPFSParams &>(info.params), info.headers);
+		AddUserAgentIfAvailable(info.params.Cast<HTTPFSParams>(), info.headers);
 		if (state) {
 			state->head_count++;
 		}
@@ -140,7 +162,7 @@ public:
 	}
 
 	unique_ptr<HTTPResponse> Delete(DeleteRequestInfo &info) override {
-		AddUserAgentIfAvailable(static_cast<HTTPFSParams &>(info.params), info.headers);
+		AddUserAgentIfAvailable(info.params.Cast<HTTPFSParams>(), info.headers);
 		if (state) {
 			state->delete_count++;
 		}
@@ -154,7 +176,7 @@ public:
 	}
 
 	unique_ptr<HTTPResponse> Post(PostRequestInfo &info) override {
-		AddUserAgentIfAvailable(static_cast<HTTPFSParams &>(info.params), info.headers);
+		AddUserAgentIfAvailable(info.params.Cast<HTTPFSParams>(), info.headers);
 		if (state) {
 			state->post_count++;
 			state->total_bytes_sent += info.buffer_in_len;

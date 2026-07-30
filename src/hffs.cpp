@@ -112,74 +112,109 @@ static bool Match(vector<string>::const_iterator key, vector<string>::const_iter
 	return key == key_end && pattern == pattern_end;
 }
 
-void ParseListResult(string &input, vector<string> &files, vector<string> &directories) {
-	enum parse_entry { FILE, DIR, UNKNOWN };
-	idx_t idx = 0;
-	idx_t nested = 0;
-	bool found_path;
-	parse_entry type;
-	string current_string;
-base:
-	found_path = false;
-	type = parse_entry::UNKNOWN;
-	for (; idx < input.size(); idx++) {
-		if (input[idx] == '{') {
-			idx++;
-			goto entry;
+struct HFListResultParser {
+	enum class EntryType : uint8_t { FILE, DIRECTORY, UNKNOWN };
+
+	HFListResultParser(const string &input_p, vector<string> &files_p, vector<string> &directories_p)
+	    : input(input_p), files(files_p), directories(directories_p) {
+	}
+
+	static void Parse(const string &input, vector<string> &files, vector<string> &directories) {
+		HFListResultParser(input, files, directories).ParseEntries();
+	}
+
+private:
+	void ParseEntries() {
+		while (SeekEntry()) {
+			ParseEntry();
 		}
 	}
-	goto end;
-entry:
-	while (idx < input.size()) {
-		if (input[idx] == '}') {
-			if (nested) {
-				idx++;
-				nested--;
-				continue;
-			} else if (!found_path || type == parse_entry::UNKNOWN) {
-				throw IOException("Failed to parse list result");
-			} else if (type == parse_entry::FILE) {
-				files.push_back("/" + current_string);
-			} else {
-				directories.push_back("/" + current_string);
+
+	bool SeekEntry() {
+		position = input.find('{', position);
+		if (position == string::npos) {
+			return false;
+		}
+		position++;
+		return true;
+	}
+
+	void ParseEntry() {
+		idx_t nested = 0;
+		EntryType type = EntryType::UNKNOWN;
+		optional_idx path_position;
+		string path;
+		while (position < input.size()) {
+			if (input[position] == '}') {
+				position++;
+				if (nested > 0) {
+					nested--;
+					continue;
+				}
+				AppendEntry(type, path_position, path);
+				return;
 			}
-			current_string = "";
-			idx++;
-			goto base;
-		} else if (input[idx] == '{') {
-			nested++;
-			idx++;
-		} else if (strncmp(input.c_str() + idx, "\"type\":\"directory\"", 18) == 0) {
-			type = parse_entry::DIR;
-			idx += 18;
-		} else if (strncmp(input.c_str() + idx, "\"type\":\"file\"", 13) == 0) {
-			type = parse_entry::FILE;
-			idx += 13;
-		} else if (strncmp(input.c_str() + idx, "\"path\":\"", 8) == 0) {
-			idx += 8;
-			found_path = true;
-			goto pathname;
-		} else {
-			idx++;
+			if (input[position] == '{') {
+				nested++;
+				position++;
+			} else if (Consume("\"type\":\"directory\"")) {
+				type = EntryType::DIRECTORY;
+			} else if (Consume("\"type\":\"file\"")) {
+				type = EntryType::FILE;
+			} else if (Consume("\"path\":\"")) {
+				path_position = position;
+				path = ParseString();
+			} else {
+				position++;
+			}
 		}
 	}
-	goto end;
-pathname:
-	while (idx < input.size()) {
-		// Handle escaped quote in url
-		if (input[idx] == '\\' && idx + 1 < input.size() && input[idx] == '\"') {
-			current_string += '\"';
-			idx += 2;
-		} else if (input[idx] == '\"') {
-			idx++;
-			goto entry;
+
+	bool Consume(const string &token) {
+		if (input.compare(position, token.size(), token) != 0) {
+			return false;
+		}
+		position += token.size();
+		return true;
+	}
+
+	string ParseString() {
+		string result;
+		while (position < input.size()) {
+			if (input[position] == '"') {
+				position++;
+				return result;
+			}
+			if (input[position] == '\\' && position + 1 < input.size() &&
+			    (input[position + 1] == '"' || input[position + 1] == '\\')) {
+				result += input[position + 1];
+				position += 2;
+				continue;
+			}
+			result += input[position++];
+		}
+		return result;
+	}
+
+	void AppendEntry(EntryType type, optional_idx path_position, const string &path) {
+		if (!path_position.IsValid() || type == EntryType::UNKNOWN) {
+			throw IOException("Failed to parse list result");
+		}
+		if (type == EntryType::FILE) {
+			files.push_back("/" + path);
 		} else {
-			current_string += input[idx];
-			idx++;
+			directories.push_back("/" + path);
 		}
 	}
-end:
-	return;
+
+	const string &input;
+	vector<string> &files;
+	vector<string> &directories;
+	idx_t position = 0;
+};
+
+void HuggingFaceFileSystem::ParseListResult(const string &input, vector<string> &files, vector<string> &directories) {
+	HFListResultParser::Parse(input, files, directories);
 }
 
 // Some valid example Urls:
@@ -213,7 +248,7 @@ vector<OpenFileInfo> HuggingFaceFileSystem::Glob(const string &path, FileOpener 
 	auto params = http_util.InitializeParameters(opener, info);
 	auto &http_params = params->Cast<HTTPFSParams>();
 	SetParams(http_params, path, opener);
-	auto http_state = HTTPState::TryGetState(opener).get();
+	auto http_state = HTTPState::TryGetState(opener);
 
 	ParsedHFUrl curr_hf_path = parsed_glob_url;
 	curr_hf_path.path = shared_path;
@@ -272,7 +307,7 @@ unique_ptr<HTTPResponse> HuggingFaceFileSystem::GetRequest(FileHandle &handle, s
 unique_ptr<HTTPResponse> HuggingFaceFileSystem::GetRangeRequest(FileHandle &handle, string s3_url,
                                                                 HTTPHeaders header_map,
                                                                 const HTTPReadConfig &read_config, idx_t file_offset,
-                                                                char *buffer_out, idx_t buffer_out_len) {
+                                                                data_ptr_t buffer_out, idx_t buffer_out_len) {
 	auto &hf_handle = handle.Cast<HFFileHandle>();
 	auto http_url = HuggingFaceFileSystem::GetFileUrl(hf_handle.parsed_url);
 	return HTTPFileSystem::GetRangeRequest(handle, http_url, header_map, read_config, file_offset, buffer_out,

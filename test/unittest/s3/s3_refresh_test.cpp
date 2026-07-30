@@ -15,7 +15,6 @@
 #include "duckdb/main/secret/secret_manager.hpp"
 
 #include <atomic>
-#include <mutex>
 
 namespace duckdb {
 

@@ -119,6 +119,15 @@ protected:
 
 private:
 	void FinalizeReadConfig();
+	bool TryLoadFileInfoWithoutRequest();
+	unique_ptr<HTTPResponse> RequestFileInfo(HTTPFileSystem &file_system);
+	unique_ptr<HTTPResponse> RetryFileInfoWithRange(HTTPFileSystem &file_system);
+	void ApplyFileInfo(const HTTPResponse &response);
+	void InitializeRequestState(optional_ptr<FileOpener> opener);
+	bool TryInitializeRead(HTTPFileSystem &file_system, optional_ptr<HTTPMetadataCache> cache,
+	                       bool &should_write_cache);
+	void InitializeFileInfo(HTTPFileSystem &file_system, optional_ptr<HTTPMetadataCache> cache,
+	                        bool should_write_cache);
 };
 
 class HTTPFileSystem : public FileSystem {
@@ -178,7 +187,7 @@ public:
 	// Get Request with range parameter that GETs exactly buffer_out_len bytes from the url
 	virtual unique_ptr<HTTPResponse> GetRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map,
 	                                                 const HTTPReadConfig &read_config, idx_t file_offset,
-	                                                 char *buffer_out, idx_t buffer_out_len);
+	                                                 data_ptr_t buffer_out, idx_t buffer_out_len);
 	// Get Request without a range (i.e., downloads full file)
 	virtual unique_ptr<HTTPResponse> GetRequest(FileHandle &handle, string url, HTTPHeaders header_map,
 	                                            const HTTPReadConfig &read_config, CachedFileDownload &download);
@@ -199,9 +208,10 @@ protected:
 
 	//! Internal read helpers.
 	bool TryRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map, const HTTPReadConfig &read_config,
-	                     idx_t file_offset, char *buffer_out, idx_t buffer_out_len);
-	bool ReadAt(FileHandle &handle, void *buffer, idx_t read_size, idx_t location, const HTTPReadConfig &read_config);
-	void ReadAtWithFallback(FileHandle &handle, void *buffer, idx_t read_size, idx_t location,
+	                     idx_t file_offset, data_ptr_t buffer_out, idx_t buffer_out_len);
+	bool ReadAt(FileHandle &handle, data_ptr_t buffer, idx_t read_size, idx_t location,
+	            const HTTPReadConfig &read_config);
+	void ReadAtWithFallback(FileHandle &handle, data_ptr_t buffer, idx_t read_size, idx_t location,
 	                        const HTTPReadConfig &read_config);
 
 	//! Shared request runners used by subclasses that need custom request setup/retry behavior.
@@ -213,10 +223,10 @@ protected:
 	unique_ptr<HTTPResponse> RunDeleteRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
 	                                          HTTPSendCallback send_request);
 	unique_ptr<HTTPResponse> RunPostRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-	                                        string &result, char *buffer_in, idx_t buffer_in_len,
+	                                        string &result, const_data_ptr_t buffer_in, idx_t buffer_in_len,
 	                                        HTTPSendCallback send_request);
 	unique_ptr<HTTPResponse> RunPutRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-	                                       char *buffer_in, idx_t buffer_in_len, const string &content_type,
+	                                       const_data_ptr_t buffer_in, idx_t buffer_in_len, const string &content_type,
 	                                       HTTPSendCallback send_request);
 	unique_ptr<HTTPResponse> RunGetRequest(HTTPFileHandle &handle, string url, HTTPHeaders header_map,
 	                                       HTTPFSParams &http_params, const HTTPReadConfig &read_config,
@@ -224,7 +234,7 @@ protected:
 	                                       HTTPSendCallback send_request);
 	unique_ptr<HTTPResponse> RunGetRangeRequest(HTTPFileHandle &handle, string url, HTTPHeaders header_map,
 	                                            HTTPFSParams &http_params, const HTTPReadConfig &read_config,
-	                                            idx_t file_offset, char *buffer_out, idx_t buffer_out_len,
+	                                            idx_t file_offset, data_ptr_t buffer_out, idx_t buffer_out_len,
 	                                            HTTPErrorCallback get_error, HTTPSendCallback send_request);
 
 private:

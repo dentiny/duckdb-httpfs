@@ -223,7 +223,7 @@ void S3FileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx
 		// Writing to buffer
 		auto idx_to_write = curr_location - write_buffer->buffer_start;
 		auto bytes_to_write = MinValue<idx_t>(nr_bytes - bytes_written, part_size - idx_to_write);
-		memcpy((char *)write_buffer->Ptr() + idx_to_write, (char *)buffer + bytes_written, bytes_to_write);
+		memcpy(write_buffer->Ptr() + idx_to_write, data_ptr_cast(buffer) + bytes_written, bytes_to_write);
 		write_buffer->idx += bytes_to_write;
 
 		// Flush to HTTP if full

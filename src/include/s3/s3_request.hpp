@@ -53,7 +53,7 @@ struct S3RequestUtil {
 	                                string service, string method, const S3AuthParams &auth_params,
 	                                string date_now = "", string datetime_now = "", string payload_hash = "",
 	                                string content_type = "", string content_md5 = "");
-	static string GetPayloadHash(EncryptionUtil &encryption_util, char *buffer, idx_t buffer_len);
+	static string GetPayloadHash(EncryptionUtil &encryption_util, const_data_ptr_t buffer, idx_t buffer_len);
 	static bool IsRequestTimeout(const HTTPResponse &response);
 
 	static optional_idx TryFindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);

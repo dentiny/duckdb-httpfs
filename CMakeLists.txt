@@ -4,6 +4,14 @@ project(HTTPFsExtension)
 
 add_extension_definitions()
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(-Wpessimizing-move)
+endif()
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Werror=thread-safety)
+endif()
+
 if (NOT EMSCRIPTEN)
   add_definitions(-DOVERRIDE_ENCRYPTION_UTILS=1)
 else()
