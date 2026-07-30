@@ -36,11 +36,11 @@ static void RequireQueryOk(Connection &con, const string &query) {
 	REQUIRE_FALSE(result->HasError());
 }
 
-static void ConfigureHTTPTest(DuckDB &db, Connection &con, idx_t retries,
-                              const string &client_implementation = "curl") {
+static void ConfigureHTTPTest(DuckDB &db, Connection &con, idx_t retries, const string &client_implementation = "curl",
+                              bool connection_caching = false) {
 	LoadHTTPFSExtension(db);
 	RequireQueryOk(con, "SET httpfs_client_implementation='" + client_implementation + "'");
-	RequireQueryOk(con, "SET httpfs_connection_caching=false");
+	RequireQueryOk(con, StringUtil::Format("SET httpfs_connection_caching=%s", connection_caching ? "true" : "false"));
 	RequireQueryOk(con, "SET http_retries=" + to_string(retries));
 	RequireQueryOk(con, "SET http_retry_wait_ms=1");
 	RequireQueryOk(con, "SET http_retry_backoff=1");
@@ -55,6 +55,17 @@ static idx_t CountRequests(const vector<MockS3RequestObservation> &observations,
 		}
 	}
 	return count;
+}
+
+static vector<int> RequestPorts(const vector<MockS3RequestObservation> &observations, const string &method, int status,
+                                const string &range = string()) {
+	vector<int> result;
+	for (auto &observation : observations) {
+		if (observation.method == method && observation.status == status && observation.range == range) {
+			result.push_back(observation.remote_port);
+		}
+	}
+	return result;
 }
 
 static idx_t CountRangeRequests(const vector<MockS3RequestObservation> &observations, int status) {
@@ -222,15 +233,64 @@ static void RunParallelRangeHeaderRelease(const string &client_implementation) {
 	first_reader.join();
 	second_reader.join();
 
+	auto observations = server.Observations();
 	INFO(first_outcome.error);
 	INFO(second_outcome.error);
+	INFO(MockS3DescribeObservations(observations));
 	REQUIRE_FALSE(first_outcome.failed);
 	REQUIRE_FALSE(second_outcome.failed);
-	auto observations = server.Observations();
-	INFO(MockS3DescribeObservations(observations));
 	REQUIRE(CountRequests(observations, "GET", 206, "bytes=0-1023") == 1);
 	REQUIRE(CountRequests(observations, "GET", 206, "bytes=1024-2047") == 1);
 	RequireQueryOk(con, "COMMIT");
+}
+
+static void RunCompletedErrorConnectionReuse(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.transient_head_failures = 1;
+	config.failure_is_request_timeout = false;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureHTTPTest(db, con, 0, client_implementation);
+
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto handle = fs.OpenFile(server.HTTPPath(), FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+	REQUIRE(handle);
+	RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	auto error_ports = RequestPorts(observations, "HEAD", 400);
+	auto success_ports = RequestPorts(observations, "GET", 206, "bytes=0-1");
+	REQUIRE(error_ports.size() == 1);
+	REQUIRE(success_ports.size() == 1);
+	REQUIRE(error_ports[0] != 0);
+	REQUIRE(error_ports[0] == success_ports[0]);
+}
+
+static void RunSharedConnectionNotFoundReuse() {
+	MockS3ServerConfig config;
+	config.head_not_found_requests = 2;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureHTTPTest(db, con, 0, "curl", true);
+
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	REQUIRE_FALSE(fs.FileExists(server.HTTPPath()));
+	REQUIRE_FALSE(fs.FileExists(server.HTTPPath()));
+	RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	auto not_found_ports = RequestPorts(observations, "HEAD", 404);
+	REQUIRE(not_found_ports.size() == 2);
+	REQUIRE(not_found_ports[0] != 0);
+	REQUIRE(not_found_ports[0] == not_found_ports[1]);
 }
 
 static void RunFullDownloadSingleFlight(const string &client_implementation, bool shared_handle) {
@@ -314,6 +374,18 @@ TEST_CASE("HTTP range readers resume after the first response headers", "[httpfs
 	}
 	SECTION("httplib") {
 		RunParallelRangeHeaderRelease("httplib");
+	}
+}
+
+TEST_CASE("HTTP request sessions reuse connections after completed errors", "[httpfs][request-session]") {
+	SECTION("httplib reuses a session-local connection") {
+		RunCompletedErrorConnectionReuse("httplib");
+	}
+	SECTION("curl reuses a session-local connection") {
+		RunCompletedErrorConnectionReuse("curl");
+	}
+	SECTION("curl reuses a shared connection across missing-file probes") {
+		RunSharedConnectionNotFoundReuse();
 	}
 }
 

@@ -29,7 +29,7 @@ unique_ptr<HTTPClient> HTTPClientConnectionCache::Find(const string &base_url) {
 		auto &pool = pools[idx];
 		// block instead of skipping: a spurious miss dials a new connection (DNS + TLS),
 		// which is far more expensive than waiting for this short critical section
-		lock_guard<mutex> lock(pool.lock);
+		annotated_lock_guard<annotated_mutex> lock(pool.lock);
 		for (auto &entry : pool.entries) {
 			if (entry && entry->GetBaseUrl() == base_url) {
 				cache_pool_idx = idx;
@@ -49,7 +49,7 @@ void HTTPClientConnectionCache::Store(unique_ptr<HTTPClient> &&client) {
 	for (size_t i = 0; i < POOL_COUNT; i++) {
 		const size_t idx = (start + i) & (POOL_COUNT - 1);
 		auto &pool = pools[idx];
-		lock_guard<mutex> lock(pool.lock);
+		annotated_lock_guard<annotated_mutex> lock(pool.lock);
 		for (auto &entry : pool.entries) {
 			if (!entry) {
 				entry = std::move(client);
@@ -61,16 +61,24 @@ void HTTPClientConnectionCache::Store(unique_ptr<HTTPClient> &&client) {
 	// Pass 2: every pool is full — evict at random in the starting pool
 	RandomEngine engine;
 	auto &pool = pools[start];
-	lock_guard<mutex> lock(pool.lock);
-	const size_t slot = engine.NextRandomInteger() % pool.entries.size();
-	pool.entries[slot] = std::move(client);
+	unique_ptr<HTTPClient> evicted_client;
+	{
+		annotated_lock_guard<annotated_mutex> lock(pool.lock);
+		const size_t slot = engine.NextRandomInteger() % pool.entries.size();
+		evicted_client = std::move(pool.entries[slot]);
+		pool.entries[slot] = std::move(client);
+	}
 }
 
 void HTTPClientConnectionCache::Clear() {
+	vector<unique_ptr<HTTPClient>> cleared_clients;
+	cleared_clients.reserve(POOL_COUNT * POOL_SIZE);
 	for (auto &pool : pools) {
-		lock_guard<mutex> lock(pool.lock);
+		annotated_lock_guard<annotated_mutex> lock(pool.lock);
 		for (auto &entry : pool.entries) {
-			entry.reset();
+			if (entry) {
+				cleared_clients.push_back(std::move(entry));
+			}
 		}
 	}
 }
@@ -91,6 +99,10 @@ bool HTTPFSCurlUtil::EnableCaching(BaseRequest &request) {
 
 void HTTPFSCurlUtil::ClearCachedConnections() {
 	connection_cache.Clear();
+}
+
+HTTPClientReuseMode HTTPFSCurlUtil::GetClientReuseMode() const {
+	return connection_caching_enabled ? HTTPClientReuseMode::SHARED : HTTPClientReuseMode::SESSION_LOCAL;
 }
 
 void HTTPFSCurlUtil::CloseClient(unique_ptr<HTTPClient> &&client) {

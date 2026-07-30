@@ -9,6 +9,7 @@
 #include "duckdb/main/client_data.hpp"
 #include "http_metadata_cache.hpp"
 #include "httpfs_client.hpp"
+#include "http_request_session.hpp"
 
 #include <functional>
 
@@ -29,68 +30,16 @@ public:
 	}
 };
 
-class HTTPClientCache {
-public:
-	struct Entry {
-		unique_ptr<HTTPClient> client;
-		idx_t generation = 0;
-	};
-
-	//! Get a client from the client cache
-	unique_ptr<HTTPClient> GetClient();
-	//! Get a client together with the cache generation it came from
-	Entry GetClientWithGeneration();
-	//! Store a client in the cache for reuse
-	void StoreClient(unique_ptr<HTTPClient> client);
-	//! Store a generation-tagged client if the cache was not cleared while it was checked out
-	bool StoreClient(Entry &entry);
-	//! Clear the stored clients
-	void Clear();
-
-protected:
-	//! The cached clients
-	vector<unique_ptr<HTTPClient>> clients;
-	//! Incremented when the cache is cleared, invalidating checked-out clients
-	idx_t generation = 0;
-	//! Lock to fetch a client
-	mutex lock;
-};
-
-class HTTPInput {
-public:
-	HTTPInput(unique_ptr<HTTPParams> params_p);
-	virtual ~HTTPInput() = default;
-
-	unique_ptr<HTTPParams> params;
-	HTTPFSParams &http_params;
-
-	template <class TARGET>
-	TARGET &Cast() {
-		DynamicCastCheck<TARGET>(this);
-		return reinterpret_cast<TARGET &>(*this);
-	}
-	template <class TARGET>
-	const TARGET &Cast() const {
-		DynamicCastCheck<TARGET>(this);
-		return reinterpret_cast<const TARGET &>(*this);
-	}
-};
-
 class HTTPFileSystem;
 
 class HTTPFileHandle : public FileHandle {
 public:
 	HTTPFileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpenFlags flags, unique_ptr<HTTPParams> params);
-	HTTPFileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpenFlags flags, shared_ptr<HTTPInput> input);
 	~HTTPFileHandle() override;
 	// This two-phase construction allows subclasses more flexible setup.
 	virtual void Initialize(optional_ptr<FileOpener> opener);
 
-	// We keep an http client stored for connection reuse with keep-alive headers
-	HTTPClientCache client_cache;
-
-	shared_ptr<HTTPInput> http_input;
-	HTTPFSParams &http_params;
+	shared_ptr<HTTPRequestSession> request_session;
 
 	// File handle info
 	FileOpenFlags flags;
@@ -126,20 +75,14 @@ public:
 	constexpr static idx_t MAXIMUM_READ_BUFFER_LEN = 33554432;
 
 	// Adaptively resizes read_buffer based on range_request_statistics
-	void AddStatistics(idx_t read_offset, idx_t read_length, idx_t read_duration);
-	void AdaptReadBufferSize(idx_t next_read_offset);
+	void AddStatistics(idx_t read_offset, idx_t read_length, idx_t read_duration) DUCKDB_EXCLUDES(throughput_lock);
+	void AdaptReadBufferSize(idx_t next_read_offset) DUCKDB_EXCLUDES(throughput_lock);
 
 	// Record a completed range request into the network throughput estimate (latency + bandwidth)
-	void RecordNetworkSample(double total_seconds, idx_t bytes, bool sample_has_ttfb, double ttfb_seconds);
+	void RecordNetworkSample(double total_seconds, idx_t bytes, bool sample_has_ttfb, double ttfb_seconds)
+	    DUCKDB_EXCLUDES(throughput_lock);
 	// Expose the measured network throughput estimate to the (parquet) prefetch cost model.
-	bool TryGetNetworkThroughput(NetworkThroughputEstimate &result);
-
-	void AddHeaders(HTTPHeaders &map);
-
-	// Get a Client to run requests over
-	unique_ptr<HTTPClient> GetClient();
-	// Return the client for re-use
-	void StoreClient(unique_ptr<HTTPClient> client);
+	bool TryGetNetworkThroughput(NetworkThroughputEstimate &result) DUCKDB_EXCLUDES(throughput_lock);
 
 	// Whether to bypass the read buffer
 	bool SkipBuffer() const {
@@ -155,14 +98,14 @@ private:
 		idx_t length;
 		idx_t duration;
 	};
-	vector<RangeRequestStatistics> range_request_statistics;
+	vector<RangeRequestStatistics> range_request_statistics DUCKDB_GUARDED_BY(throughput_lock);
 
 	// throughput_lock guards the throughput estimate (fed by RecordNetworkSample) and range_request_statistics against
 	// concurrent prefetch reads.
-	mutex throughput_lock;
-	double tp_latency_seconds = 0;
-	double tp_bandwidth_bps = 0;
-	idx_t tp_sample_count = 0;
+	mutable annotated_mutex throughput_lock;
+	double tp_latency_seconds DUCKDB_GUARDED_BY(throughput_lock) = 0;
+	double tp_bandwidth_bps DUCKDB_GUARDED_BY(throughput_lock) = 0;
+	idx_t tp_sample_count DUCKDB_GUARDED_BY(throughput_lock) = 0;
 	// Minimum payload size for a request to contribute a bandwidth sample
 	constexpr static idx_t MIN_BANDWIDTH_SAMPLE_BYTES = 1 << 16; // 64 KiB
 
@@ -171,8 +114,7 @@ public:
 	}
 
 protected:
-	//! Create a new Client
-	virtual unique_ptr<HTTPClient> CreateClient();
+	virtual shared_ptr<const HTTPRequestSnapshot> CreateRequestSnapshot(const HTTPFSParams &params) const;
 	//! Perform a HEAD request to get the file info (if not yet loaded)
 	void LoadFileInfo();
 	//! TODO: make base function virtual?
@@ -242,11 +184,6 @@ public:
 	// Get Request without a range (i.e., downloads full file)
 	virtual unique_ptr<HTTPResponse> GetRequest(FileHandle &handle, string url, HTTPHeaders header_map,
 	                                            CachedFileDownload &download);
-	// Post Request that can handle variable sized responses without a content-length header (needed for s3 multipart)
-	virtual unique_ptr<HTTPResponse> PostRequest(HTTPInput &input, string url, HTTPHeaders header_map, string &result,
-	                                             char *buffer_in, idx_t buffer_in_len, string params = "");
-	virtual unique_ptr<HTTPResponse> PutRequest(HTTPInput &input, string url, HTTPHeaders header_map, char *buffer_in,
-	                                            idx_t buffer_in_len, string params = "");
 	virtual unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, string url, HTTPHeaders header_map);
 	//! Fully download a file, or wait for an in-progress download of the same path
 	unique_ptr<CachedFileHandle> FullDownload(HTTPFileHandle &handle, bool &should_write_cache);
@@ -290,9 +227,11 @@ protected:
 	                                            HTTPSendCallback send_request);
 
 private:
+	void EraseGlobalCacheEntry(const string &path) DUCKDB_EXCLUDES(global_cache_lock);
+
 	// Global cache
-	mutex global_cache_lock;
-	unique_ptr<HTTPMetadataCache> global_metadata_cache;
+	mutable annotated_mutex global_cache_lock;
+	unique_ptr<HTTPMetadataCache> global_metadata_cache DUCKDB_GUARDED_BY(global_cache_lock);
 };
 
 } // namespace duckdb

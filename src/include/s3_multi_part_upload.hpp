@@ -55,7 +55,7 @@ public:
 	void Finalize();
 
 	S3FileSystem &s3fs;
-	shared_ptr<HTTPInput> http_input;
+	shared_ptr<HTTPRequestSession> request_session;
 	string path;
 	const S3ConfigParams config_params;
 

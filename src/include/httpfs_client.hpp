@@ -27,6 +27,9 @@ class HTTPLogger;
 class FileOpener;
 struct FileOpenerInfo;
 class HTTPState;
+class HTTPFSUtil;
+
+enum class HTTPClientReuseMode : uint8_t { SESSION_LOCAL, SHARED, NONE };
 
 struct HTTPFSParams : public HTTPParams {
 	HTTPFSParams(HTTPUtil &http_util) : HTTPParams(http_util) {
@@ -53,6 +56,8 @@ struct HTTPFSParams : public HTTPParams {
 	string user_agent = {""};
 	bool pre_merged_headers = false;
 	idx_t force_download_threshold = 0;
+	HTTPClientReuseMode client_reuse_mode = HTTPClientReuseMode::SESSION_LOCAL;
+	optional_ptr<HTTPFSUtil> httpfs_util;
 
 	// Additional fields needs to be appended at the end and need to be propagated to duckdb-wasm
 	// TODO: make this unnecessary
@@ -70,8 +75,9 @@ public:
 
 private:
 	struct Pool {
-		mutex lock {};
-		std::vector<unique_ptr<HTTPClient>> entries {std::vector<unique_ptr<HTTPClient>>(POOL_SIZE)};
+		annotated_mutex lock {};
+		std::vector<unique_ptr<HTTPClient>> entries DUCKDB_GUARDED_BY(lock) {
+		    std::vector<unique_ptr<HTTPClient>>(POOL_SIZE)};
 	};
 
 	std::array<Pool, POOL_COUNT> pools {};
@@ -85,6 +91,7 @@ public:
 
 	//! Clear any cached connections
 	virtual void ClearCachedConnections();
+	virtual HTTPClientReuseMode GetClientReuseMode() const;
 
 	static unordered_map<string, string> ParseGetParameters(const string &text);
 	static HTTPUtil &GetHTTPUtil(optional_ptr<FileOpener> opener);
@@ -99,6 +106,7 @@ public:
 	unique_ptr<HTTPClient> InitializeClient(HTTPParams &http_params, const string &proto_host_port) override;
 	void CloseClient(unique_ptr<HTTPClient> &&client) override;
 	void ClearCachedConnections() override;
+	HTTPClientReuseMode GetClientReuseMode() const override;
 	unique_ptr<HTTPResponse> SendRequest(BaseRequest &request, unique_ptr<HTTPClient> &client) override;
 
 	static unordered_map<string, string> ParseGetParameters(const string &text);

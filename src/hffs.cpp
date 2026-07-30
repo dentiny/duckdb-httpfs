@@ -45,10 +45,6 @@ static string ParseNextUrlFromLinkHeader(const string &link_header_content) {
 HFFileHandle::~HFFileHandle() {
 }
 
-unique_ptr<HTTPClient> HFFileHandle::CreateClient() {
-	return http_params.http_util.InitializeClient(http_params, parsed_url.endpoint);
-}
-
 string HuggingFaceFileSystem::ListHFRequest(ParsedHFUrl &url, HTTPFSParams &http_params, string &next_page_url,
                                             optional_ptr<HTTPState> state) {
 	HTTPHeaders header_map;

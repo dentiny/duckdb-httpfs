@@ -10,6 +10,7 @@
 #include "duckdb/main/client_context_state.hpp"
 
 #include <condition_variable>
+#include <functional>
 
 namespace duckdb {
 
@@ -238,13 +239,11 @@ public:
 		Reset();
 	}
 	void WriteProfilingInformation(std::ostream &ss) override;
-	mutex &CredentialRefreshLock() {
-		return credential_refresh_mutex;
-	}
+	bool RunCredentialRefresh(const std::function<bool()> &callback) DUCKDB_EXCLUDES(credential_refresh_mutex);
 
 private:
 	//! Serializes credential provider refreshes after auth failures.
-	mutex credential_refresh_mutex;
+	annotated_mutex credential_refresh_mutex;
 	//! Protects the per-path state map
 	annotated_mutex file_states_mutex;
 	//! Per-path state shared by all file handles in this query

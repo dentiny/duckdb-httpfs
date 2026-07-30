@@ -30,6 +30,27 @@ static string ExtractCredentialKey(const string &authorization) {
 	return authorization.substr(credential_pos, end_pos - credential_pos);
 }
 
+static string ExtractCredentialRegion(const string &authorization) {
+	auto credential_pos = authorization.find("Credential=");
+	if (credential_pos == string::npos) {
+		return string();
+	}
+	credential_pos += strlen("Credential=");
+	auto key_end = authorization.find('/', credential_pos);
+	if (key_end == string::npos) {
+		return string();
+	}
+	auto date_end = authorization.find('/', key_end + 1);
+	if (date_end == string::npos) {
+		return string();
+	}
+	auto region_end = authorization.find('/', date_end + 1);
+	if (region_end == string::npos) {
+		return string();
+	}
+	return authorization.substr(date_end + 1, region_end - date_end - 1);
+}
+
 static bool ParseRange(const string &range, idx_t object_size, idx_t &start, idx_t &end) {
 	static constexpr const char *PREFIX = "bytes=";
 	if (range.rfind(PREFIX, 0) != 0) {
@@ -65,6 +86,16 @@ static string GetHeader(const httplib::Request &request, const string &header) {
 	return request.get_header_value(header);
 }
 
+static idx_t CountHeader(const httplib::Request &request, const string &header) {
+	idx_t result = 0;
+	for (const auto &entry : request.headers) {
+		if (StringUtil::CIEquals(entry.first, header)) {
+			result++;
+		}
+	}
+	return result;
+}
+
 } // namespace
 
 struct MockS3Server::Impl {
@@ -73,6 +104,7 @@ struct MockS3Server::Impl {
 		remaining_get_failures = config.transient_get_failures;
 		remaining_range_behavior_requests = config.range_behavior_requests;
 		remaining_head_failures = config.transient_head_failures;
+		remaining_head_not_found = config.head_not_found_requests;
 		remaining_delete_failures = config.transient_delete_failures;
 		remaining_post_failures = config.transient_post_failures;
 		remaining_complete_post_failures = config.transient_complete_post_failures;
@@ -156,6 +188,11 @@ struct MockS3Server::Impl {
 		       MatchesRefreshTarget(request);
 	}
 
+	bool ShouldRedirectRegion(const httplib::Request &request) const {
+		return !config.required_region.empty() &&
+		       ExtractCredentialRegion(GetHeader(request, "Authorization")) != config.required_region;
+	}
+
 	void Record(const httplib::Request &request, int status) const {
 		MockS3RequestObservation observation;
 		observation.method = request.method;
@@ -163,6 +200,11 @@ struct MockS3Server::Impl {
 		observation.target = request.target;
 		observation.range = GetHeader(request, "Range");
 		observation.key_id = ExtractCredentialKey(GetHeader(request, "Authorization"));
+		observation.region = ExtractCredentialRegion(GetHeader(request, "Authorization"));
+		observation.user_agent = GetHeader(request, "User-Agent");
+		observation.session_header = GetHeader(request, "X-HTTPFS-Session");
+		observation.user_agent_count = CountHeader(request, "User-Agent");
+		observation.session_header_count = CountHeader(request, "X-HTTPFS-Session");
 		observation.status = status;
 		observation.remote_port = request.remote_port;
 
@@ -189,10 +231,18 @@ struct MockS3Server::Impl {
 		Record(request, response.status);
 	}
 
-	void SendForbidden(const httplib::Request &request, httplib::Response &response) const {
-		response.status = 403;
-		response.set_content("<Error><Code>AccessDenied</Code><Message>stale credentials</Message></Error>",
+	void SendAuthFailure(const httplib::Request &request, httplib::Response &response) const {
+		response.status = config.stale_auth_status;
+		response.set_content(StringUtil::Format("<Error><Code>%s</Code><Message>stale credentials</Message></Error>",
+		                                        config.stale_auth_error_code),
 		                     "application/xml");
+		Record(request, response.status);
+	}
+
+	void SendRegionRedirect(const httplib::Request &request, httplib::Response &response) const {
+		response.status = 301;
+		response.set_header("x-amz-bucket-region", config.required_region);
+		response.set_content("<Error><Code>PermanentRedirect</Code></Error>", "application/xml");
 		Record(request, response.status);
 	}
 
@@ -286,8 +336,18 @@ struct MockS3Server::Impl {
 			if (request.method != "HEAD" || request.path != path) {
 				return httplib::Server::HandlerResponse::Unhandled;
 			}
+			if (ShouldRedirectRegion(request)) {
+				SendRegionRedirect(request, response);
+				return httplib::Server::HandlerResponse::Handled;
+			}
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
+				return httplib::Server::HandlerResponse::Handled;
+			}
+			if (remaining_head_not_found.load() > 0) {
+				remaining_head_not_found--;
+				response.status = 404;
+				Record(request, response.status);
 				return httplib::Server::HandlerResponse::Handled;
 			}
 			if (remaining_head_failures.load() > 0) {
@@ -303,7 +363,7 @@ struct MockS3Server::Impl {
 
 		server.Get(path, [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			if (remaining_get_failures.load() > 0) {
@@ -383,18 +443,18 @@ struct MockS3Server::Impl {
 			response.set_header("Accept-Ranges", "bytes");
 			response.set_header("ETag", config.etag);
 			if (config.block_first_range_body_until_second_range && range_request_index == 1) {
-				const auto range_length = range_end - range_start + 1;
+				auto wait_for_second_request = make_shared_ptr<std::atomic<bool>>(true);
 				response.set_content_provider(
-				    range_length, "application/octet-stream",
-				    [this, range_start](size_t offset, size_t length, httplib::DataSink &sink) {
-					    if (offset == 0) {
+				    config.object_data.size(), "application/octet-stream",
+				    [this, wait_for_second_request](size_t offset, size_t length, httplib::DataSink &sink) {
+					    if (wait_for_second_request->exchange(false)) {
 						    std::unique_lock<std::mutex> lock(range_request_lock);
 						    if (!range_request_started.wait_for(lock, std::chrono::seconds(5),
 						                                        [this]() { return range_requests_seen >= 2; })) {
 							    return false;
 						    }
 					    }
-					    return sink.write(config.object_data.data() + range_start + offset, length);
+					    return sink.write(config.object_data.data() + offset, length);
 				    });
 				Record(request, response.status);
 				return;
@@ -431,8 +491,12 @@ struct MockS3Server::Impl {
 				Record(request, response.status);
 				return;
 			}
+			if (ShouldRedirectRegion(request)) {
+				SendRegionRedirect(request, response);
+				return;
+			}
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			if (config.transient_503_lists > 0 && transient_503_lists_sent.fetch_add(1) < config.transient_503_lists) {
@@ -450,7 +514,7 @@ struct MockS3Server::Impl {
 
 		server.Put(path, [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			if (remaining_put_failures.load() > 0) {
@@ -463,7 +527,7 @@ struct MockS3Server::Impl {
 
 		server.Post(path, [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			if (request.target.find("uploads") != string::npos && remaining_post_failures.load() > 0) {
@@ -481,7 +545,7 @@ struct MockS3Server::Impl {
 
 		auto bulk_delete = [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			SendBulkDeleteSuccess(request, response);
@@ -491,7 +555,7 @@ struct MockS3Server::Impl {
 
 		server.Delete(path, [this](const httplib::Request &request, httplib::Response &response) {
 			if (ShouldRejectStaleCredentials(request)) {
-				SendForbidden(request, response);
+				SendAuthFailure(request, response);
 				return;
 			}
 			if (remaining_delete_failures.load() > 0) {
@@ -514,6 +578,7 @@ struct MockS3Server::Impl {
 	mutable std::atomic<idx_t> remaining_get_failures {0};
 	mutable std::atomic<idx_t> remaining_range_behavior_requests {0};
 	mutable std::atomic<idx_t> remaining_head_failures {0};
+	mutable std::atomic<idx_t> remaining_head_not_found {0};
 	mutable std::atomic<idx_t> remaining_delete_failures {0};
 	mutable std::atomic<idx_t> remaining_post_failures {0};
 	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
@@ -606,8 +671,10 @@ string MockS3DescribeObservations(const vector<MockS3RequestObservation> &observ
 		if (!result.empty()) {
 			result += "\n";
 		}
-		result += StringUtil::Format("%s %s status=%d key=%s range=%s target=%s", observation.method, observation.path,
-		                             observation.status, observation.key_id, observation.range, observation.target);
+		result += StringUtil::Format(
+		    "%s %s status=%d key=%s region=%s range=%s target=%s user_agent=%s session_header=%s", observation.method,
+		    observation.path, observation.status, observation.key_id, observation.region, observation.range,
+		    observation.target, observation.user_agent, observation.session_header);
 	}
 	return result;
 }

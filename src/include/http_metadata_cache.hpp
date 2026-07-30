@@ -26,55 +26,31 @@ struct HTTPMetadataCacheEntry {
 // Simple cache with a max age for an entry to be valid
 class HTTPMetadataCache : public ClientContextState {
 public:
-	explicit HTTPMetadataCache(bool flush_on_query_end_p, bool shared_p)
-	    : flush_on_query_end(flush_on_query_end_p), shared(shared_p) {};
+	explicit HTTPMetadataCache(bool flush_on_query_end_p, bool) : flush_on_query_end(flush_on_query_end_p) {};
 
-	void Insert(const string &path, HTTPMetadataCacheEntry val) {
-		if (shared) {
-			lock_guard<mutex> parallel_lock(lock);
-			map[path] = val;
-		} else {
-			map[path] = val;
-		}
+	void Insert(const string &path, HTTPMetadataCacheEntry val) DUCKDB_EXCLUDES(lock) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		map[path] = std::move(val);
 	};
 
-	void Erase(string path) {
-		if (shared) {
-			lock_guard<mutex> parallel_lock(lock);
-			map.erase(path);
-		} else {
-			map.erase(path);
-		}
+	void Erase(string path) DUCKDB_EXCLUDES(lock) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		map.erase(path);
 	};
 
-	bool Find(string path, HTTPMetadataCacheEntry &ret_val) {
-		if (shared) {
-			lock_guard<mutex> parallel_lock(lock);
-			auto lookup = map.find(path);
-			if (lookup != map.end()) {
-				ret_val = lookup->second;
-				return true;
-			} else {
-				return false;
-			}
-		} else {
-			auto lookup = map.find(path);
-			if (lookup != map.end()) {
-				ret_val = lookup->second;
-				return true;
-			} else {
-				return false;
-			}
+	bool Find(string path, HTTPMetadataCacheEntry &ret_val) DUCKDB_EXCLUDES(lock) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		auto lookup = map.find(path);
+		if (lookup == map.end()) {
+			return false;
 		}
+		ret_val = lookup->second;
+		return true;
 	};
 
-	void Clear() {
-		if (shared) {
-			lock_guard<mutex> parallel_lock(lock);
-			map.clear();
-		} else {
-			map.clear();
-		}
+	void Clear() DUCKDB_EXCLUDES(lock) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		map.clear();
 	}
 
 	//! Called by the ClientContext when the current query ends
@@ -85,10 +61,9 @@ public:
 	}
 
 protected:
-	mutex lock;
-	unordered_map<string, HTTPMetadataCacheEntry> map;
+	annotated_mutex lock;
+	unordered_map<string, HTTPMetadataCacheEntry> map DUCKDB_GUARDED_BY(lock);
 	bool flush_on_query_end;
-	bool shared;
 };
 
 } // namespace duckdb
