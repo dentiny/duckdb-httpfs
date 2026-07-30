@@ -28,7 +28,7 @@ void S3MultiPartUpload::Finalize() {
 shared_ptr<S3WriteBuffer> S3MultiPartUpload::GetBuffer(uint16_t write_buffer_idx) {
 	// Check if write buffer already exists
 	{
-		unique_lock<mutex> lck(write_buffers_lock);
+		annotated_lock_guard<annotated_mutex> lck(write_buffers_lock);
 		auto lookup_result = write_buffers.find(write_buffer_idx);
 		if (lookup_result != write_buffers.end()) {
 			shared_ptr<S3WriteBuffer> buffer = lookup_result->second;
@@ -40,7 +40,7 @@ shared_ptr<S3WriteBuffer> S3MultiPartUpload::GetBuffer(uint16_t write_buffer_idx
 	auto new_write_buffer =
 	    make_shared_ptr<S3WriteBuffer>(write_buffer_idx * part_size, part_size, std::move(buffer_handle));
 	{
-		unique_lock<mutex> lck(write_buffers_lock);
+		annotated_lock_guard<annotated_mutex> lck(write_buffers_lock);
 		auto lookup_result = write_buffers.find(write_buffer_idx);
 
 		// Check if other thread has created the same buffer, if so we return theirs and drop ours.
@@ -92,12 +92,15 @@ void S3MultiPartUpload::FinalizeMultipartUpload() {
 	ss << "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">";
 
 	auto parts = parts_uploaded.load();
-	for (auto i = 0; i < parts; i++) {
-		auto etag_lookup = part_etags.find(i);
-		if (etag_lookup == part_etags.end()) {
-			throw IOException("Unknown part number");
+	{
+		annotated_lock_guard<annotated_mutex> part_etags_guard(part_etags_lock);
+		for (auto i = 0; i < parts; i++) {
+			auto etag_lookup = part_etags.find(i);
+			if (etag_lookup == part_etags.end()) {
+				throw IOException("Unknown part number");
+			}
+			ss << "<Part><ETag>" << etag_lookup->second << "</ETag><PartNumber>" << i + 1 << "</PartNumber></Part>";
 		}
-		ss << "<Part><ETag>" << etag_lookup->second << "</ETag><PartNumber>" << i + 1 << "</PartNumber></Part>";
 	}
 	ss << "</CompleteMultipartUpload>";
 	string body = ss.str();
@@ -106,7 +109,8 @@ void S3MultiPartUpload::FinalizeMultipartUpload() {
 	string result;
 
 	string query_param = "uploadId=" + S3Url::Encode(multipart_upload_id, true);
-	auto res = s3fs.PostRequest(*request_session, path, result, (char *)body.c_str(), body.length(), query_param);
+	auto res =
+	    s3fs.PostRequest(*request_session, path, result, const_data_ptr_cast(body.data()), body.length(), query_param);
 	auto open_tag_pos = result.find("<CompleteMultipartUploadResult", 0);
 	if (open_tag_pos == string::npos) {
 		throw HTTPException(*res, "Unexpected response during S3 multipart upload finalization: %d\n\n%s",
@@ -134,7 +138,7 @@ void S3MultiPartUpload::UploadBufferImplementation(shared_ptr<S3WriteBuffer> wri
 
 	try {
 		// Transient S3 errors are retried inside PutRequest; a non-OK status here is already final.
-		res = s3fs.PutRequest(*request_session, path, (char *)write_buffer->Ptr(), write_buffer->idx, query_param);
+		res = s3fs.PutRequest(*request_session, path, write_buffer->Ptr(), write_buffer->idx, query_param);
 
 		if (res->status != HTTPStatusCode::OK_200) {
 			throw HTTPException(*res, "Unable to connect to URL %s: %s (HTTP code %d)%s", path, res->GetError(),
@@ -161,8 +165,8 @@ void S3MultiPartUpload::UploadBufferImplementation(shared_ptr<S3WriteBuffer> wri
 
 	// Insert etag
 	{
-		unique_lock<mutex> lck(part_etags_lock);
-		part_etags.insert(std::pair<uint16_t, string>(write_buffer->part_no, etag));
+		annotated_lock_guard<annotated_mutex> lck(part_etags_lock);
+		part_etags.insert(std::pair<uint16_t, string>(NumericCast<uint16_t>(write_buffer->part_no), etag));
 	}
 
 	parts_uploaded++;
@@ -173,7 +177,7 @@ void S3MultiPartUpload::UploadBufferImplementation(shared_ptr<S3WriteBuffer> wri
 
 void S3MultiPartUpload::NotifyUploadsInProgress() {
 	{
-		unique_lock<mutex> lck(uploads_in_progress_lock);
+		annotated_lock_guard<annotated_mutex> lck(uploads_in_progress_lock);
 		if (uploads_in_progress == 0) {
 			throw InternalException(
 			    "S3MultiPartUpload: uploads_in_progress decremented but no uploads are supposed to be active");
@@ -205,17 +209,19 @@ void S3MultiPartUpload::FlushBuffer(shared_ptr<S3WriteBuffer> write_buffer) {
 	RethrowIOError();
 
 	{
-		unique_lock<mutex> lck(write_buffers_lock);
+		annotated_lock_guard<annotated_mutex> lck(write_buffers_lock);
 		write_buffers.erase(write_buffer->part_no);
 	}
 
 	{
-		unique_lock<mutex> lck(uploads_in_progress_lock);
+		annotated_unique_lock<annotated_mutex> lck(uploads_in_progress_lock);
 		// check if there are upload threads available
 #ifndef SAME_THREAD_UPLOAD
 		if (uploads_in_progress >= config_params.max_upload_threads) {
 			// there are not - wait for one to become available
-			uploads_in_progress_cv.wait(lck, [&] { return uploads_in_progress < config_params.max_upload_threads; });
+			uploads_in_progress_cv.wait(lck, [&]() DUCKDB_REQUIRES(uploads_in_progress_lock) {
+				return uploads_in_progress < config_params.max_upload_threads;
+			});
 		}
 #endif
 		uploads_in_progress++;
@@ -239,11 +245,12 @@ void S3MultiPartUpload::FlushBuffer(shared_ptr<S3WriteBuffer> write_buffer) {
 void S3MultiPartUpload::FlushAllBuffers() {
 	//  Collect references to all buffers to check
 	vector<shared_ptr<S3WriteBuffer>> to_flush;
-	write_buffers_lock.lock();
-	for (auto &item : write_buffers) {
-		to_flush.push_back(item.second);
+	{
+		annotated_lock_guard<annotated_mutex> lck(write_buffers_lock);
+		for (auto &item : write_buffers) {
+			to_flush.push_back(item.second);
+		}
 	}
-	write_buffers_lock.unlock();
 
 	if (!initialized_multipart_upload) {
 		// TODO (carlo): unclear how to handle kms_key_id, but given currently they are custom, leave the multiupload
@@ -264,9 +271,9 @@ void S3MultiPartUpload::FlushAllBuffers() {
 			FlushBuffer(write_buffer);
 		}
 	}
-	unique_lock<mutex> lck(uploads_in_progress_lock);
+	annotated_unique_lock<annotated_mutex> lck(uploads_in_progress_lock);
 #ifndef SAME_THREAD_UPLOAD
-	final_flush_cv.wait(lck, [&] { return uploads_in_progress == 0; });
+	final_flush_cv.wait(lck, [&]() DUCKDB_REQUIRES(uploads_in_progress_lock) { return uploads_in_progress == 0; });
 #endif
 
 	RethrowIOError();

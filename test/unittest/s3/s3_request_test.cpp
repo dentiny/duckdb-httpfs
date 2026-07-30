@@ -5,6 +5,8 @@
 
 #include "http/httpfs.hpp"
 #include "http/httpfs_client.hpp"
+#include "crypto.hpp"
+#include "s3/s3_request.hpp"
 #include "s3/s3fs.hpp"
 
 #include "duckdb.hpp"
@@ -190,6 +192,46 @@ CREATE SECRET s3_region_redirect (
 }
 
 } // namespace
+
+TEST_CASE("S3 request signing remains deterministic", "[httpfs][s3][signing]") {
+	::AESStateSSLFactory encryption_util;
+	S3AuthParams auth_params;
+	auth_params.region = "us-east-1";
+	auth_params.access_key_id = "AKIAIOSFODNN7EXAMPLE";
+	auth_params.secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+
+	auto headers = S3RequestUtil::CreateHeader(encryption_util, "/test.txt", "", "examplebucket.s3.amazonaws.com", "s3",
+	                                           "GET", auth_params, "20130524", "20130524T000000Z");
+
+	REQUIRE(headers.GetHeaderValue("Host") == "examplebucket.s3.amazonaws.com");
+	REQUIRE(headers.GetHeaderValue("x-amz-content-sha256") ==
+	        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+	REQUIRE(headers.GetHeaderValue("Authorization") ==
+	        "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, "
+	        "SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+	        "Signature=df548e2ce037944d03f3e68682813b093763996d597cf890ca3d9037fd231eb4");
+}
+
+TEST_CASE("S3 request signing includes optional headers", "[httpfs][s3][signing]") {
+	::AESStateSSLFactory encryption_util;
+	S3AuthParams auth_params;
+	auth_params.region = "eu-west-1";
+	auth_params.access_key_id = "key";
+	auth_params.secret_access_key = "secret";
+	auth_params.session_token = "token";
+	auth_params.kms_key_id = "kms-key";
+	auth_params.requester_pays = true;
+
+	auto headers =
+	    S3RequestUtil::CreateHeader(encryption_util, "/bucket/key", "", "bucket.example.com", "s3", "PUT", auth_params,
+	                                "20260730", "20260730T120000Z", "", "application/octet-stream", "content-md5");
+
+	REQUIRE(headers.GetHeaderValue("x-amz-security-token") == "token");
+	REQUIRE(headers.GetHeaderValue("x-amz-request-payer") == "requester");
+	REQUIRE(headers.GetHeaderValue("x-amz-server-side-encryption") == "aws:kms");
+	REQUIRE(headers.GetHeaderValue("x-amz-server-side-encryption-aws-kms-key-id") == "kms-key");
+	REQUIRE(headers.GetHeaderValue("Authorization").find("content-md5;content-type;host;") != string::npos);
+}
 
 TEST_CASE("HTTPFS preserves S3 error bodies for streamed GETs", "[httpfs][s3][errors]") {
 	SECTION("httplib") {

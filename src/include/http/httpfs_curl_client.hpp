@@ -11,6 +11,24 @@ class FileOpener;
 struct FileOpenerInfo;
 class HTTPState;
 
+class CURLURLHandle {
+public:
+	CURLURLHandle();
+	CURLURLHandle(const CURLURLHandle &other);
+	~CURLURLHandle();
+
+	CURLURLHandle &operator=(const CURLURLHandle &) = delete;
+
+	CURLU *Get() {
+		return handle;
+	}
+
+private:
+	explicit CURLURLHandle(CURLU *handle_p);
+
+	CURLU *handle;
+};
+
 class CURLHandle {
 public:
 	CURLHandle(const string &token, const string &cert_path);
@@ -25,7 +43,7 @@ public:
 	}
 
 private:
-	CURL *curl = NULL;
+	CURL *curl = nullptr;
 };
 
 class CURLRequestHeaders {
@@ -52,10 +70,10 @@ public:
 		if (headers) {
 			curl_slist_free_all(headers);
 		}
-		headers = NULL;
+		headers = nullptr;
 	}
 	operator bool() const {
-		return headers != NULL;
+		return headers != nullptr;
 	}
 
 public:
@@ -64,7 +82,7 @@ public:
 	}
 
 public:
-	curl_slist *headers = NULL;
+	curl_slist *headers = nullptr;
 };
 
 } // namespace duckdb

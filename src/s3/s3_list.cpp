@@ -57,6 +57,14 @@ protected:
 	bool ExpandNextPath() const override;
 
 private:
+	void ScanCurrentCommonPrefix(vector<OpenFileInfo> &s3_keys) const;
+	void ScanTopLevel(vector<OpenFileInfo> &s3_keys) const;
+	bool ShouldInvestigateRecursiveGlob() const;
+	void SelectGlobType(string &response, string &continuation_token) const;
+	bool ContainsDenseDirectories(const vector<OpenFileInfo> &s3_keys) const;
+	void SelectNextCommonPrefix() const;
+	void AppendMatchingFiles(vector<OpenFileInfo> &s3_keys) const;
+
 	S3FileSystem &fs;
 	string glob_pattern;
 	optional_ptr<FileOpener> opener;
@@ -111,127 +119,109 @@ bool S3GlobResult::ExpandNextPath() const {
 		return false;
 	}
 
-	const vector<string> pattern_splits = StringUtil::Split(parsed_s3_url.key, "/");
-
 	vector<OpenFileInfo> s3_keys;
 	if (!current_common_prefix.empty()) {
-		// we have common prefixes left to scan - perform the request
-		auto prefix_path = parsed_s3_url.prefix + parsed_s3_url.bucket + '/' + current_common_prefix;
-
-		current_common_prefix = S3Url::Decode(current_common_prefix);
-		vector<string> key_splits = StringUtil::Split(current_common_prefix, "/");
-		const bool is_match =
-		    Match(key_splits.begin(), key_splits.end(), pattern_splits.begin(), pattern_splits.end(), false);
-		if (is_match) {
-			prefix_path = S3Url::Decode(prefix_path);
-			auto prefix_res = AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, prefix_path,
-			                                           common_prefix_continuation_token, true);
-
-			AWSListObjectV2::ParseFileList(prefix_res, s3_keys);
-			auto more_prefixes = AWSListObjectV2::ParseCommonPrefix(prefix_res);
-			common_prefixes.insert(common_prefixes.end(), more_prefixes.begin(), more_prefixes.end());
-
-			common_prefix_continuation_token = AWSListObjectV2::ParseContinuationToken(prefix_res);
-		}
-
-		if (common_prefix_continuation_token.empty()) {
-			// we are done with the current common prefix
-			// either move on to the next one, or finish up
-			if (common_prefixes.empty()) {
-				// done - we need to do a top-level request again next
-				current_common_prefix = string();
-			} else {
-				// process the next prefix
-				current_common_prefix = common_prefixes.back();
-				common_prefixes.pop_back();
-			}
-		}
+		ScanCurrentCommonPrefix(s3_keys);
 	} else {
-		if (!common_prefixes.empty()) {
-			throw InternalException("We have common prefixes but we are doing a top-level request");
-		}
-
-		Value value;
-		bool allow_s3_recursive_globbing = true;
-		if (FileOpener::TryGetCurrentSetting(opener, "s3_allow_recursive_globbing", value)) {
-			allow_s3_recursive_globbing = value.GetValue<bool>();
-		}
-
-		const bool investigate_use_recursive_glob = !StringUtil::Contains(parsed_s3_url.key, "**") &&
-		                                            allow_s3_recursive_globbing && glob_type == GlobType::UNKNOWN;
-		// issue the main request
-
-		bool perform_listing = (glob_type != GlobType::HIERARCHICAL);
-
-		// First perform listing once (default will get back up to 1000 elements)
-		string response_str = AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, shared_path,
-		                                               main_continuation_token, !perform_listing);
-
-		string next_continuation_token = AWSListObjectV2::ParseContinuationToken(response_str);
-
-		// If we could have used recursive globbing AND there are more files, check average number of files per folder
-		if (investigate_use_recursive_glob && !next_continuation_token.empty()) {
-			vector<OpenFileInfo> s3_keys_tmp;
-			AWSListObjectV2::ParseFileList(response_str, s3_keys_tmp);
-			idx_t found = 0;
-			unordered_set<string> my_set;
-			for (auto &s3_key : s3_keys_tmp) {
-				vector<string> key_splits = StringUtil::Split(s3_key.path, "/");
-
-				found++;
-				string x = "";
-				key_splits.pop_back();
-				for (string y : key_splits) {
-					x += y + "/";
-				}
-				my_set.insert(x);
-			}
-
-			if (my_set.size() * 100 < found) {
-				// We have at least 100 files per folder, this should make so that hierarchical listing price is
-				// amortized folder of hierarchical glob
-
-				// Start from scratch:
-				// 1. clear keys
-				s3_keys_tmp.clear();
-				// 2. do request again, now passing true
-				response_str = AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, shared_path,
-				                                        main_continuation_token, true);
-
-				// 3. now set next_continuation_token
-				next_continuation_token = AWSListObjectV2::ParseContinuationToken(response_str);
-
-				glob_type = GlobType::HIERARCHICAL;
-			} else {
-				glob_type = GlobType::LISTING;
-			}
-		}
-
-		main_continuation_token = next_continuation_token;
-		AWSListObjectV2::ParseFileList(response_str, s3_keys);
-
-		// parse the list of common prefixes
-		common_prefixes = AWSListObjectV2::ParseCommonPrefix(response_str);
-		if (!common_prefixes.empty()) {
-			// we have common prefixes - set one up for the next request
-			current_common_prefix = common_prefixes.back();
-			common_prefixes.pop_back();
-		}
+		ScanTopLevel(s3_keys);
 	}
 
 	if (main_continuation_token.empty() && current_common_prefix.empty()) {
-		// we are done
 		finished = true;
 	}
+	AppendMatchingFiles(s3_keys);
+	return true;
+}
 
+void S3GlobResult::ScanCurrentCommonPrefix(vector<OpenFileInfo> &s3_keys) const {
+	auto prefix_path = parsed_s3_url.prefix + parsed_s3_url.bucket + '/' + current_common_prefix;
+	current_common_prefix = S3Url::Decode(current_common_prefix);
+	auto key_splits = StringUtil::Split(current_common_prefix, "/");
+	auto pattern_splits = StringUtil::Split(parsed_s3_url.key, "/");
+	if (Match(key_splits.begin(), key_splits.end(), pattern_splits.begin(), pattern_splits.end(), false)) {
+		prefix_path = S3Url::Decode(prefix_path);
+		auto response = AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, prefix_path,
+		                                         common_prefix_continuation_token, true);
+		AWSListObjectV2::ParseFileList(response, s3_keys);
+		auto more_prefixes = AWSListObjectV2::ParseCommonPrefix(response);
+		common_prefixes.insert(common_prefixes.end(), more_prefixes.begin(), more_prefixes.end());
+		common_prefix_continuation_token = AWSListObjectV2::ParseContinuationToken(response);
+	}
+	if (common_prefix_continuation_token.empty()) {
+		SelectNextCommonPrefix();
+	}
+}
+
+void S3GlobResult::ScanTopLevel(vector<OpenFileInfo> &s3_keys) const {
+	if (!common_prefixes.empty()) {
+		throw InternalException("We have common prefixes but we are doing a top-level request");
+	}
+	const bool hierarchical = glob_type == GlobType::HIERARCHICAL;
+	auto response = AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, shared_path,
+	                                         main_continuation_token, hierarchical);
+	auto continuation_token = AWSListObjectV2::ParseContinuationToken(response);
+	if (ShouldInvestigateRecursiveGlob() && !continuation_token.empty()) {
+		SelectGlobType(response, continuation_token);
+	}
+	main_continuation_token = continuation_token;
+	AWSListObjectV2::ParseFileList(response, s3_keys);
+	common_prefixes = AWSListObjectV2::ParseCommonPrefix(response);
+	SelectNextCommonPrefix();
+}
+
+bool S3GlobResult::ShouldInvestigateRecursiveGlob() const {
+	if (glob_type != GlobType::UNKNOWN || StringUtil::Contains(parsed_s3_url.key, "**")) {
+		return false;
+	}
+	Value value;
+	if (!FileOpener::TryGetCurrentSetting(opener, "s3_allow_recursive_globbing", value)) {
+		return true;
+	}
+	return value.GetValue<bool>();
+}
+
+void S3GlobResult::SelectGlobType(string &response, string &continuation_token) const {
+	vector<OpenFileInfo> s3_keys;
+	AWSListObjectV2::ParseFileList(response, s3_keys);
+	if (!ContainsDenseDirectories(s3_keys)) {
+		glob_type = GlobType::LISTING;
+		return;
+	}
+	response =
+	    AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, shared_path, main_continuation_token, true);
+	continuation_token = AWSListObjectV2::ParseContinuationToken(response);
+	glob_type = GlobType::HIERARCHICAL;
+}
+
+bool S3GlobResult::ContainsDenseDirectories(const vector<OpenFileInfo> &s3_keys) const {
+	unordered_set<string> directories;
+	for (const auto &s3_key : s3_keys) {
+		auto key_splits = StringUtil::Split(s3_key.path, "/");
+		key_splits.pop_back();
+		string directory;
+		for (const auto &split : key_splits) {
+			directory += split + "/";
+		}
+		directories.insert(std::move(directory));
+	}
+	return directories.size() * 100 < s3_keys.size();
+}
+
+void S3GlobResult::SelectNextCommonPrefix() const {
+	if (common_prefixes.empty()) {
+		current_common_prefix.clear();
+		return;
+	}
+	current_common_prefix = common_prefixes.back();
+	common_prefixes.pop_back();
+}
+
+void S3GlobResult::AppendMatchingFiles(vector<OpenFileInfo> &s3_keys) const {
+	auto pattern_splits = StringUtil::Split(parsed_s3_url.key, "/");
 	for (auto &s3_key : s3_keys) {
-
-		vector<string> key_splits = StringUtil::Split(s3_key.path, "/");
-		bool is_match = Match(key_splits.begin(), key_splits.end(), pattern_splits.begin(), pattern_splits.end(), true);
-
-		if (is_match) {
+		auto key_splits = StringUtil::Split(s3_key.path, "/");
+		if (Match(key_splits.begin(), key_splits.end(), pattern_splits.begin(), pattern_splits.end(), true)) {
 			auto result_full_url = parsed_s3_url.prefix + parsed_s3_url.bucket + "/" + s3_key.path;
-			// if a ? char was present, we re-add it here as the url parsing will have trimmed it.
 			if (!parsed_s3_url.query_param.empty()) {
 				result_full_url += '?' + parsed_s3_url.query_param;
 			}
@@ -244,7 +234,6 @@ bool S3GlobResult::ExpandNextPath() const {
 			expanded_files.push_back(std::move(s3_key));
 		}
 	}
-	return true;
 }
 
 unique_ptr<MultiFileList> S3FileSystem::GlobFilesExtended(const string &path, const FileGlobInput &input,
@@ -277,36 +266,14 @@ bool S3FileSystem::ListFilesExtended(const string &directory, const std::functio
 	return true;
 }
 
-// Tolerant variant for error bodies: a truncated/malformed body must not escalate to a DB-invalidating
-// InternalException, so an unmatched open tag is "not found".
-
-string AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSession &session, const string &path,
-                                const string &continuation_token, bool use_delimiter, optional_idx max_keys) {
-	auto create_request_data = [&]() {
+struct S3ListRequest {
+	static S3RequestData Create(EncryptionUtil &encryption_util, HTTPRequestSession &session, const string &path,
+	                            const string &continuation_token, bool use_delimiter, optional_idx max_keys) {
 		auto captured = session.Capture();
 		auto &snapshot = captured.snapshot->Cast<S3RequestSnapshot>();
 		auto auth_params = snapshot.auth_params;
 		auto parsed_url = S3Url::Parse(path, auth_params);
-
-		map<string, string> request_params;
-		if (!continuation_token.empty()) {
-			request_params["continuation-token"] = S3Url::Encode(continuation_token, true);
-		}
-		if (use_delimiter) {
-			request_params["delimiter"] = "%2F";
-		}
-		request_params["encoding-type"] = "url";
-		request_params["list-type"] = "2";
-		if (max_keys.IsValid()) {
-			request_params["max-keys"] = to_string(max_keys.GetIndex());
-		}
-		request_params["prefix"] = S3Url::Encode(parsed_url.key, true);
-
-		string encoded_params;
-		for (const auto &param : request_params) {
-			encoded_params += param.first + "=" + param.second + "&";
-		}
-		encoded_params.pop_back();
+		auto encoded_params = BuildParameters(parsed_url, continuation_token, use_delimiter, max_keys);
 
 		S3RequestData result;
 		result.captured = captured;
@@ -324,10 +291,56 @@ string AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSess
 		}
 		snapshot.AddConfiguredHeaders(result.headers);
 		return result;
-	};
+	}
 
+	static string Finish(HTTPRequestSession &session, const string &path, unique_ptr<HTTPResponse> response) {
+		if (response->HasRequestError()) {
+			throw IOException("%s error for HTTP GET to '%s'", response->GetRequestError(), path);
+		}
+		if (static_cast<int>(response->status) >= 400) {
+			auto captured = session.Capture();
+			auto &snapshot = captured.snapshot->Cast<S3RequestSnapshot>();
+			auto trimmed_path = path;
+			StringUtil::RTrim(trimmed_path, "/");
+			throw S3RequestUtil::GetError(snapshot.auth_params, *response, trimmed_path);
+		}
+		return std::move(response->body);
+	}
+
+private:
+	static string BuildParameters(const ParsedS3Url &parsed_url, const string &continuation_token, bool use_delimiter,
+	                              optional_idx max_keys) {
+		map<string, string> request_params;
+		if (!continuation_token.empty()) {
+			request_params["continuation-token"] = S3Url::Encode(continuation_token, true);
+		}
+		if (use_delimiter) {
+			request_params["delimiter"] = "%2F";
+		}
+		request_params["encoding-type"] = "url";
+		request_params["list-type"] = "2";
+		if (max_keys.IsValid()) {
+			request_params["max-keys"] = to_string(max_keys.GetIndex());
+		}
+		request_params["prefix"] = S3Url::Encode(parsed_url.key, true);
+
+		string result;
+		for (const auto &param : request_params) {
+			result += param.first + "=" + param.second + "&";
+		}
+		result.pop_back();
+		return result;
+	}
+};
+
+string AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSession &session, const string &path,
+                                const string &continuation_token, bool use_delimiter, optional_idx max_keys) {
 	auto response = S3RequestExecutor::Run(
-	    path, create_request_data, true,
+	    path,
+	    [&]() {
+		    return S3ListRequest::Create(encryption_util, session, path, continuation_token, use_delimiter, max_keys);
+	    },
+	    true,
 	    [&](S3RequestData &request_data) {
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		    GetRequestInfo get_request(request_data.http_url, request_data.headers, params, nullptr, nullptr);
@@ -345,17 +358,7 @@ string AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSess
 			        path, previous_region, correct_region);
 		    }
 	    });
-	if (response->HasRequestError()) {
-		throw IOException("%s error for HTTP GET to '%s'", response->GetRequestError(), path);
-	}
-	if (static_cast<int>(response->status) >= 400) {
-		auto captured = session.Capture();
-		auto &snapshot = captured.snapshot->Cast<S3RequestSnapshot>();
-		string trimmed_path = path;
-		StringUtil::RTrim(trimmed_path, "/");
-		throw S3RequestUtil::GetError(snapshot.auth_params, *response, trimmed_path);
-	}
-	return std::move(response->body);
+	return S3ListRequest::Finish(session, path, std::move(response));
 }
 
 void AWSListObjectV2::ParseFileList(string &aws_response, vector<OpenFileInfo> &result) {

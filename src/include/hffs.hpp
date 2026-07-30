@@ -30,7 +30,7 @@ public:
 	                                            CachedFileDownload &download) override;
 	duckdb::unique_ptr<HTTPResponse> GetRangeRequest(FileHandle &handle, string hf_url, HTTPHeaders header_map,
 	                                                 const HTTPReadConfig &read_config, idx_t file_offset,
-	                                                 char *buffer_out, idx_t buffer_out_len) override;
+	                                                 data_ptr_t buffer_out, idx_t buffer_out_len) override;
 
 	bool CanHandleFile(const string &fpath) override {
 		return fpath.rfind("hf://", 0) == 0;
@@ -40,6 +40,7 @@ public:
 		return "HuggingFaceFileSystem";
 	}
 	static ParsedHFUrl HFUrlParse(const string &url);
+	static void ParseListResult(const string &input, vector<string> &files, vector<string> &directories);
 	string GetHFUrl(const ParsedHFUrl &url);
 	string GetTreeUrl(const ParsedHFUrl &url, idx_t limit);
 	string GetFileUrl(const ParsedHFUrl &url);

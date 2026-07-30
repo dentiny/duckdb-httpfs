@@ -31,92 +31,111 @@ HTTPUtil &HTTPFSUtil::GetHTTPUtil(optional_ptr<FileOpener> opener) {
 	throw InternalException("FileOpener not provided, can't get HTTPUtil");
 }
 
-unique_ptr<HTTPParams> HTTPFSUtil::InitializeParameters(optional_ptr<FileOpener> opener,
-                                                        optional_ptr<FileOpenerInfo> info) {
-	auto result = make_uniq<HTTPFSParams>(*this);
-	result->Initialize(opener);
-	result->state = HTTPState::TryGetState(opener);
-	result->client_reuse_mode = GetClientReuseMode();
-	result->httpfs_util = this;
+struct HTTPParametersInitializer {
+	static unique_ptr<HTTPParams> Create(HTTPFSUtil &httpfs_util, optional_ptr<FileOpener> opener,
+	                                     optional_ptr<FileOpenerInfo> info) {
+		HTTPParametersInitializer initializer(httpfs_util, opener, info);
+		return initializer.Initialize();
+	}
 
-	// No point in continuing without an opener
-	if (!opener) {
+private:
+	HTTPParametersInitializer(HTTPFSUtil &httpfs_util_p, optional_ptr<FileOpener> opener_p,
+	                          optional_ptr<FileOpenerInfo> info_p)
+	    : httpfs_util(httpfs_util_p), opener(opener_p), info(info_p), result(make_uniq<HTTPFSParams>(httpfs_util)) {
+	}
+
+	unique_ptr<HTTPParams> Initialize() {
+		result->Initialize(opener);
+		result->state = HTTPState::TryGetState(opener);
+		result->client_reuse_mode = httpfs_util.GetClientReuseMode();
+		result->httpfs_util = httpfs_util;
+		if (!opener) {
+			return std::move(result);
+		}
+		ReadSettings();
+		SetUserAgent();
+		auto settings_reader = CreateSettingsReader();
+		ReadSecrets(*settings_reader);
 		return std::move(result);
 	}
 
-	Value value;
+	void ReadSettings() {
+		FileOpener::TryGetCurrentSetting(opener, "http_timeout", result->timeout, info);
+		FileOpener::TryGetCurrentSetting(opener, "force_download", result->force_download, info);
+		FileOpener::TryGetCurrentSetting(opener, "force_download_threshold", result->force_download_threshold, info);
+		FileOpener::TryGetCurrentSetting(opener, "auto_fallback_to_full_download",
+		                                 result->auto_fallback_to_full_download, info);
+		FileOpener::TryGetCurrentSetting(opener, "http_retries", result->retries, info);
+		FileOpener::TryGetCurrentSetting(opener, "http_retry_wait_ms", result->retry_wait_ms, info);
+		FileOpener::TryGetCurrentSetting(opener, "http_retry_backoff", result->retry_backoff, info);
+		FileOpener::TryGetCurrentSetting(opener, "http_keep_alive", result->keep_alive, info);
+		FileOpener::TryGetCurrentSetting(opener, "enable_curl_server_cert_verification",
+		                                 result->enable_curl_server_cert_verification, info);
+		FileOpener::TryGetCurrentSetting(opener, "enable_server_cert_verification",
+		                                 result->enable_server_cert_verification, info);
+		FileOpener::TryGetCurrentSetting(opener, "ca_cert_file", result->ca_cert_file, info);
+		FileOpener::TryGetCurrentSetting(opener, "hf_max_per_page", result->hf_max_per_page, info);
+		FileOpener::TryGetCurrentSetting(opener, "unsafe_disable_etag_checks", result->unsafe_disable_etag_checks,
+		                                 info);
+		FileOpener::TryGetCurrentSetting(opener, "s3_version_id_pinning", result->s3_version_id_pinning, info);
+	}
 
-	// Setting lookups
-	FileOpener::TryGetCurrentSetting(opener, "http_timeout", result->timeout, info);
-	FileOpener::TryGetCurrentSetting(opener, "force_download", result->force_download, info);
-	FileOpener::TryGetCurrentSetting(opener, "force_download_threshold", result->force_download_threshold, info);
-	FileOpener::TryGetCurrentSetting(opener, "auto_fallback_to_full_download", result->auto_fallback_to_full_download,
-	                                 info);
-	FileOpener::TryGetCurrentSetting(opener, "http_retries", result->retries, info);
-	FileOpener::TryGetCurrentSetting(opener, "http_retry_wait_ms", result->retry_wait_ms, info);
-	FileOpener::TryGetCurrentSetting(opener, "http_retry_backoff", result->retry_backoff, info);
-	FileOpener::TryGetCurrentSetting(opener, "http_keep_alive", result->keep_alive, info);
-	FileOpener::TryGetCurrentSetting(opener, "enable_curl_server_cert_verification",
-	                                 result->enable_curl_server_cert_verification, info);
-	FileOpener::TryGetCurrentSetting(opener, "enable_server_cert_verification", result->enable_server_cert_verification,
-	                                 info);
-	FileOpener::TryGetCurrentSetting(opener, "ca_cert_file", result->ca_cert_file, info);
-	FileOpener::TryGetCurrentSetting(opener, "hf_max_per_page", result->hf_max_per_page, info);
-	FileOpener::TryGetCurrentSetting(opener, "unsafe_disable_etag_checks", result->unsafe_disable_etag_checks, info);
-	FileOpener::TryGetCurrentSetting(opener, "s3_version_id_pinning", result->s3_version_id_pinning, info);
-
-	{
+	void SetUserAgent() {
 		auto db = FileOpener::TryGetDatabase(opener);
 		if (db) {
 			result->user_agent = StringUtil::Format("%s %s", db->config.UserAgent(), DuckDB::SourceID());
 		}
 	}
 
-	unique_ptr<KeyValueSecretReader> settings_reader;
-	if (info && !S3Url::TryGetPrefix(info->file_path).empty()) {
-		// This is an S3-type url, we should
-		const char *s3_secret_types[] = {"s3", "r2", "gcs", "aws", "http"};
-
-		idx_t secret_type_count = 5;
-		Value merge_http_secret_into_s3_request;
-		FileOpener::TryGetCurrentSetting(opener, "merge_http_secret_into_s3_request",
-		                                 merge_http_secret_into_s3_request);
-
-		if (!merge_http_secret_into_s3_request.IsNull() && !merge_http_secret_into_s3_request.GetValue<bool>()) {
-			// Drop the http secret from the lookup
-			secret_type_count = 4;
+	unique_ptr<KeyValueSecretReader> CreateSettingsReader() {
+		if (info && !S3Url::TryGetPrefix(info->file_path).empty()) {
+			const char *s3_secret_types[] = {"s3", "r2", "gcs", "aws", "http"};
+			idx_t secret_type_count = 5;
+			Value merge_http_secret_into_s3_request;
+			FileOpener::TryGetCurrentSetting(opener, "merge_http_secret_into_s3_request",
+			                                 merge_http_secret_into_s3_request);
+			if (!merge_http_secret_into_s3_request.IsNull() && !merge_http_secret_into_s3_request.GetValue<bool>()) {
+				secret_type_count = 4;
+			}
+			return make_uniq<KeyValueSecretReader>(*opener, info, s3_secret_types, secret_type_count);
 		}
-		settings_reader = make_uniq<KeyValueSecretReader>(*opener, info, s3_secret_types, secret_type_count);
-	} else {
-		settings_reader = make_uniq<KeyValueSecretReader>(*opener, info, "http");
+		return make_uniq<KeyValueSecretReader>(*opener, info, "http");
 	}
 
-	// HTTP Secret lookups
+	void ReadSecrets(KeyValueSecretReader &settings_reader) {
+		string proxy_setting;
+		if (settings_reader.TryGetSecretKey<string>("http_proxy", proxy_setting) && !proxy_setting.empty()) {
+			idx_t port;
+			string host;
+			HTTPUtil::ParseHTTPProxyHost(proxy_setting, host, port);
+			result->http_proxy = host;
+			result->http_proxy_port = port;
+		}
+		result->override_verify_ssl = settings_reader.TryGetSecretKey<bool>("verify_ssl", result->verify_ssl);
+		settings_reader.TryGetSecretKey<string>("http_proxy_username", result->http_proxy_username);
+		settings_reader.TryGetSecretKey<string>("http_proxy_password", result->http_proxy_password);
+		settings_reader.TryGetSecretKey<string>("bearer_token", result->bearer_token);
 
-	string proxy_setting;
-	if (settings_reader->TryGetSecretKey<string>("http_proxy", proxy_setting) && !proxy_setting.empty()) {
-		idx_t port;
-		string host;
-		HTTPUtil::ParseHTTPProxyHost(proxy_setting, host, port);
-		result->http_proxy = host;
-		result->http_proxy_port = port;
-	}
-	result->override_verify_ssl = settings_reader->TryGetSecretKey<bool>("verify_ssl", result->verify_ssl);
-	settings_reader->TryGetSecretKey<string>("http_proxy_username", result->http_proxy_username);
-	settings_reader->TryGetSecretKey<string>("http_proxy_password", result->http_proxy_password);
-	settings_reader->TryGetSecretKey<string>("bearer_token", result->bearer_token);
-
-	Value extra_headers;
-	if (settings_reader->TryGetSecretKey("extra_http_headers", extra_headers)) {
-		auto children = MapValue::GetChildren(extra_headers);
-		for (const auto &child : children) {
-			auto kv = StructValue::GetChildren(child);
-			D_ASSERT(kv.size() == 2);
-			result->extra_headers[kv[0].GetValue<string>()] = kv[1].GetValue<string>();
+		Value extra_headers;
+		if (settings_reader.TryGetSecretKey("extra_http_headers", extra_headers)) {
+			auto children = MapValue::GetChildren(extra_headers);
+			for (const auto &child : children) {
+				auto key_value = StructValue::GetChildren(child);
+				D_ASSERT(key_value.size() == 2);
+				result->extra_headers[key_value[0].GetValue<string>()] = key_value[1].GetValue<string>();
+			}
 		}
 	}
 
-	return std::move(result);
+	HTTPFSUtil &httpfs_util;
+	optional_ptr<FileOpener> opener;
+	optional_ptr<FileOpenerInfo> info;
+	unique_ptr<HTTPFSParams> result;
+};
+
+unique_ptr<HTTPParams> HTTPFSUtil::InitializeParameters(optional_ptr<FileOpener> opener,
+                                                        optional_ptr<FileOpenerInfo> info) {
+	return HTTPParametersInitializer::Create(*this, opener, info);
 }
 
 unique_ptr<HTTPParams> HTTPFSParams::Clone() const {
@@ -298,7 +317,7 @@ static bool RespondedWithRangeRequestNotSupported(const HTTPResponse &res) {
 }
 
 bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map,
-                                     const HTTPReadConfig &read_config, idx_t file_offset, char *buffer_out,
+                                     const HTTPReadConfig &read_config, idx_t file_offset, data_ptr_t buffer_out,
                                      idx_t buffer_out_len) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
 
@@ -328,7 +347,7 @@ bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders
 	throw IOException("Unknown error for HTTP %s to '%s'", EnumUtil::ToString(RequestType::GET_REQUEST), url);
 }
 
-bool HTTPFileSystem::ReadAt(FileHandle &handle, void *buffer, idx_t read_size, idx_t location,
+bool HTTPFileSystem::ReadAt(FileHandle &handle, data_ptr_t buffer, idx_t read_size, idx_t location,
                             const HTTPReadConfig &read_config) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
 	if (read_size > NumericLimits<idx_t>::Maximum() - location) {
@@ -347,7 +366,7 @@ bool HTTPFileSystem::ReadAt(FileHandle &handle, void *buffer, idx_t read_size, i
 			memcpy(buffer, cached_file->GetData() + location, read_size);
 		}
 	} else if (read_size > 0) {
-		if (!TryRangeRequest(hfh, hfh.path, {}, read_config, location, static_cast<char *>(buffer), read_size)) {
+		if (!TryRangeRequest(hfh, hfh.path, {}, read_config, location, buffer, read_size)) {
 			return false;
 		}
 	}
@@ -356,7 +375,7 @@ bool HTTPFileSystem::ReadAt(FileHandle &handle, void *buffer, idx_t read_size, i
 	return true;
 }
 
-void HTTPFileSystem::ReadAtWithFallback(FileHandle &handle, void *buffer, idx_t read_size, idx_t location,
+void HTTPFileSystem::ReadAtWithFallback(FileHandle &handle, data_ptr_t buffer, idx_t read_size, idx_t location,
                                         const HTTPReadConfig &read_config) {
 	auto success = ReadAt(handle, buffer, read_size, location, read_config);
 	if (success) {
@@ -402,7 +421,7 @@ void HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 		return;
 	}
 	auto read_config = hfh.GetReadConfig();
-	ReadAtWithFallback(handle, buffer, read_size, location, read_config);
+	ReadAtWithFallback(handle, data_ptr_cast(buffer), read_size, location, read_config);
 }
 
 int64_t HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
@@ -415,7 +434,7 @@ int64_t HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes)
 	read_size = MinValue<idx_t>(hfh.length - hfh.file_offset, read_size);
 	const auto location = hfh.file_offset;
 	auto read_config = hfh.GetReadConfig();
-	ReadAtWithFallback(handle, buffer, read_size, location, read_config);
+	ReadAtWithFallback(handle, data_ptr_cast(buffer), read_size, location, read_config);
 	hfh.file_offset += read_size;
 	return NumericCast<int64_t>(read_size);
 }
@@ -485,7 +504,7 @@ optional_ptr<HTTPMetadataCache> HTTPFileSystem::GetGlobalCache() {
 	if (!global_metadata_cache) {
 		global_metadata_cache = make_uniq<HTTPMetadataCache>(false, true);
 	}
-	return global_metadata_cache.get();
+	return global_metadata_cache;
 }
 
 void HTTPFileSystem::EraseGlobalCacheEntry(const string &path) {
@@ -513,7 +532,7 @@ static optional_ptr<HTTPMetadataCache> TryGetMetadataCache(optional_ptr<FileOpen
 	if (use_shared_cache) {
 		return httpfs.GetGlobalCache();
 	} else if (client_context) {
-		return client_context->registered_state->GetOrCreate<HTTPMetadataCache>("http_cache", true, true).get();
+		return client_context->registered_state->GetOrCreate<HTTPMetadataCache>("http_cache", true, true);
 	}
 	return nullptr;
 }
@@ -555,119 +574,130 @@ bool HTTPFileSystem::TryParseLastModifiedTime(const string &timestamp, timestamp
 	return true;
 }
 
-optional_idx TryParseContentRange(const HTTPHeaders &headers) {
-	if (!headers.HasHeader("Content-Range")) {
-		return optional_idx();
+struct HTTPFileInfoParser {
+	static optional_idx TryParseContentRange(const HTTPHeaders &headers) {
+		if (!headers.HasHeader("Content-Range")) {
+			return optional_idx();
+		}
+		auto content_range = headers.GetHeaderValue("Content-Range");
+		auto range_find = content_range.find("/");
+		if (range_find == string::npos || content_range.size() < range_find + 1) {
+			return optional_idx();
+		}
+		auto range_length = content_range.substr(range_find + 1);
+		if (range_length == "*") {
+			return optional_idx();
+		}
+		return TryParseLength(range_length);
 	}
-	string content_range = headers.GetHeaderValue("Content-Range");
-	auto range_find = content_range.find("/");
-	if (range_find == std::string::npos || content_range.size() < range_find + 1) {
-		return optional_idx();
-	}
-	string range_length = content_range.substr(range_find + 1);
-	if (range_length == "*") {
-		return optional_idx();
-	}
-	try {
-		return std::stoull(range_length);
-	} catch (...) {
-		return optional_idx();
-	}
-}
 
-optional_idx TryParseContentLength(const HTTPHeaders &headers) {
-	if (!headers.HasHeader("Content-Length")) {
-		return optional_idx();
+	static optional_idx TryParseContentLength(const HTTPHeaders &headers) {
+		if (!headers.HasHeader("Content-Length")) {
+			return optional_idx();
+		}
+		return TryParseLength(headers.GetHeaderValue("Content-Length"));
 	}
-	string content_length = headers.GetHeaderValue("Content-Length");
-	try {
-		return std::stoull(content_length);
-	} catch (...) {
-		return optional_idx();
+
+private:
+	static optional_idx TryParseLength(const string &input) {
+		try {
+			return NumericCast<idx_t>(std::stoull(input));
+		} catch (...) {
+			return optional_idx();
+		}
 	}
-}
+};
 
-void HTTPFileHandle::LoadFileInfo() {
-
-	// Check if file is already fully cached (e.g., from a prior force_download_threshold open)
+bool HTTPFileHandle::TryLoadFileInfoWithoutRequest() {
 	D_ASSERT(file_state);
 	if (auto cached_file = file_state->TryGetCachedFileHandle()) {
 		length = cached_file->GetSize();
 		initialized = true;
-		return;
+		return true;
 	}
-
 	if (initialized || force_full_download) {
-		// already initialized or we specifically do not want to perform a head request and just run a direct download
-		return;
+		return true;
 	}
-
-	// In write_overwrite_mode we dgaf about the size, so no head request is needed
 	if (write_overwrite_mode) {
 		length = 0;
 		initialized = true;
-		return;
+		return true;
 	}
+	return false;
+}
 
-	auto &hfs = file_system.Cast<HTTPFileSystem>();
-	auto res = hfs.HeadRequest(*this, path, {});
-	if (res->status != HTTPStatusCode::OK_200) {
-		if (flags.OpenForWriting() && res->status == HTTPStatusCode::NotFound_404) {
-			if (!flags.CreateFileIfNotExists() && !flags.OverwriteExistingFile()) {
-				throw IOException(
-				    "Unable to open URL \"%s\" for writing: file does not exist and CREATE flag is not set", path);
-			}
-			length = 0;
-			return;
-		} else {
-			// HEAD request fail, use Range request for another try (read only one byte)
-			if (flags.OpenForReading() && res->status != HTTPStatusCode::NotFound_404 &&
-			    res->status != HTTPStatusCode::MovedPermanently_301) {
-				auto read_config = BuildReadConfig();
-				auto range_res = hfs.GetRangeRequest(*this, path, {}, read_config, 0, nullptr, 2);
-				if (range_res->status != HTTPStatusCode::PartialContent_206 &&
-				    range_res->status != HTTPStatusCode::Accepted_202 && range_res->status != HTTPStatusCode::OK_200) {
-					// It failed again, check whether we can fall back to full download
-					if (RespondedWithRangeRequestNotSupported(*range_res) &&
-					    read_config.auto_fallback_to_full_download) {
-						force_full_download = true;
-					} else {
-						throw hfs.GetHTTPError(*this, *range_res, path);
-					}
-				}
-				res = std::move(range_res);
-			} else {
-				throw hfs.GetHTTPError(*this, *res, path);
-			}
-		}
+unique_ptr<HTTPResponse> HTTPFileHandle::RequestFileInfo(HTTPFileSystem &hfs) {
+	auto response = hfs.HeadRequest(*this, path, {});
+	if (response->status == HTTPStatusCode::OK_200) {
+		return response;
 	}
+	if (flags.OpenForWriting() && response->status == HTTPStatusCode::NotFound_404) {
+		if (!flags.CreateFileIfNotExists() && !flags.OverwriteExistingFile()) {
+			throw IOException("Unable to open URL \"%s\" for writing: file does not exist and CREATE flag is not set",
+			                  path);
+		}
+		length = 0;
+		return nullptr;
+	}
+	if (flags.OpenForReading() && response->status != HTTPStatusCode::NotFound_404 &&
+	    response->status != HTTPStatusCode::MovedPermanently_301) {
+		return RetryFileInfoWithRange(hfs);
+	}
+	throw hfs.GetHTTPError(*this, *response, path);
+}
+
+unique_ptr<HTTPResponse> HTTPFileHandle::RetryFileInfoWithRange(HTTPFileSystem &hfs) {
+	auto config = BuildReadConfig();
+	auto response = hfs.GetRangeRequest(*this, path, {}, config, 0, nullptr, 2);
+	if (response->status == HTTPStatusCode::PartialContent_206 || response->status == HTTPStatusCode::Accepted_202 ||
+	    response->status == HTTPStatusCode::OK_200) {
+		return response;
+	}
+	if (RespondedWithRangeRequestNotSupported(*response) && config.auto_fallback_to_full_download) {
+		force_full_download = true;
+		return response;
+	}
+	throw hfs.GetHTTPError(*this, *response, path);
+}
+
+void HTTPFileHandle::ApplyFileInfo(const HTTPResponse &response) {
 	length = 0;
-	optional_idx content_size;
-	content_size = TryParseContentRange(res->headers);
+	auto content_size = HTTPFileInfoParser::TryParseContentRange(response.headers);
 	if (!content_size.IsValid()) {
-		content_size = TryParseContentLength(res->headers);
+		content_size = HTTPFileInfoParser::TryParseContentLength(response.headers);
 	}
 	if (content_size.IsValid()) {
 		length = content_size.GetIndex();
 	}
-	if (res->headers.HasHeader("Last-Modified")) {
-		HTTPFileSystem::TryParseLastModifiedTime(res->headers.GetHeaderValue("Last-Modified"), last_modified);
+	if (response.headers.HasHeader("Last-Modified")) {
+		HTTPFileSystem::TryParseLastModifiedTime(response.headers.GetHeaderValue("Last-Modified"), last_modified);
 	}
-	if (res->headers.HasHeader("ETag")) {
-		etag = res->headers.GetHeaderValue("ETag");
+	if (response.headers.HasHeader("ETag")) {
+		etag = response.headers.GetHeaderValue("ETag");
 	}
 	if (request_session->Capture().snapshot->Params().s3_version_id_pinning &&
-	    res->headers.HasHeader("x-amz-version-id")) {
-		SetVersionId(res->headers.GetHeaderValue("x-amz-version-id"));
+	    response.headers.HasHeader("x-amz-version-id")) {
+		SetVersionId(response.headers.GetHeaderValue("x-amz-version-id"));
 	}
-	if (res->headers.HasHeader("Accept-Ranges")) {
-		auto accept_ranges = res->headers.GetHeaderValue("Accept-Ranges");
+	if (response.headers.HasHeader("Accept-Ranges")) {
+		auto accept_ranges = response.headers.GetHeaderValue("Accept-Ranges");
 		StringUtil::Trim(accept_ranges);
 		if (StringUtil::CIEquals(accept_ranges, "bytes")) {
 			file_state->MarkRangeRequestsSupported();
 		}
 	}
 	initialized = true;
+}
+
+void HTTPFileHandle::LoadFileInfo() {
+	if (TryLoadFileInfoWithoutRequest()) {
+		return;
+	}
+	auto &hfs = file_system.Cast<HTTPFileSystem>();
+	auto response = RequestFileInfo(hfs);
+	if (response) {
+		ApplyFileInfo(*response);
+	}
 }
 
 void HTTPFileHandle::TryAddLogger(FileOpener &opener) {
@@ -701,8 +731,7 @@ HTTPMetadataCacheEntry HTTPFileHandle::GetCacheEntry() const {
 	return result;
 }
 
-void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
-	auto &hfs = file_system.Cast<HTTPFileSystem>();
+void HTTPFileHandle::InitializeRequestState(optional_ptr<FileOpener> opener) {
 	auto client_context = FileOpener::TryGetClientContext(opener);
 	if (client_context) {
 		buffer_allocator = BufferAllocator::Get(*client_context);
@@ -723,48 +752,62 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 	if (opener) {
 		TryAddLogger(*opener);
 	}
+}
 
-	auto current_cache = TryGetMetadataCache(opener, hfs);
-
-	bool should_write_cache = false;
-	if (flags.OpenForReading()) {
-		if (request_snapshot->Params().force_download) {
-			FinalizeReadConfig();
-			length = hfs.FullDownload(*this, GetReadConfig(), should_write_cache)->GetSize();
-			return;
-		}
-
-		if (current_cache) {
-			HTTPMetadataCacheEntry value;
-			bool found = current_cache->Find(path, value);
-
-			if (found) {
-				InitializeFromCacheEntry(value);
-				FinalizeReadConfig();
-				return;
-			}
-
-			should_write_cache = true;
-		}
+bool HTTPFileHandle::TryInitializeRead(HTTPFileSystem &hfs, optional_ptr<HTTPMetadataCache> cache,
+                                       bool &should_write_cache) {
+	if (!flags.OpenForReading()) {
+		return false;
 	}
+	auto request_snapshot = request_session->Capture().snapshot;
+	if (request_snapshot->Params().force_download) {
+		FinalizeReadConfig();
+		length = hfs.FullDownload(*this, GetReadConfig(), should_write_cache)->GetSize();
+		return true;
+	}
+
+	if (cache) {
+		HTTPMetadataCacheEntry value;
+		if (cache->Find(path, value)) {
+			InitializeFromCacheEntry(value);
+			FinalizeReadConfig();
+			return true;
+		}
+		should_write_cache = true;
+	}
+	return false;
+}
+
+void HTTPFileHandle::InitializeFileInfo(HTTPFileSystem &hfs, optional_ptr<HTTPMetadataCache> cache,
+                                        bool should_write_cache) {
 	LoadFileInfo();
 	FinalizeReadConfig();
 
 	if (flags.OpenForReading()) {
-
+		auto request_snapshot = request_session->Capture().snapshot;
 		const auto has_cache_state = (request_snapshot->Params().state != nullptr) && (length == 0);
 		const auto always_download = force_full_download;
 		const auto meets_threshold = (length < request_snapshot->Params().force_download_threshold) && (length != 0);
-
 		const auto should_full_download = has_cache_state || meets_threshold || always_download;
 
 		if (should_full_download) {
 			length = hfs.FullDownload(*this, GetReadConfig(), should_write_cache)->GetSize();
 		}
 		if (should_write_cache) {
-			current_cache->Insert(path, GetCacheEntry());
+			cache->Insert(path, GetCacheEntry());
 		}
 	}
+}
+
+void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
+	auto &hfs = file_system.Cast<HTTPFileSystem>();
+	InitializeRequestState(opener);
+	auto current_cache = TryGetMetadataCache(opener, hfs);
+	bool should_write_cache = false;
+	if (TryInitializeRead(hfs, current_cache, should_write_cache)) {
+		return;
+	}
+	InitializeFileInfo(hfs, current_cache, should_write_cache);
 
 	// If we're writing to a file, we might as well remove it from the cache
 	if (current_cache && flags.OpenForWriting()) {

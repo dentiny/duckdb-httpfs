@@ -93,11 +93,11 @@ public:
 	unique_ptr<HTTPResponse> GetRequest(FileHandle &handle, string url, HTTPHeaders header_map,
 	                                    const HTTPReadConfig &read_config, CachedFileDownload &download) override;
 	unique_ptr<HTTPResponse> GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
-	                                         const HTTPReadConfig &read_config, idx_t file_offset, char *buffer_out,
-	                                         idx_t buffer_out_len) override;
+	                                         const HTTPReadConfig &read_config, idx_t file_offset,
+	                                         data_ptr_t buffer_out, idx_t buffer_out_len) override;
 	unique_ptr<HTTPResponse> PostRequest(HTTPRequestSession &session, string s3_url, string &buffer_out,
-	                                     char *buffer_in, idx_t buffer_in_len, string http_params = "");
-	unique_ptr<HTTPResponse> PutRequest(HTTPRequestSession &session, string s3_url, char *buffer_in,
+	                                     const_data_ptr_t buffer_in, idx_t buffer_in_len, string http_params = "");
+	unique_ptr<HTTPResponse> PutRequest(HTTPRequestSession &session, string s3_url, const_data_ptr_t buffer_in,
 	                                    idx_t buffer_in_len, string http_params = "");
 	unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) override;
 	HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) override;

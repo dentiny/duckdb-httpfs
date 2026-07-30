@@ -18,114 +18,161 @@
 
 namespace duckdb {
 
+struct S3HeaderBuilder {
+	S3HeaderBuilder(EncryptionUtil &encryption_util_p, string url_p, string query_p, string host_p, string service_p,
+	                string method_p, const S3AuthParams &auth_params_p, string date_now_p, string datetime_now_p,
+	                string payload_hash_p, string content_type_p, string content_md5_p)
+	    : encryption_util(encryption_util_p), url(std::move(url_p)), query(std::move(query_p)), host(std::move(host_p)),
+	      service(std::move(service_p)), method(std::move(method_p)), auth_params(auth_params_p),
+	      date_now(std::move(date_now_p)), datetime_now(std::move(datetime_now_p)),
+	      payload_hash(std::move(payload_hash_p)), content_type(std::move(content_type_p)),
+	      content_md5(std::move(content_md5_p)),
+	      use_sse_kms(!auth_params.kms_key_id.empty() && (method == "POST" || method == "PUT") &&
+	                  query.find("uploadId") == string::npos) {
+	}
+
+	HTTPHeaders Create() {
+		headers["Host"] = host;
+		if (auth_params.secret_access_key.empty() && auth_params.access_key_id.empty()) {
+			return headers;
+		}
+
+		InitializeDefaults();
+		AddRequestHeaders();
+		auto signed_headers = BuildSignedHeaders();
+		auto canonical_request = BuildCanonicalRequest(signed_headers);
+		auto signature = CreateSignature(canonical_request);
+		headers["Authorization"] = "AWS4-HMAC-SHA256 Credential=" + auth_params.access_key_id + "/" +
+		                           CredentialScope() + ", SignedHeaders=" + signed_headers + ", Signature=" + signature;
+		return headers;
+	}
+
+private:
+	void InitializeDefaults() {
+		if (payload_hash.empty()) {
+			payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+		}
+		if (datetime_now.empty()) {
+			auto timestamp = Timestamp::GetCurrentTimestamp();
+			date_now = StrfTimeFormat::Format(timestamp, "%Y%m%d");
+			datetime_now = StrfTimeFormat::Format(timestamp, "%Y%m%dT%H%M%SZ");
+		}
+	}
+
+	void AddRequestHeaders() {
+		headers["x-amz-date"] = datetime_now;
+		headers["x-amz-content-sha256"] = payload_hash;
+		if (!auth_params.session_token.empty()) {
+			headers["x-amz-security-token"] = auth_params.session_token;
+		}
+		if (use_sse_kms) {
+			headers["x-amz-server-side-encryption"] = "aws:kms";
+			headers["x-amz-server-side-encryption-aws-kms-key-id"] = auth_params.kms_key_id;
+		}
+		if (auth_params.requester_pays) {
+			headers["x-amz-request-payer"] = "requester";
+		}
+		if (!content_md5.empty()) {
+			headers["content-md5"] = content_md5;
+		}
+		if (!content_type.empty() && content_type != "application/octet-stream") {
+			headers["content-type"] = content_type;
+		}
+	}
+
+	string BuildSignedHeaders() const {
+		string result;
+		if (!content_md5.empty()) {
+			result += "content-md5;";
+		}
+		if (!content_type.empty()) {
+			result += "content-type;";
+		}
+		result += "host;x-amz-content-sha256;x-amz-date";
+		if (auth_params.requester_pays) {
+			result += ";x-amz-request-payer";
+		}
+		if (!auth_params.session_token.empty()) {
+			result += ";x-amz-security-token";
+		}
+		if (use_sse_kms) {
+			result += ";x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id";
+		}
+		return result;
+	}
+
+	string BuildCanonicalRequest(const string &signed_headers) const {
+		auto result = method + "\n" + S3Url::Encode(url) + "\n" + query;
+		if (!content_md5.empty()) {
+			result += "\ncontent-md5:" + content_md5;
+		}
+		if (!content_type.empty()) {
+			result += "\ncontent-type:" + content_type;
+		}
+		result += "\nhost:" + host + "\nx-amz-content-sha256:" + payload_hash + "\nx-amz-date:" + datetime_now;
+		if (auth_params.requester_pays) {
+			result += "\nx-amz-request-payer:requester";
+		}
+		if (!auth_params.session_token.empty()) {
+			result += "\nx-amz-security-token:" + auth_params.session_token;
+		}
+		if (use_sse_kms) {
+			result += "\nx-amz-server-side-encryption:aws:kms";
+			result += "\nx-amz-server-side-encryption-aws-kms-key-id:" + auth_params.kms_key_id;
+		}
+		return result + "\n\n" + signed_headers + "\n" + payload_hash;
+	}
+
+	string CreateSignature(const string &canonical_request) const {
+		hash_bytes canonical_request_hash;
+		hash_str canonical_request_hash_str;
+		sha256(encryption_util, const_data_ptr_cast(canonical_request.data()), canonical_request.length(),
+		       canonical_request_hash);
+		hex256(canonical_request_hash, canonical_request_hash_str);
+
+		auto string_to_sign = "AWS4-HMAC-SHA256\n" + datetime_now + "\n" + CredentialScope() + "\n" +
+		                      string(const_char_ptr_cast(canonical_request_hash_str), sizeof(hash_str));
+		hash_bytes k_date, k_region, k_service, signing_key, signature;
+		auto sign_key = "AWS4" + auth_params.secret_access_key;
+		hmac256(encryption_util, date_now, const_data_ptr_cast(sign_key.data()), sign_key.length(), k_date);
+		hmac256(encryption_util, auth_params.region, k_date, k_region);
+		hmac256(encryption_util, service, k_region, k_service);
+		hmac256(encryption_util, "aws4_request", k_service, signing_key);
+		hmac256(encryption_util, string_to_sign, signing_key, signature);
+
+		hash_str signature_str;
+		hex256(signature, signature_str);
+		return string(const_char_ptr_cast(signature_str), sizeof(hash_str));
+	}
+
+	string CredentialScope() const {
+		return date_now + "/" + auth_params.region + "/" + service + "/aws4_request";
+	}
+
+	EncryptionUtil &encryption_util;
+	const string url;
+	const string query;
+	const string host;
+	const string service;
+	const string method;
+	const S3AuthParams &auth_params;
+	string date_now;
+	string datetime_now;
+	string payload_hash;
+	const string content_type;
+	const string content_md5;
+	const bool use_sse_kms;
+	HTTPHeaders headers;
+};
+
 HTTPHeaders S3RequestUtil::CreateHeader(EncryptionUtil &encryption_util, string url, string query, string host,
                                         string service, string method, const S3AuthParams &auth_params, string date_now,
                                         string datetime_now, string payload_hash, string content_type,
                                         string content_md5) {
-
-	HTTPHeaders res;
-	res["Host"] = host;
-	// If access key is not set, we don't set the headers at all to allow accessing public files through s3 urls
-	if (auth_params.secret_access_key.empty() && auth_params.access_key_id.empty()) {
-		return res;
-	}
-
-	if (payload_hash == "") {
-		payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"; // Empty payload hash
-	}
-
-	// we can pass date/time but this is mostly useful in testing. normally we just get the current datetime here.
-	if (datetime_now.empty()) {
-		auto timestamp = Timestamp::GetCurrentTimestamp();
-		date_now = StrfTimeFormat::Format(timestamp, "%Y%m%d");
-		datetime_now = StrfTimeFormat::Format(timestamp, "%Y%m%dT%H%M%SZ");
-	}
-
-	// Only some S3 operations supports SSE-KMS, which this "heuristic" attempts to detect.
-	// https://docs.aws.amazon.com/AmazonS3/latest/userguide/specifying-kms-encryption.html#sse-request-headers-kms
-	bool use_sse_kms = auth_params.kms_key_id.length() > 0 && (method == "POST" || method == "PUT") &&
-	                   query.find("uploadId") == std::string::npos;
-
-	res["x-amz-date"] = datetime_now;
-	res["x-amz-content-sha256"] = payload_hash;
-	if (auth_params.session_token.length() > 0) {
-		res["x-amz-security-token"] = auth_params.session_token;
-	}
-	if (use_sse_kms) {
-		res["x-amz-server-side-encryption"] = "aws:kms";
-		res["x-amz-server-side-encryption-aws-kms-key-id"] = auth_params.kms_key_id;
-	}
-
-	bool use_requester_pays = auth_params.requester_pays;
-	if (use_requester_pays) {
-		res["x-amz-request-payer"] = "requester";
-	}
-
-	string signed_headers = "";
-	hash_bytes canonical_request_hash;
-	hash_str canonical_request_hash_str;
-	if (content_md5.length() > 0) {
-		signed_headers += "content-md5;";
-		res["content-md5"] = content_md5;
-	}
-	if (content_type.length() > 0) {
-		signed_headers += "content-type;";
-		if (content_type != "application/octet-stream") {
-			res["content-type"] = content_type;
-		}
-	}
-	signed_headers += "host;x-amz-content-sha256;x-amz-date";
-	if (use_requester_pays) {
-		signed_headers += ";x-amz-request-payer";
-	}
-	if (auth_params.session_token.length() > 0) {
-		signed_headers += ";x-amz-security-token";
-	}
-	if (use_sse_kms) {
-		signed_headers += ";x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id";
-	}
-	auto canonical_request = method + "\n" + S3Url::Encode(url) + "\n" + query;
-	if (content_md5.length() > 0) {
-		canonical_request += "\ncontent-md5:" + content_md5;
-	}
-	if (content_type.length() > 0) {
-		canonical_request += "\ncontent-type:" + content_type;
-	}
-	canonical_request += "\nhost:" + host + "\nx-amz-content-sha256:" + payload_hash + "\nx-amz-date:" + datetime_now;
-	if (use_requester_pays) {
-		canonical_request += "\nx-amz-request-payer:requester";
-	}
-	if (auth_params.session_token.length() > 0) {
-		canonical_request += "\nx-amz-security-token:" + auth_params.session_token;
-	}
-	if (use_sse_kms) {
-		canonical_request += "\nx-amz-server-side-encryption:aws:kms";
-		canonical_request += "\nx-amz-server-side-encryption-aws-kms-key-id:" + auth_params.kms_key_id;
-	}
-
-	canonical_request += "\n\n" + signed_headers + "\n" + payload_hash;
-
-	sha256(encryption_util, canonical_request.c_str(), canonical_request.length(), canonical_request_hash);
-
-	hex256(canonical_request_hash, canonical_request_hash_str);
-	auto string_to_sign = "AWS4-HMAC-SHA256\n" + datetime_now + "\n" + date_now + "/" + auth_params.region + "/" +
-	                      service + "/aws4_request\n" + string((char *)canonical_request_hash_str, sizeof(hash_str));
-	// compute signature
-	hash_bytes k_date, k_region, k_service, signing_key, signature;
-	hash_str signature_str;
-	auto sign_key = "AWS4" + auth_params.secret_access_key;
-	hmac256(encryption_util, date_now, sign_key.c_str(), sign_key.length(), k_date);
-	hmac256(encryption_util, auth_params.region, k_date, k_region);
-	hmac256(encryption_util, service, k_region, k_service);
-	hmac256(encryption_util, "aws4_request", k_service, signing_key);
-	hmac256(encryption_util, string_to_sign, signing_key, signature);
-	hex256(signature, signature_str);
-
-	res["Authorization"] = "AWS4-HMAC-SHA256 Credential=" + auth_params.access_key_id + "/" + date_now + "/" +
-	                       auth_params.region + "/" + service + "/aws4_request, SignedHeaders=" + signed_headers +
-	                       ", Signature=" + string((char *)signature_str, sizeof(hash_str));
-
-	return res;
+	return S3HeaderBuilder(encryption_util, std::move(url), std::move(query), std::move(host), std::move(service),
+	                       std::move(method), auth_params, std::move(date_now), std::move(datetime_now),
+	                       std::move(payload_hash), std::move(content_type), std::move(content_md5))
+	    .Create();
 }
 
 static bool IsAuthRefreshErrorBody(const string &body) {
@@ -463,7 +510,7 @@ bool S3RequestExecutor::TryRefreshSession(HTTPRequestSession &session, const S3R
 	ClientContextFileOpener opener(*context);
 	auto refreshed_auth_params = current_snapshot.auth_params;
 	auto refreshed_http_params = current_snapshot.CreateRequestParams();
-	if (!TryRefreshS3AuthMaterial(context.get(), opener, current_snapshot.refresh_path, refreshed_auth_params,
+	if (!TryRefreshS3AuthMaterial(context, opener, current_snapshot.refresh_path, refreshed_auth_params,
 	                              *refreshed_http_params, current_snapshot.credential_refresh_enabled,
 	                              current_snapshot.region_redirected)) {
 		return session.Capture().snapshot->Cast<S3RequestSnapshot>().credential_generation !=
@@ -618,20 +665,21 @@ S3RequestSnapshot::S3RequestSnapshot(const HTTPFSParams &http_params, const S3Au
       region_redirected(region_redirected_p), credential_generation(credential_generation_p) {
 }
 
-string S3RequestUtil::GetPayloadHash(EncryptionUtil &encryption_util, char *buffer, idx_t buffer_len) {
+string S3RequestUtil::GetPayloadHash(EncryptionUtil &encryption_util, const_data_ptr_t buffer, idx_t buffer_len) {
 	if (buffer_len > 0) {
 		hash_bytes payload_hash_bytes;
 		hash_str payload_hash_str;
 		sha256(encryption_util, buffer, buffer_len, payload_hash_bytes);
 		hex256(payload_hash_bytes, payload_hash_str);
-		return string((char *)payload_hash_str, sizeof(payload_hash_str));
+		return string(const_char_ptr_cast(payload_hash_str), sizeof(payload_hash_str));
 	} else {
 		return "";
 	}
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, string url, string &result,
-                                                   char *buffer_in, idx_t buffer_in_len, string http_params) {
+                                                   const_data_ptr_t buffer_in, idx_t buffer_in_len,
+                                                   string http_params) {
 	auto payload_hash = S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), buffer_in, buffer_in_len);
 	const string content_type = "application/octet-stream";
 	return S3RequestExecutor::RunSession(
@@ -647,7 +695,7 @@ unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, 
 	    });
 }
 
-unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, string url, char *buffer_in,
+unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, string url, const_data_ptr_t buffer_in,
                                                   idx_t buffer_in_len, string http_params) {
 	auto payload_hash = S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), buffer_in, buffer_in_len);
 	const string content_type = "application/octet-stream";
@@ -693,7 +741,7 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_
 
 unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
                                                        const HTTPReadConfig &read_config, idx_t file_offset,
-                                                       char *buffer_out, idx_t buffer_out_len) {
+                                                       data_ptr_t buffer_out, idx_t buffer_out_len) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
 	const auto version_id =
 	    read_config.condition.type == HTTPReadConditionType::S3_VERSION_ID ? read_config.condition.value : string();

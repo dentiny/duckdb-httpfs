@@ -134,7 +134,7 @@ static void AddDeleteBatchSelectedSecretKeyParts(S3DeleteBatchKeyBuilder &key_bu
 			key_builder.AddString("");
 			continue;
 		}
-		key_builder.AddIndex(static_cast<idx_t>(match.score));
+		key_builder.AddIndex(NumericCast<idx_t>(match.score));
 		AddDeleteBatchSecretKeyParts(key_builder, *match.secret_entry);
 	}
 }
@@ -229,7 +229,7 @@ unique_ptr<HTTPResponse> S3FileSystem::RunS3BulkDeleteRequest(HTTPRequestSession
                                                               const string &secret_lookup_url, const string &body,
                                                               string &result) {
 	auto payload_hash =
-	    S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), const_cast<char *>(body.data()), body.length());
+	    S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), const_data_ptr_cast(body.data()), body.length());
 	auto content_md5 = GetS3DeleteContentMD5(body);
 	return S3RequestExecutor::Run(
 	    secret_lookup_url,
@@ -242,7 +242,7 @@ unique_ptr<HTTPResponse> S3FileSystem::RunS3BulkDeleteRequest(HTTPRequestSession
 		    result.clear();
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		    return RunPostRequest(request_data.http_url, request_data.headers, params, result,
-		                          const_cast<char *>(body.data()), body.length(), [&](BaseRequest &request) {
+		                          const_data_ptr_cast(body.data()), body.length(), [&](BaseRequest &request) {
 			                          return S3RequestExecutor::SendSessionRequest(session, request_data.captured,
 			                                                                       params, request);
 		                          });

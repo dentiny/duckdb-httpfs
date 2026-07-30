@@ -7,15 +7,14 @@
 namespace duckdb {
 
 void AWSEnvironmentCredentialsProvider::SetExtensionOptionValue(string key, const char *env_var_name) {
-	char *evar;
-
-	if ((evar = std::getenv(env_var_name)) != NULL) {
-		if (StringUtil::Lower(evar) == "false") {
+	const auto env_value = std::getenv(env_var_name);
+	if (env_value) {
+		if (StringUtil::Lower(env_value) == "false") {
 			this->config.SetOption(key, Value(false));
-		} else if (StringUtil::Lower(evar) == "true") {
+		} else if (StringUtil::Lower(env_value) == "true") {
 			this->config.SetOption(key, Value(true));
 		} else {
-			this->config.SetOption(key, Value(evar));
+			this->config.SetOption(key, Value(env_value));
 		}
 	}
 }

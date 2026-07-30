@@ -152,14 +152,15 @@ struct MockS3Server::Impl {
 		return observations;
 	}
 
-	bool WaitForFullGet() {
-		std::unique_lock<std::mutex> lock(full_get_lock);
-		return full_get_started.wait_for(lock, std::chrono::seconds(5), [this]() { return full_get_seen; });
+	bool WaitForFullGet() DUCKDB_EXCLUDES(full_get_lock) {
+		annotated_unique_lock<annotated_mutex> lock(full_get_lock);
+		return full_get_started.wait_for(lock, std::chrono::seconds(5),
+		                                 [this]() DUCKDB_REQUIRES(full_get_lock) { return full_get_seen; });
 	}
 
-	void ReleaseFullGet() {
+	void ReleaseFullGet() DUCKDB_EXCLUDES(full_get_lock) {
 		{
-			std::lock_guard<std::mutex> lock(full_get_lock);
+			annotated_lock_guard<annotated_mutex> lock(full_get_lock);
 			full_get_released = true;
 		}
 		full_get_release.notify_all();
@@ -411,11 +412,12 @@ struct MockS3Server::Impl {
 					    config.object.data.size(), "application/octet-stream",
 					    [this](size_t offset, size_t length, httplib::DataSink &sink) {
 						    if (offset == 0) {
-							    std::unique_lock<std::mutex> lock(full_get_lock);
+							    annotated_unique_lock<annotated_mutex> lock(full_get_lock);
 							    full_get_seen = true;
 							    full_get_started.notify_all();
-							    if (!full_get_release.wait_for(lock, std::chrono::seconds(5),
-							                                   [this]() { return full_get_released; })) {
+							    if (!full_get_release.wait_for(
+							            lock, std::chrono::seconds(5),
+							            [this]() DUCKDB_REQUIRES(full_get_lock) { return full_get_released; })) {
 								    return false;
 							    }
 						    }
@@ -465,7 +467,7 @@ struct MockS3Server::Impl {
 
 			idx_t range_request_index;
 			{
-				std::lock_guard<std::mutex> lock(range_request_lock);
+				annotated_lock_guard<annotated_mutex> lock(range_request_lock);
 				range_request_index = ++range_requests_seen;
 			}
 			range_request_started.notify_all();
@@ -475,10 +477,12 @@ struct MockS3Server::Impl {
 			if (!config.range.blocked.empty() && range == config.range.blocked) {
 				response.set_content_provider(config.object.data.size(), "application/octet-stream",
 				                              [this](size_t offset, size_t length, httplib::DataSink &sink) {
-					                              std::unique_lock<std::mutex> lock(range_release_lock);
-					                              if (!range_release.wait_for(lock, std::chrono::seconds(5), [this]() {
-						                                  return release_range_completed;
-					                                  })) {
+					                              annotated_unique_lock<annotated_mutex> lock(range_release_lock);
+					                              if (!range_release.wait_for(lock, std::chrono::seconds(5),
+					                                                          [this]()
+					                                                              DUCKDB_REQUIRES(range_release_lock) {
+						                                                              return release_range_completed;
+					                                                              })) {
 						                              return false;
 					                              }
 					                              return sink.write(config.object.data.data() + offset, length);
@@ -487,19 +491,19 @@ struct MockS3Server::Impl {
 				return;
 			}
 			if (!config.range.release.empty() && range == config.range.release) {
-				response.set_content_provider(config.object.data.size(), "application/octet-stream",
-				                              [this](size_t offset, size_t length, httplib::DataSink &sink) {
-					                              const auto success =
-					                                  sink.write(config.object.data.data() + offset, length);
-					                              if (success) {
-						                              {
-							                              std::lock_guard<std::mutex> lock(range_release_lock);
-							                              release_range_completed = true;
-						                              }
-						                              range_release.notify_all();
-					                              }
-					                              return success;
-				                              });
+				response.set_content_provider(
+				    config.object.data.size(), "application/octet-stream",
+				    [this](size_t offset, size_t length, httplib::DataSink &sink) {
+					    const auto success = sink.write(config.object.data.data() + offset, length);
+					    if (success) {
+						    {
+							    annotated_lock_guard<annotated_mutex> lock(range_release_lock);
+							    release_range_completed = true;
+						    }
+						    range_release.notify_all();
+					    }
+					    return success;
+				    });
 				Record(request, response.status);
 				return;
 			}
@@ -509,9 +513,11 @@ struct MockS3Server::Impl {
 				    config.object.data.size(), "application/octet-stream",
 				    [this, wait_for_second_request](size_t offset, size_t length, httplib::DataSink &sink) {
 					    if (wait_for_second_request->exchange(false)) {
-						    std::unique_lock<std::mutex> lock(range_request_lock);
+						    annotated_unique_lock<annotated_mutex> lock(range_request_lock);
 						    if (!range_request_started.wait_for(lock, std::chrono::seconds(5),
-						                                        [this]() { return range_requests_seen >= 2; })) {
+						                                        [this]() DUCKDB_REQUIRES(range_request_lock) {
+							                                        return range_requests_seen >= 2;
+						                                        })) {
 							    return false;
 						    }
 					    }
@@ -647,17 +653,17 @@ struct MockS3Server::Impl {
 	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
 	mutable annotated_mutex observation_lock;
 	mutable vector<MockS3RequestObservation> observations DUCKDB_GUARDED_BY(observation_lock);
-	std::mutex range_request_lock;
+	annotated_mutex range_request_lock;
 	std::condition_variable range_request_started;
-	idx_t range_requests_seen = 0;
-	std::mutex range_release_lock;
+	idx_t range_requests_seen DUCKDB_GUARDED_BY(range_request_lock) = 0;
+	annotated_mutex range_release_lock;
 	std::condition_variable range_release;
-	bool release_range_completed = false;
-	std::mutex full_get_lock;
+	bool release_range_completed DUCKDB_GUARDED_BY(range_release_lock) = false;
+	annotated_mutex full_get_lock;
 	std::condition_variable full_get_started;
 	std::condition_variable full_get_release;
-	bool full_get_seen = false;
-	bool full_get_released = false;
+	bool full_get_seen DUCKDB_GUARDED_BY(full_get_lock) = false;
+	bool full_get_released DUCKDB_GUARDED_BY(full_get_lock) = false;
 };
 
 MockS3Server::MockS3Server(MockS3ServerConfig config) : impl(make_uniq<Impl>(std::move(config))) {

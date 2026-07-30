@@ -27,119 +27,110 @@ static Value MapToStruct(const Value &map) {
 	}
 	return Value::STRUCT(struct_fields);
 }
-unique_ptr<BaseSecret> CreateS3SecretFunctions::CreateSecretFunctionInternal(ClientContext &context,
-                                                                             CreateSecretInput &input) {
-	// Set scope to user provided scope or the default
-	auto scope = input.scope;
-	if (scope.empty()) {
-		if (input.type == "s3") {
-			scope.push_back("s3://");
-			scope.push_back("s3n://");
-			scope.push_back("s3a://");
-		} else if (input.type == "r2") {
-			scope.push_back("r2://");
-		} else if (input.type == "gcs") {
-			scope.push_back("gcs://");
-			scope.push_back("gs://");
-		} else if (input.type == "aws") {
-			scope.push_back("");
-		} else {
-			throw InternalException("Unknown secret type found in httpfs extension: '%s'", input.type);
-		}
+
+struct S3SecretBuilder {
+	explicit S3SecretBuilder(CreateSecretInput &input_p) : input(input_p) {
+		auto scope = input.scope.empty() ? DefaultScope() : input.scope;
+		secret = make_uniq<KeyValueSecret>(std::move(scope), input.type, input.provider, input.name);
+		secret->redact_keys = {"secret", "session_token"};
 	}
 
-	auto secret = make_uniq<KeyValueSecret>(scope, input.type, input.provider, input.name);
-	secret->redact_keys = {"secret", "session_token"};
+	unique_ptr<BaseSecret> Create() {
+		ApplyR2Endpoint();
+		for (const auto &option : input.options) {
+			ApplyOption(StringUtil::Lower(option.first), option.second);
+		}
+		return std::move(secret);
+	}
 
-	// for r2 we can set the endpoint using the account id
-	if (input.type == "r2" && input.options.find("account_id") != input.options.end()) {
-		secret->secret_map["endpoint"] = input.options["account_id"].ToString() + ".r2.cloudflarestorage.com";
+private:
+	vector<string> DefaultScope() const {
+		if (input.type == "s3") {
+			return {"s3://", "s3n://", "s3a://"};
+		}
+		if (input.type == "r2") {
+			return {"r2://"};
+		}
+		if (input.type == "gcs") {
+			return {"gcs://", "gs://"};
+		}
+		if (input.type == "aws") {
+			return {""};
+		}
+		throw InternalException("Unknown secret type found in httpfs extension: '%s'", input.type);
+	}
+
+	void ApplyR2Endpoint() {
+		auto account_id = input.options.find("account_id");
+		if (input.type != "r2" || account_id == input.options.end()) {
+			return;
+		}
+		secret->secret_map["endpoint"] = account_id->second.ToString() + ".r2.cloudflarestorage.com";
 		secret->secret_map["url_style"] = "path";
 	}
 
-	bool refresh = false;
-
-	// apply any overridden settings
-	for (const auto &named_param : input.options) {
-		auto lower_name = StringUtil::Lower(named_param.first);
-
-		if (lower_name == "key_id") {
-			secret->secret_map["key_id"] = named_param.second;
-		} else if (lower_name == "secret") {
-			secret->secret_map["secret"] = named_param.second;
-		} else if (lower_name == "region") {
-			secret->secret_map["region"] = named_param.second.ToString();
-		} else if (lower_name == "session_token") {
-			secret->secret_map["session_token"] = named_param.second.ToString();
-		} else if (lower_name == "endpoint") {
-			secret->secret_map["endpoint"] = named_param.second.ToString();
-		} else if (lower_name == "url_style") {
-			secret->secret_map["url_style"] = StringUtil::Lower(named_param.second.ToString());
-		} else if (lower_name == "use_ssl") {
-			if (named_param.second.type() != LogicalType::BOOLEAN) {
-				throw InvalidInputException("Invalid type past to secret option: '%s', found '%s', expected: 'BOOLEAN'",
-				                            lower_name, named_param.second.type().ToString());
-			}
-			secret->secret_map["use_ssl"] = Value::BOOLEAN(named_param.second.GetValue<bool>());
-		} else if (lower_name == "verify_ssl") {
-			if (named_param.second.type() != LogicalType::BOOLEAN) {
-				throw InvalidInputException("Invalid type past to secret option: '%s', found '%s', expected: 'BOOLEAN'",
-				                            lower_name, named_param.second.type().ToString());
-			}
-			secret->secret_map["verify_ssl"] = Value::BOOLEAN(named_param.second.GetValue<bool>());
-		} else if (lower_name == "kms_key_id") {
-			secret->secret_map["kms_key_id"] = named_param.second.ToString();
-		} else if (lower_name == "url_compatibility_mode") {
-			if (named_param.second.type() != LogicalType::BOOLEAN) {
-				throw InvalidInputException("Invalid type past to secret option: '%s', found '%s', expected: 'BOOLEAN'",
-				                            lower_name, named_param.second.type().ToString());
-			}
-			secret->secret_map["url_compatibility_mode"] = Value::BOOLEAN(named_param.second.GetValue<bool>());
-		} else if (lower_name == "account_id") {
-			continue; // handled already
-		} else if (lower_name == "refresh") {
-			if (refresh) {
-				throw InvalidInputException("Can not set `refresh` and `refresh_info` at the same time");
-			}
-			refresh = StringUtil::Lower(named_param.second.GetValue<string>()) == "auto";
-			secret->secret_map["refresh"] = Value("auto");
-			child_list_t<Value> struct_fields;
-			for (const auto &named_param : input.options) {
-				auto lower_name = StringUtil::Lower(named_param.first);
-				struct_fields.emplace_back(lower_name, named_param.second);
-			}
-			secret->secret_map["refresh_info"] = Value::STRUCT(struct_fields);
-		} else if (lower_name == "refresh_info") {
-			if (refresh) {
-				throw InvalidInputException("Can not set `refresh` and `refresh_info` at the same time");
-			}
-			refresh = true;
-			secret->secret_map["refresh_info"] = MapToStruct(named_param.second);
-		} else if (lower_name == "requester_pays") {
-			if (named_param.second.type() != LogicalType::BOOLEAN) {
-				throw InvalidInputException("Invalid type past to secret option: '%s', found '%s', expected: 'BOOLEAN'",
-				                            lower_name, named_param.second.type().ToString());
-			}
-			secret->secret_map["requester_pays"] = Value::BOOLEAN(named_param.second.GetValue<bool>());
-		} else if (lower_name == "bearer_token" && input.type == "gcs") {
-			secret->secret_map["bearer_token"] = named_param.second.ToString();
-			// Mark it as sensitive
+	void ApplyOption(const string &name, const Value &value) {
+		if (name == "key_id" || name == "secret" || name == "http_proxy" || name == "http_proxy_password" ||
+		    name == "http_proxy_username" || name == "extra_http_headers") {
+			secret->secret_map[Identifier(name)] = value;
+		} else if (name == "region" || name == "session_token" || name == "endpoint" || name == "kms_key_id") {
+			secret->secret_map[Identifier(name)] = value.ToString();
+		} else if (name == "url_style") {
+			secret->secret_map[Identifier(name)] = StringUtil::Lower(value.ToString());
+		} else if (name == "use_ssl" || name == "verify_ssl" || name == "url_compatibility_mode" ||
+		           name == "requester_pays") {
+			SetBooleanOption(name, value);
+		} else if (name == "account_id") {
+			return;
+		} else if (name == "refresh") {
+			SetRefresh(value);
+		} else if (name == "refresh_info") {
+			SetRefreshInfo(value);
+		} else if (name == "bearer_token" && input.type == "gcs") {
+			secret->secret_map["bearer_token"] = value.ToString();
 			secret->redact_keys.insert("bearer_token");
-		} else if (lower_name == "http_proxy") {
-			secret->secret_map["http_proxy"] = named_param.second;
-		} else if (lower_name == "http_proxy_password") {
-			secret->secret_map["http_proxy_password"] = named_param.second;
-		} else if (lower_name == "http_proxy_username") {
-			secret->secret_map["http_proxy_username"] = named_param.second;
-		} else if (lower_name == "extra_http_headers") {
-			secret->secret_map["extra_http_headers"] = named_param.second;
 		} else {
-			throw InvalidInputException("Unknown named parameter passed to CreateSecretFunctionInternal: " +
-			                            lower_name);
+			throw InvalidInputException("Unknown named parameter passed to CreateSecretFunctionInternal: " + name);
 		}
 	}
 
-	return std::move(secret);
+	void SetBooleanOption(const string &name, const Value &value) {
+		if (value.type() != LogicalType::BOOLEAN) {
+			throw InvalidInputException("Invalid type passed to secret option: '%s', found '%s', expected: 'BOOLEAN'",
+			                            name, value.type().ToString());
+		}
+		secret->secret_map[Identifier(name)] = Value::BOOLEAN(value.GetValue<bool>());
+	}
+
+	void SetRefresh(const Value &value) {
+		if (refresh) {
+			throw InvalidInputException("Can not set `refresh` and `refresh_info` at the same time");
+		}
+		refresh = StringUtil::Lower(value.GetValue<string>()) == "auto";
+		secret->secret_map["refresh"] = Value("auto");
+		child_list_t<Value> struct_fields;
+		for (const auto &option : input.options) {
+			struct_fields.emplace_back(StringUtil::Lower(option.first), option.second);
+		}
+		secret->secret_map["refresh_info"] = Value::STRUCT(struct_fields);
+	}
+
+	void SetRefreshInfo(const Value &value) {
+		if (refresh) {
+			throw InvalidInputException("Can not set `refresh` and `refresh_info` at the same time");
+		}
+		refresh = true;
+		secret->secret_map["refresh_info"] = MapToStruct(value);
+	}
+
+	CreateSecretInput &input;
+	unique_ptr<KeyValueSecret> secret;
+	bool refresh = false;
+};
+
+unique_ptr<BaseSecret> CreateS3SecretFunctions::CreateSecretFunctionInternal(ClientContext &context,
+                                                                             CreateSecretInput &input) {
+	return S3SecretBuilder(input).Create();
 }
 
 CreateSecretInput CreateS3SecretFunctions::GenerateRefreshSecretInfo(const SecretEntry &secret_entry,
