@@ -27,6 +27,14 @@ struct MockS3ServerConfig {
 	int stale_auth_status = 403;
 	string stale_auth_error_code = "AccessDenied";
 	string etag = "\"httpfs-refresh-test-etag\"";
+	//! ETag returned by GET; use etag when empty
+	string get_etag;
+	//! S3 version ID returned by selected metadata/data responses
+	string version_id;
+	bool version_id_on_head = false;
+	bool version_id_on_get = false;
+	//! Reject GETs whose If-Match does not equal the GET ETag
+	bool enforce_if_match = false;
 	//! Redirect signed requests to this region when their credential scope uses a different one
 	string required_region;
 	MockS3RefreshTarget refresh_target = MockS3RefreshTarget::HEAD;
@@ -52,6 +60,9 @@ struct MockS3ServerConfig {
 	bool advertise_ranges = true;
 	//! Hold the first range response body until a second range request arrives
 	bool block_first_range_body_until_second_range = false;
+	//! Hold this exact range response body until release_range has emitted its body
+	string blocked_range;
+	string release_range;
 	//! Hold a full GET response body until ReleaseFullGet is called
 	bool block_full_get_until_released = false;
 	//! Number of object HEADs to fail with a 400 before succeeding
@@ -75,6 +86,8 @@ struct MockS3RequestObservation {
 	string path;
 	string target;
 	string range;
+	string if_match;
+	string version_id;
 	string key_id;
 	string region;
 	string user_agent;

@@ -164,6 +164,7 @@ public:
 
 protected:
 	shared_ptr<const HTTPRequestSnapshot> CreateRequestSnapshot(const HTTPFSParams &params) const override;
+	HTTPReadConfig BuildReadConfig() const override;
 	void InitializeFromCacheEntry(const HTTPMetadataCacheEntry &cache_entry) override;
 	HTTPMetadataCacheEntry GetCacheEntry() const override;
 
@@ -198,9 +199,10 @@ public:
 	//! HTTP request overrides.
 	unique_ptr<HTTPResponse> HeadRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) override;
 	unique_ptr<HTTPResponse> GetRequest(FileHandle &handle, string url, HTTPHeaders header_map,
-	                                    CachedFileDownload &download) override;
+	                                    const HTTPReadConfig &read_config, CachedFileDownload &download) override;
 	unique_ptr<HTTPResponse> GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
-	                                         idx_t file_offset, char *buffer_out, idx_t buffer_out_len) override;
+	                                         const HTTPReadConfig &read_config, idx_t file_offset, char *buffer_out,
+	                                         idx_t buffer_out_len) override;
 	unique_ptr<HTTPResponse> PostRequest(HTTPRequestSession &session, string s3_url, string &buffer_out,
 	                                     char *buffer_in, idx_t buffer_in_len, string http_params = "");
 	unique_ptr<HTTPResponse> PutRequest(HTTPRequestSession &session, string s3_url, char *buffer_in,
@@ -251,7 +253,7 @@ private:
 	                                                            const string &content_md5, REQUEST request);
 	template <class REQUEST>
 	unique_ptr<HTTPResponse> RunS3HandleRequestWithAuthRefresh(S3FileHandle &s3_handle, const string &s3_url,
-	                                                           const string &method, bool use_version_id,
+	                                                           const string &method, const string &version_id,
 	                                                           REQUEST request);
 	unique_ptr<HTTPResponse> RunS3BulkDeleteRequest(HTTPRequestSession &session, const string &secret_lookup_url,
 	                                                const string &body, string &result);

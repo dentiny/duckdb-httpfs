@@ -316,8 +316,6 @@ struct S3RequestData {
 	string source_url;
 	string http_url;
 	HTTPHeaders headers;
-	string etag;
-	bool auto_fallback_to_full_file_download = false;
 };
 
 static S3RequestData CreateS3RequestData(EncryptionUtil &encryption_util, const CapturedHTTPRequestSnapshot &captured,
@@ -348,27 +346,15 @@ static S3RequestData CreateS3RequestData(EncryptionUtil &encryption_util, const 
 }
 
 static S3RequestData CreateS3HandleRequestData(EncryptionUtil &encryption_util, S3FileHandle &s3_handle,
-                                               const string &s3_url, const string &method, bool use_version_id) {
+                                               const string &s3_url, const string &method, const string &version_id) {
 	auto captured = s3_handle.request_session->Capture();
-	string version_id;
-	string etag;
-	bool auto_fallback_to_full_file_download;
-	{
-		lock_guard<mutex> lck(s3_handle.mu);
-		version_id = s3_handle.version_id;
-		etag = s3_handle.etag;
-		auto_fallback_to_full_file_download = s3_handle.auto_fallback_to_full_file_download;
-	}
 
 	string query_string;
-	if (use_version_id && !version_id.empty()) {
+	if (!version_id.empty()) {
 		query_string = "versionId=" + S3FileSystem::UrlEncode(version_id, true);
 	}
 
-	auto result = CreateS3RequestData(encryption_util, captured, s3_url, method, query_string);
-	result.etag = std::move(etag);
-	result.auto_fallback_to_full_file_download = auto_fallback_to_full_file_download;
-	return result;
+	return CreateS3RequestData(encryption_util, captured, s3_url, method, query_string);
 }
 
 static optional_idx GetRegionRedirect(const HTTPResponse &response, const S3AuthParams &auth_params,
@@ -580,11 +566,10 @@ unique_ptr<HTTPResponse> S3FileSystem::RunS3SessionRequestWithAuthRefresh(
 
 template <class REQUEST>
 unique_ptr<HTTPResponse> S3FileSystem::RunS3HandleRequestWithAuthRefresh(S3FileHandle &s3_handle, const string &s3_url,
-                                                                         const string &method, bool use_version_id,
+                                                                         const string &method, const string &version_id,
                                                                          REQUEST request) {
 	return RunS3RequestWithAuthRefreshInternal(
-	    s3_url,
-	    [&]() { return CreateS3HandleRequestData(GetEncryptionUtil(), s3_handle, s3_url, method, use_version_id); },
+	    s3_url, [&]() { return CreateS3HandleRequestData(GetEncryptionUtil(), s3_handle, s3_url, method, version_id); },
 	    IsTransientRetryEligibleMethod(method), request,
 	    [&](const S3RequestData &request_data) {
 		    return TryRefreshS3Session(*s3_handle.request_session, request_data);
@@ -815,6 +800,19 @@ S3FileHandle::S3FileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpenFla
 	if (flags.OpenForWriting()) {
 		multi_part_upload = make_shared_ptr<S3MultiPartUpload>(*this);
 	}
+}
+
+HTTPReadConfig S3FileHandle::BuildReadConfig() const {
+	auto result = HTTPFileHandle::BuildReadConfig();
+	if (!request_session->Capture().snapshot->Params().s3_version_id_pinning) {
+		return result;
+	}
+	auto version_id = GetVersionId();
+	if (!version_id.empty()) {
+		result.condition.type = HTTPReadConditionType::S3_VERSION_ID;
+		result.condition.value = std::move(version_id);
+	}
+	return result;
 }
 
 shared_ptr<const HTTPRequestSnapshot> S3FileHandle::CreateRequestSnapshot(const HTTPFSParams &params) const {
@@ -1085,7 +1083,7 @@ unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, s
 
 unique_ptr<HTTPResponse> S3FileSystem::HeadRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
-	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "HEAD", false, [&](S3RequestData &request_data) {
+	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "HEAD", {}, [&](S3RequestData &request_data) {
 		auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		return RunHeadRequest(request_data.http_url, request_data.headers, params, [&](BaseRequest &request) {
 			return SendS3HandleRequestWithClientCache(s3_handle, request_data.captured, params, request);
@@ -1094,12 +1092,14 @@ unique_ptr<HTTPResponse> S3FileSystem::HeadRequest(FileHandle &handle, string s3
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
-                                                  CachedFileDownload &download) {
+                                                  const HTTPReadConfig &read_config, CachedFileDownload &download) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
-	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "GET", true, [&](S3RequestData &request_data) {
+	const auto version_id =
+	    read_config.condition.type == HTTPReadConditionType::S3_VERSION_ID ? read_config.condition.value : string();
+	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "GET", version_id, [&](S3RequestData &request_data) {
 		auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		return RunGetRequest(
-		    s3_handle, request_data.http_url, request_data.headers, params, download,
+		    s3_handle, request_data.http_url, request_data.headers, params, read_config, download,
 		    [&](const HTTPResponse &response) { return GetS3RequestError(request_data, response); },
 		    [&](BaseRequest &request) {
 			    return SendS3HandleRequestWithClientCache(s3_handle, request_data.captured, params, request);
@@ -1108,14 +1108,16 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
-                                                       idx_t file_offset, char *buffer_out, idx_t buffer_out_len) {
+                                                       const HTTPReadConfig &read_config, idx_t file_offset,
+                                                       char *buffer_out, idx_t buffer_out_len) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
-	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "GET", true, [&](S3RequestData &request_data) {
+	const auto version_id =
+	    read_config.condition.type == HTTPReadConditionType::S3_VERSION_ID ? read_config.condition.value : string();
+	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "GET", version_id, [&](S3RequestData &request_data) {
 		auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		return RunGetRangeRequest(
-		    s3_handle, request_data.http_url, request_data.headers, params, request_data.etag,
-		    request_data.auto_fallback_to_full_file_download, file_offset, buffer_out, buffer_out_len,
-		    [&](const HTTPResponse &response) { return GetS3RequestError(request_data, response); },
+		    s3_handle, request_data.http_url, request_data.headers, params, read_config, file_offset, buffer_out,
+		    buffer_out_len, [&](const HTTPResponse &response) { return GetS3RequestError(request_data, response); },
 		    [&](BaseRequest &request) {
 			    return SendS3HandleRequestWithClientCache(s3_handle, request_data.captured, params, request);
 		    });
@@ -1124,7 +1126,7 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, strin
 
 unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
-	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "DELETE", false, [&](S3RequestData &request_data) {
+	return RunS3HandleRequestWithAuthRefresh(s3_handle, s3_url, "DELETE", {}, [&](S3RequestData &request_data) {
 		auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		return RunDeleteRequest(request_data.http_url, request_data.headers, params, [&](BaseRequest &request) {
 			return SendS3HandleRequestWithClientCache(s3_handle, request_data.captured, params, request);
@@ -1539,6 +1541,7 @@ void S3FileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx
 	if (!s3fh.flags.OpenForWriting()) {
 		throw InternalException("Write called on file not opened in write mode");
 	}
+	annotated_lock_guard<annotated_mutex> guard(s3fh.cursor_mutex);
 	int64_t bytes_written = 0;
 
 	while (bytes_written < nr_bytes) {

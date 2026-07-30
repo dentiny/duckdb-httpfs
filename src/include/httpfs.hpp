@@ -15,6 +15,20 @@
 
 namespace duckdb {
 
+enum class HTTPReadConditionType : uint8_t { NONE, ETAG, S3_VERSION_ID };
+
+struct HTTPReadCondition {
+	HTTPReadConditionType type = HTTPReadConditionType::NONE;
+	string value;
+};
+
+struct HTTPReadConfig {
+	HTTPReadCondition condition;
+	string etag;
+	bool validate_etag = false;
+	bool auto_fallback_to_full_download = false;
+};
+
 class RangeRequestNotSupportedException {
 public:
 	// Call static Throw instead: if thrown as exception DuckDB can't catch it.
@@ -31,8 +45,12 @@ public:
 };
 
 class HTTPFileSystem;
+class S3FileSystem;
 
 class HTTPFileHandle : public FileHandle {
+	friend class HTTPFileSystem;
+	friend class S3FileSystem;
+
 public:
 	HTTPFileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpenFlags flags, unique_ptr<HTTPParams> params);
 	~HTTPFileHandle() override;
@@ -46,7 +64,6 @@ public:
 	idx_t length;
 	timestamp_t last_modified;
 	string etag;
-	string version_id;
 	bool force_full_download;
 	bool initialized = false;
 
@@ -59,11 +76,9 @@ public:
 	shared_ptr<HTTPFileState> file_state;
 	optional_ptr<Allocator> buffer_allocator;
 
-	// Sequential read position
-	idx_t file_offset;
-
-	// Used when file handle created with parallel access flag specified.
-	mutex mu;
+	const HTTPReadConfig &GetReadConfig() const;
+	string GetVersionId() const;
+	void SetVersionId(string version_id);
 
 	// Record a completed range request into the network throughput estimate (latency + bandwidth)
 	void RecordNetworkSample(double total_seconds, idx_t bytes, bool sample_has_ttfb, double ttfb_seconds)
@@ -72,6 +87,14 @@ public:
 	bool TryGetNetworkThroughput(NetworkThroughputEstimate &result) DUCKDB_EXCLUDES(network_estimator_lock);
 
 private:
+	// Sequential read/write position
+	mutable annotated_mutex cursor_mutex;
+	idx_t file_offset DUCKDB_GUARDED_BY(cursor_mutex);
+
+	string version_id;
+	HTTPReadConfig read_config;
+	bool read_config_initialized = false;
+
 	mutable annotated_mutex network_estimator_lock;
 	double tp_latency_seconds DUCKDB_GUARDED_BY(network_estimator_lock) = 0;
 	double tp_bandwidth_bps DUCKDB_GUARDED_BY(network_estimator_lock) = 0;
@@ -85,6 +108,7 @@ public:
 
 protected:
 	virtual shared_ptr<const HTTPRequestSnapshot> CreateRequestSnapshot(const HTTPFSParams &params) const;
+	virtual HTTPReadConfig BuildReadConfig() const;
 	//! Perform a HEAD request to get the file info (if not yet loaded)
 	void LoadFileInfo();
 	//! TODO: make base function virtual?
@@ -92,6 +116,9 @@ protected:
 
 	virtual void InitializeFromCacheEntry(const HTTPMetadataCacheEntry &cache_entry);
 	virtual HTTPMetadataCacheEntry GetCacheEntry() const;
+
+private:
+	void FinalizeReadConfig();
 };
 
 class HTTPFileSystem : public FileSystem {
@@ -150,13 +177,15 @@ public:
 	virtual unique_ptr<HTTPResponse> HeadRequest(FileHandle &handle, string url, HTTPHeaders header_map);
 	// Get Request with range parameter that GETs exactly buffer_out_len bytes from the url
 	virtual unique_ptr<HTTPResponse> GetRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map,
-	                                                 idx_t file_offset, char *buffer_out, idx_t buffer_out_len);
+	                                                 const HTTPReadConfig &read_config, idx_t file_offset,
+	                                                 char *buffer_out, idx_t buffer_out_len);
 	// Get Request without a range (i.e., downloads full file)
 	virtual unique_ptr<HTTPResponse> GetRequest(FileHandle &handle, string url, HTTPHeaders header_map,
-	                                            CachedFileDownload &download);
+	                                            const HTTPReadConfig &read_config, CachedFileDownload &download);
 	virtual unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, string url, HTTPHeaders header_map);
 	//! Fully download a file, or wait for an in-progress download of the same path
-	unique_ptr<CachedFileHandle> FullDownload(HTTPFileHandle &handle, bool &should_write_cache);
+	unique_ptr<CachedFileHandle> FullDownload(HTTPFileHandle &handle, const HTTPReadConfig &read_config,
+	                                          bool &should_write_cache);
 
 protected:
 	//! FileSystem extension points used by HTTP handle setup.
@@ -169,9 +198,11 @@ protected:
 	                                                optional_ptr<FileOpener> opener);
 
 	//! Internal read helpers.
-	bool TryRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map, idx_t file_offset, char *buffer_out,
-	                     idx_t buffer_out_len);
-	bool ReadInternal(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location);
+	bool TryRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map, const HTTPReadConfig &read_config,
+	                     idx_t file_offset, char *buffer_out, idx_t buffer_out_len);
+	bool ReadAt(FileHandle &handle, void *buffer, idx_t read_size, idx_t location, const HTTPReadConfig &read_config);
+	void ReadAtWithFallback(FileHandle &handle, void *buffer, idx_t read_size, idx_t location,
+	                        const HTTPReadConfig &read_config);
 
 	//! Shared request runners used by subclasses that need custom request setup/retry behavior.
 	using HTTPSendCallback = std::function<unique_ptr<HTTPResponse>(BaseRequest &)>;
@@ -188,15 +219,18 @@ protected:
 	                                       char *buffer_in, idx_t buffer_in_len, const string &content_type,
 	                                       HTTPSendCallback send_request);
 	unique_ptr<HTTPResponse> RunGetRequest(HTTPFileHandle &handle, string url, HTTPHeaders header_map,
-	                                       HTTPFSParams &http_params, CachedFileDownload &download,
-	                                       HTTPErrorCallback get_error, HTTPSendCallback send_request);
+	                                       HTTPFSParams &http_params, const HTTPReadConfig &read_config,
+	                                       CachedFileDownload &download, HTTPErrorCallback get_error,
+	                                       HTTPSendCallback send_request);
 	unique_ptr<HTTPResponse> RunGetRangeRequest(HTTPFileHandle &handle, string url, HTTPHeaders header_map,
-	                                            HTTPFSParams &http_params, const string &etag,
-	                                            bool auto_fallback_to_full_file_download, idx_t file_offset,
-	                                            char *buffer_out, idx_t buffer_out_len, HTTPErrorCallback get_error,
-	                                            HTTPSendCallback send_request);
+	                                            HTTPFSParams &http_params, const HTTPReadConfig &read_config,
+	                                            idx_t file_offset, char *buffer_out, idx_t buffer_out_len,
+	                                            HTTPErrorCallback get_error, HTTPSendCallback send_request);
 
 private:
+	void ValidateResponseETag(HTTPFileHandle &handle, const HTTPReadConfig &read_config, const HTTPResponse &response);
+	void ThrowIfReadConditionFailed(HTTPFileHandle &handle, const HTTPReadConfig &read_config,
+	                                const HTTPResponse &response);
 	void EraseGlobalCacheEntry(const string &path) DUCKDB_EXCLUDES(global_cache_lock);
 
 	// Global cache

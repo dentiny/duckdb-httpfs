@@ -1,6 +1,7 @@
 #include "mock_s3_server.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 
 #include "httplib.hpp"
@@ -96,6 +97,13 @@ static idx_t CountHeader(const httplib::Request &request, const string &header) 
 	return result;
 }
 
+static string GetParameter(const httplib::Request &request, const string &parameter) {
+	if (!request.has_param(parameter)) {
+		return string();
+	}
+	return request.get_param_value(parameter);
+}
+
 } // namespace
 
 struct MockS3Server::Impl {
@@ -139,8 +147,8 @@ struct MockS3Server::Impl {
 		return StringUtil::Format("http://%s/%s/%s", Endpoint(), config.bucket, config.object_key);
 	}
 
-	vector<MockS3RequestObservation> Observations() const {
-		std::lock_guard<std::mutex> lock(observation_lock);
+	vector<MockS3RequestObservation> Observations() const DUCKDB_EXCLUDES(observation_lock) {
+		annotated_lock_guard<annotated_mutex> lock(observation_lock);
 		return observations;
 	}
 
@@ -193,12 +201,14 @@ struct MockS3Server::Impl {
 		       ExtractCredentialRegion(GetHeader(request, "Authorization")) != config.required_region;
 	}
 
-	void Record(const httplib::Request &request, int status) const {
+	void Record(const httplib::Request &request, int status) const DUCKDB_EXCLUDES(observation_lock) {
 		MockS3RequestObservation observation;
 		observation.method = request.method;
 		observation.path = request.path;
 		observation.target = request.target;
 		observation.range = GetHeader(request, "Range");
+		observation.if_match = GetHeader(request, "If-Match");
+		observation.version_id = GetParameter(request, "versionId");
 		observation.key_id = ExtractCredentialKey(GetHeader(request, "Authorization"));
 		observation.region = ExtractCredentialRegion(GetHeader(request, "Authorization"));
 		observation.user_agent = GetHeader(request, "User-Agent");
@@ -208,7 +218,7 @@ struct MockS3Server::Impl {
 		observation.status = status;
 		observation.remote_port = request.remote_port;
 
-		std::lock_guard<std::mutex> lock(observation_lock);
+		annotated_lock_guard<annotated_mutex> lock(observation_lock);
 		observations.push_back(std::move(observation));
 	}
 
@@ -222,6 +232,20 @@ struct MockS3Server::Impl {
 		    config.head_content_length.IsValid() ? config.head_content_length.GetIndex() : config.object_data.size();
 		response.set_header("Content-Length", std::to_string(content_length));
 		response.set_header("ETag", config.etag);
+		if (config.version_id_on_head && !config.version_id.empty()) {
+			response.set_header("x-amz-version-id", config.version_id);
+		}
+	}
+
+	string GetResponseETag() const {
+		return config.get_etag.empty() ? config.etag : config.get_etag;
+	}
+
+	void SetGetHeaders(httplib::Response &response) const {
+		response.set_header("ETag", GetResponseETag());
+		if (config.version_id_on_get && !config.version_id.empty()) {
+			response.set_header("x-amz-version-id", config.version_id);
+		}
 	}
 
 	void SendSlowDown(const httplib::Request &request, httplib::Response &response) const {
@@ -371,11 +395,16 @@ struct MockS3Server::Impl {
 				SendS3Error400(request, response, config.failure_is_request_timeout);
 				return;
 			}
+			if (config.enforce_if_match && GetHeader(request, "If-Match") != GetResponseETag()) {
+				response.status = 412;
+				Record(request, response.status);
+				return;
+			}
 
 			auto range = GetHeader(request, "Range");
 			if (range.empty()) {
 				response.status = 200;
-				response.set_header("ETag", config.etag);
+				SetGetHeaders(response);
 				if (config.block_full_get_until_released) {
 					response.set_content_provider(
 					    config.object_data.size(), "application/octet-stream",
@@ -419,7 +448,7 @@ struct MockS3Server::Impl {
 			}
 			if (config.range_behavior == MockS3RangeBehavior::IGNORE_RANGE) {
 				response.status = 200;
-				response.set_header("ETag", config.etag);
+				SetGetHeaders(response);
 				response.set_content(config.object_data, "application/octet-stream");
 				Record(request, response.status);
 				return;
@@ -441,7 +470,38 @@ struct MockS3Server::Impl {
 			range_request_started.notify_all();
 			response.status = 206;
 			response.set_header("Accept-Ranges", "bytes");
-			response.set_header("ETag", config.etag);
+			SetGetHeaders(response);
+			if (!config.blocked_range.empty() && range == config.blocked_range) {
+				response.set_content_provider(config.object_data.size(), "application/octet-stream",
+				                              [this](size_t offset, size_t length, httplib::DataSink &sink) {
+					                              std::unique_lock<std::mutex> lock(range_release_lock);
+					                              if (!range_release.wait_for(lock, std::chrono::seconds(5), [this]() {
+						                                  return release_range_completed;
+					                                  })) {
+						                              return false;
+					                              }
+					                              return sink.write(config.object_data.data() + offset, length);
+				                              });
+				Record(request, response.status);
+				return;
+			}
+			if (!config.release_range.empty() && range == config.release_range) {
+				response.set_content_provider(config.object_data.size(), "application/octet-stream",
+				                              [this](size_t offset, size_t length, httplib::DataSink &sink) {
+					                              const auto success =
+					                                  sink.write(config.object_data.data() + offset, length);
+					                              if (success) {
+						                              {
+							                              std::lock_guard<std::mutex> lock(range_release_lock);
+							                              release_range_completed = true;
+						                              }
+						                              range_release.notify_all();
+					                              }
+					                              return success;
+				                              });
+				Record(request, response.status);
+				return;
+			}
 			if (config.block_first_range_body_until_second_range && range_request_index == 1) {
 				auto wait_for_second_request = make_shared_ptr<std::atomic<bool>>(true);
 				response.set_content_provider(
@@ -582,11 +642,14 @@ struct MockS3Server::Impl {
 	mutable std::atomic<idx_t> remaining_delete_failures {0};
 	mutable std::atomic<idx_t> remaining_post_failures {0};
 	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
-	mutable std::mutex observation_lock;
-	mutable vector<MockS3RequestObservation> observations;
+	mutable annotated_mutex observation_lock;
+	mutable vector<MockS3RequestObservation> observations DUCKDB_GUARDED_BY(observation_lock);
 	std::mutex range_request_lock;
 	std::condition_variable range_request_started;
 	idx_t range_requests_seen = 0;
+	std::mutex range_release_lock;
+	std::condition_variable range_release;
+	bool release_range_completed = false;
 	std::mutex full_get_lock;
 	std::condition_variable full_get_started;
 	std::condition_variable full_get_release;
@@ -672,9 +735,11 @@ string MockS3DescribeObservations(const vector<MockS3RequestObservation> &observ
 			result += "\n";
 		}
 		result += StringUtil::Format(
-		    "%s %s status=%d key=%s region=%s range=%s target=%s user_agent=%s session_header=%s", observation.method,
-		    observation.path, observation.status, observation.key_id, observation.region, observation.range,
-		    observation.target, observation.user_agent, observation.session_header);
+		    "%s %s status=%d key=%s region=%s range=%s if_match=%s version_id=%s target=%s user_agent=%s "
+		    "session_header=%s",
+		    observation.method, observation.path, observation.status, observation.key_id, observation.region,
+		    observation.range, observation.if_match, observation.version_id, observation.target, observation.user_agent,
+		    observation.session_header);
 	}
 	return result;
 }
