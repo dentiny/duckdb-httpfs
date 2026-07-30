@@ -1,8 +1,8 @@
 #include "catch.hpp"
 
-#include "mock_s3_server.hpp"
+#include "s3/mock_s3_server.hpp"
 
-#include "httpfs.hpp"
+#include "http/httpfs.hpp"
 #include "httpfs_extension.hpp"
 
 #include "duckdb.hpp"

@@ -1,4 +1,6 @@
-#include "s3_multi_part_upload.hpp"
+#include "s3/s3_multi_part_upload.hpp"
+#include "s3/s3_request.hpp"
+#include "s3/s3_url.hpp"
 
 #include <thread>
 #ifdef EMSCRIPTEN
@@ -103,7 +105,7 @@ void S3MultiPartUpload::FinalizeMultipartUpload() {
 	// Response is around ~400 in AWS docs so this should be enough to not need a resize
 	string result;
 
-	string query_param = "uploadId=" + S3FileSystem::UrlEncode(multipart_upload_id, true);
+	string query_param = "uploadId=" + S3Url::Encode(multipart_upload_id, true);
 	auto res = s3fs.PostRequest(*request_session, path, result, (char *)body.c_str(), body.length(), query_param);
 	auto open_tag_pos = result.find("<CompleteMultipartUploadResult", 0);
 	if (open_tag_pos == string::npos) {
@@ -115,7 +117,7 @@ void S3MultiPartUpload::FinalizeMultipartUpload() {
 void S3MultiPartUpload::UploadBuffer(shared_ptr<S3MultiPartUpload> multi_part_upload,
                                      shared_ptr<S3WriteBuffer> write_buffer) {
 	string query_param = "partNumber=" + to_string(write_buffer->part_no + 1) + "&" +
-	                     "uploadId=" + S3FileSystem::UrlEncode(multi_part_upload->multipart_upload_id, true);
+	                     "uploadId=" + S3Url::Encode(multi_part_upload->multipart_upload_id, true);
 
 	multi_part_upload->UploadBufferImplementation(write_buffer, query_param, false);
 	multi_part_upload->NotifyUploadsInProgress();
@@ -136,7 +138,7 @@ void S3MultiPartUpload::UploadBufferImplementation(shared_ptr<S3WriteBuffer> wri
 
 		if (res->status != HTTPStatusCode::OK_200) {
 			throw HTTPException(*res, "Unable to connect to URL %s: %s (HTTP code %d)%s", path, res->GetError(),
-			                    static_cast<int>(res->status), S3FileSystem::ParseS3Error(res->body));
+			                    static_cast<int>(res->status), S3RequestUtil::ParseError(res->body));
 		}
 
 		if (!res->headers.HasHeader("ETag")) {

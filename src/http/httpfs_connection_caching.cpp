@@ -1,4 +1,4 @@
-#include "httpfs_client.hpp"
+#include "http/httpfs_client.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/random_engine.hpp"
 #include "duckdb/common/thread.hpp"

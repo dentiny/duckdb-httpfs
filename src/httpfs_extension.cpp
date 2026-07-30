@@ -1,10 +1,10 @@
 #include "httpfs_extension.hpp"
 #include "duckdb/logging/logger.hpp"
 
-#include "httpfs_client.hpp"
+#include "http/httpfs_client.hpp"
 #include "create_secret_functions.hpp"
 #include "duckdb.hpp"
-#include "s3fs.hpp"
+#include "s3/s3fs.hpp"
 #include "hffs.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/logging/log_manager.hpp"
@@ -16,7 +16,7 @@
 #endif // OVERRIDE_ENCRYPTION_UTILS
 
 #ifndef EMSCRIPTEN
-#include "httpfs_curl_client.hpp"
+#include "http/httpfs_curl_client.hpp"
 #endif
 
 namespace duckdb {

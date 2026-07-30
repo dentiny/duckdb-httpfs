@@ -1,6 +1,6 @@
 #pragma once
 
-#include "s3fs.hpp"
+#include "s3/s3fs.hpp"
 #include "duckdb/execution/task_error_manager.hpp"
 
 namespace duckdb {

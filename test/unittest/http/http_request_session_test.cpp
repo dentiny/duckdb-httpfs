@@ -1,7 +1,7 @@
 #include "catch.hpp"
 
-#include "http_request_session.hpp"
-#include "s3fs.hpp"
+#include "http/http_request_session.hpp"
+#include "s3/s3fs.hpp"
 
 #include <functional>
 

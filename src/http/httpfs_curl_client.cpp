@@ -1,5 +1,5 @@
-#include "httpfs_client.hpp"
-#include "http_state.hpp"
+#include "http/httpfs_client.hpp"
+#include "http/http_state.hpp"
 #include "duckdb/logging/logger.hpp"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -9,7 +9,7 @@
 #include "duckdb/common/exception/http_exception.hpp"
 
 #ifndef EMSCRIPTEN
-#include "httpfs_curl_client.hpp"
+#include "http/httpfs_curl_client.hpp"
 #endif
 
 namespace duckdb {

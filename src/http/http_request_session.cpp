@@ -1,6 +1,6 @@
-#include "http_request_session.hpp"
+#include "http/http_request_session.hpp"
 
-#include "http_state.hpp"
+#include "http/http_state.hpp"
 
 namespace duckdb {
 

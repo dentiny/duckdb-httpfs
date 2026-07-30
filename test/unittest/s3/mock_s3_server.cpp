@@ -1,4 +1,4 @@
-#include "mock_s3_server.hpp"
+#include "s3/mock_s3_server.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/mutex.hpp"
