@@ -59,53 +59,23 @@ public:
 	shared_ptr<HTTPFileState> file_state;
 	optional_ptr<Allocator> buffer_allocator;
 
-	// Read info
-	idx_t buffer_available;
-	idx_t buffer_idx;
+	// Sequential read position
 	idx_t file_offset;
-	idx_t buffer_start;
-	idx_t buffer_end;
 
 	// Used when file handle created with parallel access flag specified.
 	mutex mu;
 
-	// Read buffer
-	AllocatedData read_buffer;
-	constexpr static idx_t INITIAL_READ_BUFFER_LEN = 1048576;
-	constexpr static idx_t MAXIMUM_READ_BUFFER_LEN = 33554432;
-
-	// Adaptively resizes read_buffer based on range_request_statistics
-	void AddStatistics(idx_t read_offset, idx_t read_length, idx_t read_duration) DUCKDB_EXCLUDES(throughput_lock);
-	void AdaptReadBufferSize(idx_t next_read_offset) DUCKDB_EXCLUDES(throughput_lock);
-
 	// Record a completed range request into the network throughput estimate (latency + bandwidth)
 	void RecordNetworkSample(double total_seconds, idx_t bytes, bool sample_has_ttfb, double ttfb_seconds)
-	    DUCKDB_EXCLUDES(throughput_lock);
+	    DUCKDB_EXCLUDES(network_estimator_lock);
 	// Expose the measured network throughput estimate to the (parquet) prefetch cost model.
-	bool TryGetNetworkThroughput(NetworkThroughputEstimate &result) DUCKDB_EXCLUDES(throughput_lock);
-
-	// Whether to bypass the read buffer
-	bool SkipBuffer() const {
-		return flags.DirectIO() || flags.RequireParallelAccess();
-	}
+	bool TryGetNetworkThroughput(NetworkThroughputEstimate &result) DUCKDB_EXCLUDES(network_estimator_lock);
 
 private:
-	void AllocateReadBuffer(optional_ptr<FileOpener> opener);
-
-	// Statistics that are used to adaptively grow the read_buffer
-	struct RangeRequestStatistics {
-		idx_t offset;
-		idx_t length;
-		idx_t duration;
-	};
-	vector<RangeRequestStatistics> range_request_statistics DUCKDB_GUARDED_BY(throughput_lock);
-
-	// throughput_lock guards the throughput estimate (fed by RecordNetworkSample) and range_request_statistics against
-	// concurrent prefetch reads.
-	mutable annotated_mutex throughput_lock;
-	double tp_latency_seconds DUCKDB_GUARDED_BY(throughput_lock) = 0;
-	double tp_bandwidth_bps DUCKDB_GUARDED_BY(throughput_lock) = 0;
-	idx_t tp_sample_count DUCKDB_GUARDED_BY(throughput_lock) = 0;
+	mutable annotated_mutex network_estimator_lock;
+	double tp_latency_seconds DUCKDB_GUARDED_BY(network_estimator_lock) = 0;
+	double tp_bandwidth_bps DUCKDB_GUARDED_BY(network_estimator_lock) = 0;
+	idx_t tp_sample_count DUCKDB_GUARDED_BY(network_estimator_lock) = 0;
 	// Minimum payload size for a request to contribute a bandwidth sample
 	constexpr static idx_t MIN_BANDWIDTH_SAMPLE_BYTES = 1 << 16; // 64 KiB
 
@@ -198,7 +168,7 @@ protected:
 	virtual unique_ptr<HTTPFileHandle> CreateHandle(const OpenFileInfo &file, FileOpenFlags flags,
 	                                                optional_ptr<FileOpener> opener);
 
-	//! Internal read helpers shared by buffered and direct reads.
+	//! Internal read helpers.
 	bool TryRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map, idx_t file_offset, char *buffer_out,
 	                     idx_t buffer_out_len);
 	bool ReadInternal(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location);
