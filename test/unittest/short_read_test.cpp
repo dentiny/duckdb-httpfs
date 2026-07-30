@@ -117,16 +117,31 @@ static string ReadRange(Connection &con, const string &path, idx_t offset, idx_t
 	return buffer;
 }
 
+static string ReadSequential(Connection &con, FileHandle &handle, idx_t length) {
+	string buffer(length, '?');
+	auto read_count = handle.Read(QueryContext(*con.context), buffer.data(), length);
+	buffer.resize(NumericCast<idx_t>(read_count));
+	return buffer;
+}
+
+static string CreateObjectData(idx_t length) {
+	string result(length, '\0');
+	for (idx_t i = 0; i < length; i++) {
+		result[i] = NumericCast<char>('a' + (i % 26));
+	}
+	return result;
+}
+
 static void RunPersistentShortRead() {
 	static constexpr idx_t READ_OFFSET = 113;
 	static constexpr idx_t READ_LENGTH = 1024;
 	const string expected_range = "bytes=113-1136";
 
 	MockS3ServerConfig config;
-	config.object_data = string(8192, 'x');
-	config.range_behavior = MockS3RangeBehavior::TRUNCATE_TRANSFER;
-	config.range_behavior_requests = 4;
-	config.truncated_range_bytes = 17;
+	config.object.data = string(8192, 'x');
+	config.range.behavior = MockS3RangeBehavior::TRUNCATE_TRANSFER;
+	config.range.behavior_requests = 4;
+	config.range.truncated_bytes = 17;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -150,11 +165,11 @@ static void RunTransientShortRead() {
 	const string expected_range = "bytes=113-1136";
 
 	MockS3ServerConfig config;
-	config.object_data = string(8192, 'x');
-	config.range_behavior = MockS3RangeBehavior::TRUNCATE_TRANSFER;
-	config.range_behavior_requests = 1;
-	config.truncated_range_bytes = 17;
-	auto expected = config.object_data.substr(READ_OFFSET, READ_LENGTH);
+	config.object.data = string(8192, 'x');
+	config.range.behavior = MockS3RangeBehavior::TRUNCATE_TRANSFER;
+	config.range.behavior_requests = 1;
+	config.range.truncated_bytes = 17;
+	auto expected = config.object.data.substr(READ_OFFSET, READ_LENGTH);
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -176,10 +191,10 @@ static void RunSuccessfulShortResponse() {
 	const string expected_range = "bytes=113-1136";
 
 	MockS3ServerConfig config;
-	config.object_data = string(8192, 'x');
-	config.range_behavior = MockS3RangeBehavior::SHORT_SUCCESS;
-	config.range_behavior_requests = 1;
-	config.truncated_range_bytes = 17;
+	config.object.data = string(8192, 'x');
+	config.range.behavior = MockS3RangeBehavior::SHORT_SUCCESS;
+	config.range.behavior_requests = 1;
+	config.range.truncated_bytes = 17;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -200,9 +215,9 @@ static void RunSuccessfulShortResponse() {
 
 static void RunParallelRangeHeaderRelease(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.object_data = string(8192, 'x');
-	config.advertise_ranges = false;
-	config.block_first_range_body_until_second_range = true;
+	config.object.data = string(8192, 'x');
+	config.range.advertise = false;
+	config.range.block_first_body_until_second = true;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -246,8 +261,8 @@ static void RunParallelRangeHeaderRelease(const string &client_implementation) {
 
 static void RunCompletedErrorConnectionReuse(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.transient_head_failures = 1;
-	config.failure_is_request_timeout = false;
+	config.failures.transient_head_failures = 1;
+	config.failures.failure_is_request_timeout = false;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -272,7 +287,7 @@ static void RunCompletedErrorConnectionReuse(const string &client_implementation
 
 static void RunSharedConnectionNotFoundReuse() {
 	MockS3ServerConfig config;
-	config.head_not_found_requests = 2;
+	config.failures.head_not_found_requests = 2;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -298,14 +313,14 @@ static void RunFullDownloadSingleFlight(const string &client_implementation, boo
 	const vector<idx_t> offsets {0, 2048, 4096, 6144};
 
 	MockS3ServerConfig config;
-	config.object_data.resize(8192);
-	for (idx_t i = 0; i < config.object_data.size(); i++) {
-		config.object_data[i] = NumericCast<char>('a' + (i % 26));
+	config.object.data.resize(8192);
+	for (idx_t i = 0; i < config.object.data.size(); i++) {
+		config.object.data[i] = NumericCast<char>('a' + (i % 26));
 	}
-	const auto expected_data = config.object_data;
-	config.advertise_ranges = false;
-	config.range_behavior = MockS3RangeBehavior::IGNORE_RANGE;
-	config.block_full_get_until_released = true;
+	const auto expected_data = config.object.data;
+	config.range.advertise = false;
+	config.range.behavior = MockS3RangeBehavior::IGNORE_RANGE;
+	config.full_get.block_until_released = true;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -350,6 +365,118 @@ static void RunFullDownloadSingleFlight(const string &client_implementation, boo
 	auto observations = server.Observations();
 	INFO(MockS3DescribeObservations(observations));
 	REQUIRE(CountRangeRequests(observations, 200) == 1);
+	REQUIRE(CountRequests(observations, "GET", 200) == 1);
+	RequireQueryOk(con, "COMMIT");
+}
+
+static void RunExactSequentialReadGeometry(const string &client_implementation, FileOpenFlags flags) {
+	MockS3ServerConfig config;
+	config.object.data = CreateObjectData(8192);
+	auto expected_data = config.object.data;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureHTTPTest(db, con, 0, client_implementation);
+	RequireQueryOk(con, "SET enable_external_file_cache=false");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto handle = fs.OpenFile(server.HTTPPath(), flags);
+
+	REQUIRE(ReadSequential(con, *handle, 13) == expected_data.substr(0, 13));
+	REQUIRE(ReadSequential(con, *handle, 17) == expected_data.substr(13, 17));
+	REQUIRE(handle->SeekPosition() == 30);
+
+	handle->Seek(1024);
+	REQUIRE(ReadSequential(con, *handle, 19) == expected_data.substr(1024, 19));
+	REQUIRE(handle->SeekPosition() == 1043);
+
+	auto observations_before_empty_reads = server.Observations();
+	REQUIRE(ReadSequential(con, *handle, 0).empty());
+	handle->Seek(expected_data.size());
+	REQUIRE(ReadSequential(con, *handle, 1).empty());
+	REQUIRE(server.Observations().size() == observations_before_empty_reads.size());
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(CountRequests(observations, "GET", 206, "bytes=0-12") == 1);
+	REQUIRE(CountRequests(observations, "GET", 206, "bytes=13-29") == 1);
+	REQUIRE(CountRequests(observations, "GET", 206, "bytes=1024-1042") == 1);
+	REQUIRE(CountRangeRequests(observations, 206) == 3);
+	RequireQueryOk(con, "COMMIT");
+}
+
+static void RunSequentialFailureKeepsPosition(const string &client_implementation) {
+	static constexpr idx_t READ_OFFSET = 113;
+	static constexpr idx_t READ_LENGTH = 1024;
+
+	MockS3ServerConfig config;
+	config.object.data = CreateObjectData(8192);
+	auto expected_data = config.object.data;
+	config.range.behavior = MockS3RangeBehavior::TRUNCATE_TRANSFER;
+	config.range.behavior_requests = 1;
+	config.range.truncated_bytes = 17;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureHTTPTest(db, con, 0, client_implementation);
+	RequireQueryOk(con, "SET enable_external_file_cache=false");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto handle = fs.OpenFile(server.HTTPPath(), FileFlags::FILE_FLAGS_READ);
+	handle->Seek(READ_OFFSET);
+
+	ReadOutcome outcome;
+	try {
+		ReadSequential(con, *handle, READ_LENGTH);
+	} catch (std::exception &ex) {
+		outcome.failed = true;
+		outcome.error = ex.what();
+		ErrorData error(ex);
+		outcome.internal_error = error.Type() == ExceptionType::INTERNAL || error.Type() == ExceptionType::FATAL;
+	}
+	INFO(outcome.error);
+	REQUIRE(outcome.failed);
+	REQUIRE_FALSE(outcome.internal_error);
+	REQUIRE(handle->SeekPosition() == READ_OFFSET);
+
+	REQUIRE(ReadSequential(con, *handle, 31) == expected_data.substr(READ_OFFSET, 31));
+	REQUIRE(handle->SeekPosition() == READ_OFFSET + 31);
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(CountRequests(observations, "GET", 206, "bytes=113-1136") == 1);
+	REQUIRE(CountRequests(observations, "GET", 206, "bytes=113-143") == 1);
+	RequireQueryOk(con, "COMMIT");
+}
+
+static void RunSequentialFullDownloadFallback(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.object.data = CreateObjectData(8192);
+	auto expected_data = config.object.data;
+	config.range.advertise = false;
+	config.range.behavior = MockS3RangeBehavior::IGNORE_RANGE;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureHTTPTest(db, con, 0, client_implementation);
+	RequireQueryOk(con, "SET enable_external_file_cache=false");
+	RequireQueryOk(con, "BEGIN TRANSACTION");
+
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto handle = fs.OpenFile(server.HTTPPath(), FileFlags::FILE_FLAGS_READ);
+	REQUIRE(ReadSequential(con, *handle, 17) == expected_data.substr(0, 17));
+	REQUIRE(handle->SeekPosition() == 17);
+	REQUIRE(ReadSequential(con, *handle, 11) == expected_data.substr(17, 11));
+	REQUIRE(handle->SeekPosition() == 28);
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	REQUIRE(CountRequests(observations, "GET", 200, "bytes=0-16") == 1);
 	REQUIRE(CountRequests(observations, "GET", 200) == 1);
 	RequireQueryOk(con, "COMMIT");
 }
@@ -406,9 +533,9 @@ TEST_CASE("HTTP full-download fallback is single-flight", "[httpfs][full-downloa
 
 TEST_CASE("HTTP full-download fallback rejects HEAD and GET length mismatches", "[httpfs][full-download][issue-354]") {
 	MockS3ServerConfig config;
-	config.object_data = "AB";
-	config.head_content_length = 3;
-	config.range_behavior = MockS3RangeBehavior::IGNORE_RANGE;
+	config.object.data = "AB";
+	config.metadata.head_content_length = 3;
+	config.range.behavior = MockS3RangeBehavior::IGNORE_RANGE;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -447,6 +574,45 @@ TEST_CASE("HTTP full-download fallback rejects HEAD and GET length mismatches", 
 	RequireQueryOk(con, "SET force_download=true");
 	REQUIRE(ReadRange(con, server.HTTPPath(), 0, 2) == "AB");
 	RequireQueryOk(con, "COMMIT");
+}
+
+TEST_CASE("HTTP sequential reads issue exact ranges without read-ahead", "[httpfs][read-ahead]") {
+	SECTION("curl default flags") {
+		RunExactSequentialReadGeometry("curl", FileFlags::FILE_FLAGS_READ);
+	}
+	SECTION("curl DirectIO") {
+		RunExactSequentialReadGeometry("curl", FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+	}
+	SECTION("curl parallel access") {
+		RunExactSequentialReadGeometry("curl", FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_PARALLEL_ACCESS);
+	}
+	SECTION("httplib default flags") {
+		RunExactSequentialReadGeometry("httplib", FileFlags::FILE_FLAGS_READ);
+	}
+	SECTION("httplib DirectIO") {
+		RunExactSequentialReadGeometry("httplib", FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+	}
+	SECTION("httplib parallel access") {
+		RunExactSequentialReadGeometry("httplib", FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_PARALLEL_ACCESS);
+	}
+}
+
+TEST_CASE("HTTP sequential read failures leave the cursor unchanged", "[httpfs][read-ahead][short-read]") {
+	SECTION("curl") {
+		RunSequentialFailureKeepsPosition("curl");
+	}
+	SECTION("httplib") {
+		RunSequentialFailureKeepsPosition("httplib");
+	}
+}
+
+TEST_CASE("HTTP sequential reads retain full-download fallback", "[httpfs][read-ahead][full-download]") {
+	SECTION("curl") {
+		RunSequentialFullDownloadFallback("curl");
+	}
+	SECTION("httplib") {
+		RunSequentialFullDownloadFallback("httplib");
+	}
 }
 
 } // namespace duckdb

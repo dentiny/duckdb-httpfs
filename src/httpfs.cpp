@@ -17,7 +17,6 @@
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "http_state.hpp"
 
-#include <chrono>
 #include <map>
 #include <string>
 
@@ -131,6 +130,42 @@ static string StripETagQuotes(const string &etag) {
 	return etag;
 }
 
+static bool IsStrongETag(string etag) {
+	StringUtil::Trim(etag);
+	if (etag.size() < 2 || etag.front() != '"' || etag.back() != '"' || StringUtil::StartsWith(etag, "W/")) {
+		return false;
+	}
+	for (idx_t i = 1; i + 1 < etag.size(); i++) {
+		const auto character = static_cast<uint8_t>(etag[i]);
+		if (character <= 0x20 || character == 0x22 || character == 0x7F) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void ApplyReadCondition(HTTPHeaders &headers, const HTTPReadConfig &read_config) {
+	if (read_config.condition.type == HTTPReadConditionType::ETAG) {
+		headers["If-Match"] = read_config.condition.value;
+	}
+}
+
+static HTTPHeaders RemoveRangeHeader(const HTTPHeaders &headers) {
+	HTTPHeaders result;
+	for (const auto &header : headers) {
+		if (!StringUtil::CIEquals(header.first, "Range")) {
+			result[header.first] = header.second;
+		}
+	}
+	return result;
+}
+
+static HTTPHeaders PrepareFullGetHeaders(const HTTPHeaders &headers, const HTTPReadConfig &read_config) {
+	auto result = RemoveRangeHeader(headers);
+	ApplyReadCondition(result, read_config);
+	return result;
+}
+
 static unique_ptr<HTTPResponse> SendSessionRequest(HTTPRequestSession &session,
                                                    const CapturedHTTPRequestSnapshot &captured,
                                                    HTTPFSParams &request_params, BaseRequest &request) {
@@ -150,7 +185,9 @@ static unique_ptr<HTTPResponse> SendSessionRequest(HTTPRequestSession &session,
 
 unique_ptr<HTTPResponse> HTTPFileSystem::RunHeadRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
                                                         HTTPSendCallback send_request) {
-	HeadRequestInfo head_request(url, header_map, http_params);
+	auto request_headers = RemoveRangeHeader(header_map);
+	http_params.extra_headers.erase("Range");
+	HeadRequestInfo head_request(url, request_headers, http_params);
 	return send_request(head_request);
 }
 
@@ -178,13 +215,23 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunPutRequest(string url, HTTPHeaders h
 }
 
 unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRequest(HTTPFileHandle &hfh, string url, HTTPHeaders header_map,
-                                                       HTTPFSParams &http_params, CachedFileDownload &download,
-                                                       HTTPErrorCallback get_error, HTTPSendCallback send_request) {
+                                                       HTTPFSParams &http_params, const HTTPReadConfig &read_config,
+                                                       CachedFileDownload &download, HTTPErrorCallback get_error,
+                                                       HTTPSendCallback send_request) {
+	auto request_headers = PrepareFullGetHeaders(header_map, read_config);
+	http_params.extra_headers.erase("Range");
 	GetRequestInfo get_request(
-	    url, header_map, http_params,
+	    url, request_headers, http_params,
 	    [&](const HTTPResponse &response) {
+		    if (response.status == HTTPStatusCode::PreconditionFailed_412 &&
+		        read_config.condition.type == HTTPReadConditionType::ETAG) {
+			    return false;
+		    }
 		    if (static_cast<int>(response.status) >= 400) {
 			    throw get_error(response);
+		    }
+		    if (static_cast<int>(response.status) < 300) {
+			    ValidateResponseETag(hfh, read_config, response);
 		    }
 		    download.Reset();
 		    optional_idx content_length;
@@ -197,12 +244,6 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRequest(HTTPFileHandle &hfh, stri
 		    }
 		    if (content_length.IsValid() && content_length.GetIndex() > 0) {
 			    download.Reserve(content_length.GetIndex());
-		    }
-		    if (http_params.s3_version_id_pinning && response.HasHeader("x-amz-version-id")) {
-			    lock_guard<mutex> lck(hfh.mu);
-			    if (hfh.version_id.empty()) {
-				    hfh.version_id = response.GetHeaderValue("x-amz-version-id");
-			    }
 		    }
 		    return true;
 	    },
@@ -223,19 +264,18 @@ static void SetRangeRequestNotSupported(HTTPResponse &response) {
 	}
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh, string url, HTTPHeaders header_map,
-                                                            HTTPFSParams &http_params, const string &etag,
-                                                            bool auto_fallback_to_full_file_download, idx_t file_offset,
-                                                            char *buffer_out, idx_t buffer_out_len,
-                                                            HTTPErrorCallback get_error,
-                                                            HTTPSendCallback send_request) {
+unique_ptr<HTTPResponse>
+HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh, string url, HTTPHeaders header_map, HTTPFSParams &http_params,
+                                   const HTTPReadConfig &read_config, idx_t file_offset, char *buffer_out,
+                                   idx_t buffer_out_len, HTTPErrorCallback get_error, HTTPSendCallback send_request) {
 	// send the Range header to read only subset of file
 	string range_expr = "bytes=" + to_string(file_offset) + "-" + to_string(file_offset + buffer_out_len - 1);
-	header_map.Insert("Range", range_expr);
+	header_map["Range"] = range_expr;
+	ApplyReadCondition(header_map, read_config);
 
 	D_ASSERT(hfh.file_state);
-	auto range_request = hfh.file_state->BeginRangeRequest(auto_fallback_to_full_file_download);
-	if (range_request.Support() == RangeRequestSupport::NOT_SUPPORTED && auto_fallback_to_full_file_download) {
+	auto range_request = hfh.file_state->BeginRangeRequest(read_config.auto_fallback_to_full_download);
+	if (range_request.Support() == RangeRequestSupport::NOT_SUPPORTED && read_config.auto_fallback_to_full_download) {
 		auto response = make_uniq<HTTPResponse>(HTTPStatusCode::INVALID);
 		SetRangeRequestNotSupported(*response);
 		return response;
@@ -246,35 +286,16 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh,
 	GetRequestInfo get_request(
 	    url, header_map, http_params,
 	    [&](const HTTPResponse &response) {
+		    if (response.status == HTTPStatusCode::PreconditionFailed_412 &&
+		        read_config.condition.type == HTTPReadConditionType::ETAG) {
+			    return false;
+		    }
 		    if (static_cast<int>(response.status) >= 400) {
 			    throw get_error(response);
 		    }
 		    if (static_cast<int>(response.status) < 300) { // done redirecting
 			    out_offset = 0;
-
-			    if (!http_params.unsafe_disable_etag_checks && !etag.empty() && response.HasHeader("ETag")) {
-				    string responseEtag = response.GetHeaderValue("ETag");
-
-				    if (!responseEtag.empty() && StripETagQuotes(responseEtag) != StripETagQuotes(etag)) {
-					    EraseGlobalCacheEntry(hfh.path);
-					    throw HTTPException(
-					        response,
-					        "ETag on reading file \"%s\" was initially %s and now it returned %s, this likely means "
-					        "the remote file has changed.\nFor parquet or similar single table sources, consider "
-					        "retrying the query, for "
-					        "persistent FileHandles such as databases consider `DETACH` and re-`ATTACH` "
-					        "\nYou can disable checking etags via `SET "
-					        "unsafe_disable_etag_checks = true;`",
-					        hfh.path, etag, response.GetHeaderValue("ETag"));
-				    }
-			    }
-
-			    if (http_params.s3_version_id_pinning && response.HasHeader("x-amz-version-id")) {
-				    lock_guard<mutex> lck(hfh.mu);
-				    if (hfh.version_id.empty()) {
-					    hfh.version_id = response.GetHeaderValue("x-amz-version-id");
-				    }
-			    }
+			    ValidateResponseETag(hfh, read_config, response);
 
 			    if (response.HasHeader("Content-Length")) {
 				    unsigned long long content_length;
@@ -309,7 +330,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh,
 		    return true;
 	    });
 
-	get_request.try_request = auto_fallback_to_full_file_download;
+	get_request.try_request = read_config.auto_fallback_to_full_download;
 	auto response = send_request(get_request);
 	if (range_request_not_supported) {
 		SetRangeRequestNotSupported(*response);
@@ -367,14 +388,44 @@ HTTPException HTTPFileSystem::GetHTTPError(FileHandle &, const HTTPResponse &res
 	return HTTPException(response, error);
 }
 
+void HTTPFileSystem::ValidateResponseETag(HTTPFileHandle &hfh, const HTTPReadConfig &read_config,
+                                          const HTTPResponse &response) {
+	if (!read_config.validate_etag || read_config.etag.empty() || !response.HasHeader("ETag")) {
+		return;
+	}
+	auto response_etag = response.GetHeaderValue("ETag");
+	if (response_etag.empty() || StripETagQuotes(response_etag) == StripETagQuotes(read_config.etag)) {
+		return;
+	}
+	EraseGlobalCacheEntry(hfh.path);
+	throw HTTPException(
+	    response,
+	    "ETag on reading file \"%s\" was initially %s and now it returned %s, this likely means "
+	    "the remote file has changed.\nFor parquet or similar single table sources, consider "
+	    "retrying the query, for persistent FileHandles such as databases consider `DETACH` and re-`ATTACH` "
+	    "\nYou can disable checking etags via `SET unsafe_disable_etag_checks = true;`",
+	    hfh.path, read_config.etag, response_etag);
+}
+
+void HTTPFileSystem::ThrowIfReadConditionFailed(HTTPFileHandle &hfh, const HTTPReadConfig &read_config,
+                                                const HTTPResponse &response) {
+	if (response.status != HTTPStatusCode::PreconditionFailed_412 ||
+	    read_config.condition.type != HTTPReadConditionType::ETAG) {
+		return;
+	}
+	EraseGlobalCacheEntry(hfh.path);
+	throw HTTPException(response, "ETag on reading file \"%s\" changed after it was opened: the server rejected %s",
+	                    hfh.path, read_config.condition.value);
+}
+
 unique_ptr<HTTPResponse> HTTPFileSystem::GetRequest(FileHandle &handle, string url, HTTPHeaders header_map,
-                                                    CachedFileDownload &download) {
+                                                    const HTTPReadConfig &read_config, CachedFileDownload &download) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
 	auto captured = hfh.request_session->Capture();
 	captured.snapshot->AddConfiguredHeaders(header_map);
 	auto request_params = captured.snapshot->CreateRequestParams();
 	return RunGetRequest(
-	    hfh, url, header_map, *request_params, download,
+	    hfh, url, header_map, *request_params, read_config, download,
 	    [&](const HTTPResponse &response) { return GetHTTPError(handle, response, url); },
 	    [&](BaseRequest &request) {
 		    return SendSessionRequest(*hfh.request_session, captured, *request_params, request);
@@ -382,14 +433,15 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRequest(FileHandle &handle, string u
 }
 
 unique_ptr<HTTPResponse> HTTPFileSystem::GetRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map,
-                                                         idx_t file_offset, char *buffer_out, idx_t buffer_out_len) {
+                                                         const HTTPReadConfig &read_config, idx_t file_offset,
+                                                         char *buffer_out, idx_t buffer_out_len) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
 	auto captured = hfh.request_session->Capture();
 	captured.snapshot->AddConfiguredHeaders(header_map);
 	auto request_params = captured.snapshot->CreateRequestParams();
 	return RunGetRangeRequest(
-	    hfh, url, header_map, *request_params, hfh.etag, hfh.auto_fallback_to_full_file_download, file_offset,
-	    buffer_out, buffer_out_len, [&](const HTTPResponse &response) { return GetHTTPError(handle, response, url); },
+	    hfh, url, header_map, *request_params, read_config, file_offset, buffer_out, buffer_out_len,
+	    [&](const HTTPResponse &response) { return GetHTTPError(handle, response, url); },
 	    [&](BaseRequest &request) {
 		    return SendSessionRequest(*hfh.request_session, captured, *request_params, request);
 	    });
@@ -399,8 +451,7 @@ HTTPFileHandle::HTTPFileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpe
                                unique_ptr<HTTPParams> params_p)
     : FileHandle(fs, file.path, flags), request_session(make_shared_ptr<HTTPRequestSession>(
                                             make_shared_ptr<HTTPRequestSnapshot>(params_p->Cast<HTTPFSParams>()))),
-      flags(flags), length(0), last_modified(0), force_full_download(false), buffer_available(0), buffer_idx(0),
-      file_offset(0), buffer_start(0), buffer_end(0) {
+      flags(flags), length(0), last_modified(0), force_full_download(false), file_offset(0) {
 	// check if the handle has extended properties that can be set directly in the handle
 	// if we have these properties we don't need to do a head request to obtain them later
 	if (file.extended_info) {
@@ -427,6 +478,42 @@ HTTPFileHandle::HTTPFileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpe
 			initialized = true;
 		}
 	}
+}
+
+HTTPReadConfig HTTPFileHandle::BuildReadConfig() const {
+	auto captured = request_session->Capture();
+	auto &params = captured.snapshot->Params();
+
+	HTTPReadConfig result;
+	result.etag = etag;
+	result.validate_etag = !params.unsafe_disable_etag_checks;
+	result.auto_fallback_to_full_download =
+	    auto_fallback_to_full_file_download && params.auto_fallback_to_full_download;
+	if (result.validate_etag && IsStrongETag(result.etag)) {
+		result.condition.type = HTTPReadConditionType::ETAG;
+		result.condition.value = result.etag;
+		StringUtil::Trim(result.condition.value);
+	}
+	return result;
+}
+
+void HTTPFileHandle::FinalizeReadConfig() {
+	D_ASSERT(!read_config_initialized);
+	read_config = BuildReadConfig();
+	read_config_initialized = true;
+}
+
+const HTTPReadConfig &HTTPFileHandle::GetReadConfig() const {
+	D_ASSERT(read_config_initialized);
+	return read_config;
+}
+
+string HTTPFileHandle::GetVersionId() const {
+	return version_id;
+}
+
+void HTTPFileHandle::SetVersionId(string version_id_p) {
+	version_id = std::move(version_id_p);
 }
 
 unique_ptr<HTTPFileHandle> HTTPFileSystem::CreateHandle(const OpenFileInfo &file, FileOpenFlags flags,
@@ -480,16 +567,11 @@ unique_ptr<FileHandle> HTTPFileSystem::OpenFileExtended(const OpenFileInfo &file
 	return std::move(handle);
 }
 
-void HTTPFileHandle::AddStatistics(idx_t read_offset, idx_t read_length, idx_t read_duration) {
-	annotated_lock_guard<annotated_mutex> guard(throughput_lock);
-	range_request_statistics.push_back({read_offset, read_length, read_duration});
-}
-
 void HTTPFileHandle::RecordNetworkSample(double total_seconds, idx_t bytes, bool sample_has_ttfb, double ttfb_seconds) {
 	if (!(total_seconds > 0)) {
 		return;
 	}
-	annotated_lock_guard<annotated_mutex> guard(throughput_lock);
+	annotated_lock_guard<annotated_mutex> guard(network_estimator_lock);
 	const idx_t n = tp_sample_count + 1;
 	const double alpha = MaxValue<double>(0.2, 1.0 / static_cast<double>(n));
 
@@ -507,34 +589,13 @@ void HTTPFileHandle::RecordNetworkSample(double total_seconds, idx_t bytes, bool
 }
 
 bool HTTPFileHandle::TryGetNetworkThroughput(NetworkThroughputEstimate &result) {
-	annotated_lock_guard<annotated_mutex> guard(throughput_lock);
+	annotated_lock_guard<annotated_mutex> guard(network_estimator_lock);
 	if (tp_sample_count == 0 || tp_latency_seconds <= 0 || tp_bandwidth_bps <= 0) {
 		return false;
 	}
 	result.latency_seconds = tp_latency_seconds;
 	result.bandwidth_bytes_per_s = tp_bandwidth_bps;
 	return true;
-}
-
-void HTTPFileHandle::AdaptReadBufferSize(idx_t next_read_offset) {
-	D_ASSERT(!SkipBuffer());
-	{
-		annotated_lock_guard<annotated_mutex> guard(throughput_lock);
-		if (range_request_statistics.empty()) {
-			return;
-		}
-		const auto &last_read = range_request_statistics.back();
-		if (last_read.offset + last_read.length != next_read_offset) {
-			return;
-		}
-	}
-
-	if (read_buffer.GetSize() >= MAXIMUM_READ_BUFFER_LEN) {
-		return;
-	}
-	// Grow the buffer
-	// TODO: can use statistics to estimate per-byte and round-trip cost using least squares, and do something smarter
-	read_buffer = read_buffer.GetAllocator()->Allocate(read_buffer.GetSize() * 2);
 }
 
 static bool RespondedWithRangeRequestNotSupported(const HTTPResponse &res) {
@@ -546,21 +607,20 @@ static bool RespondedWithRangeRequestNotSupported(const HTTPResponse &res) {
 	       error.RawMessage() == RangeRequestNotSupportedException::MESSAGE;
 }
 
-bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map, idx_t file_offset,
-                                     char *buffer_out, idx_t buffer_out_len) {
+bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map,
+                                     const HTTPReadConfig &read_config, idx_t file_offset, char *buffer_out,
+                                     idx_t buffer_out_len) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
 
-	const auto timestamp_before = std::chrono::steady_clock::now();
-	auto res = GetRangeRequest(handle, url, header_map, file_offset, buffer_out, buffer_out_len);
+	auto res = GetRangeRequest(handle, url, header_map, read_config, file_offset, buffer_out, buffer_out_len);
 
 	if (res) {
+		ThrowIfReadConditionFailed(hfh, read_config, *res);
 		// Request failed and we have a request error
 		if (res->HasRequestError()) {
 			// Special case: we can do a retry with a full file download
-			if (RespondedWithRangeRequestNotSupported(*res)) {
-				if (hfh.request_session->Capture().snapshot->Params().auto_fallback_to_full_download) {
-					return false;
-				}
+			if (RespondedWithRangeRequestNotSupported(*res) && read_config.auto_fallback_to_full_download) {
+				return false;
 			}
 			ErrorData error(res->GetRequestError());
 			error.Throw();
@@ -569,14 +629,6 @@ bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders
 		// Request succeeded TODO: fix upstream that 206 is not considered success
 		if (res->Success() || res->status == HTTPStatusCode::PartialContent_206 ||
 		    res->status == HTTPStatusCode::Accepted_202) {
-			if (!hfh.flags.RequireParallelAccess()) {
-				// Update range request statistics
-				const auto timestamp_after = std::chrono::steady_clock::now();
-				const auto duration = NumericCast<idx_t>(
-				    std::chrono::duration_cast<std::chrono::microseconds>(timestamp_after - timestamp_before).count());
-				hfh.AddStatistics(file_offset, buffer_out_len, duration);
-			}
-
 			return true;
 		}
 
@@ -586,116 +638,42 @@ bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders
 	throw IOException("Unknown error for HTTP %s to '%s'", EnumUtil::ToString(RequestType::GET_REQUEST), url);
 }
 
-bool HTTPFileSystem::ReadInternal(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+bool HTTPFileSystem::ReadAt(FileHandle &handle, void *buffer, idx_t read_size, idx_t location,
+                            const HTTPReadConfig &read_config) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
+	if (read_size > NumericLimits<idx_t>::Maximum() - location) {
+		throw IOException("HTTP read range overflow for file \"%s\"", hfh.path);
+	}
+	auto read_end = location + read_size;
 
 	D_ASSERT(hfh.file_state);
 	auto cached_file = hfh.file_state->TryGetCachedFileHandle();
 	if (cached_file) {
-		if (cached_file->GetSize() < location + nr_bytes) {
+		if (cached_file->GetSize() < read_end) {
 			throw IOException("Cached file length can't satisfy the requested Read. You can try to resolve this by "
 			                  "enabling `SET force_download=true`");
 		}
-		memcpy(buffer, cached_file->GetData() + location, nr_bytes);
-		DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
-		if (hfh.flags.RequireParallelAccess()) {
-			std::lock_guard<mutex> lck(hfh.mu);
-			hfh.file_offset = location + nr_bytes;
-			return true;
+		if (read_size > 0) {
+			memcpy(buffer, cached_file->GetData() + location, read_size);
 		}
-		hfh.file_offset = location + nr_bytes;
-		return true;
-	}
-
-	idx_t to_read = nr_bytes;
-	idx_t buffer_offset = 0;
-
-	// Don't buffer when DirectIO is set or when we are doing parallel reads
-	if (hfh.SkipBuffer() && to_read > 0) {
-		if (!TryRangeRequest(hfh, hfh.path, {}, location, (char *)buffer, to_read)) {
+	} else if (read_size > 0) {
+		if (!TryRangeRequest(hfh, hfh.path, {}, read_config, location, static_cast<char *>(buffer), read_size)) {
 			return false;
 		}
-		DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
-		// Update handle status within critical section for parallel access.
-		if (hfh.flags.RequireParallelAccess()) {
-			std::lock_guard<mutex> lck(hfh.mu);
-			hfh.buffer_available = 0;
-			hfh.buffer_idx = 0;
-			hfh.file_offset = location + nr_bytes;
-			return true;
-		}
-
-		hfh.buffer_available = 0;
-		hfh.buffer_idx = 0;
-		hfh.file_offset = location + nr_bytes;
-		return true;
 	}
 
-	if (location >= hfh.buffer_start && location < hfh.buffer_end) {
-		hfh.buffer_idx = location - hfh.buffer_start;
-		hfh.buffer_available = (hfh.buffer_end - hfh.buffer_start) - hfh.buffer_idx;
-	} else {
-		// reset buffer
-		hfh.buffer_available = 0;
-		hfh.buffer_idx = 0;
-	}
-
-	idx_t start_offset = location; // Start file offset to read from.
-	while (to_read > 0) {
-		auto buffer_read_len = MinValue<idx_t>(hfh.buffer_available, to_read);
-		if (buffer_read_len > 0) {
-			D_ASSERT(hfh.buffer_start + hfh.buffer_idx + buffer_read_len <= hfh.buffer_end);
-			memcpy((char *)buffer + buffer_offset, hfh.read_buffer.get() + hfh.buffer_idx, buffer_read_len);
-
-			buffer_offset += buffer_read_len;
-			to_read -= buffer_read_len;
-
-			hfh.buffer_idx += buffer_read_len;
-			hfh.buffer_available -= buffer_read_len;
-			start_offset += buffer_read_len;
-		}
-
-		if (to_read > 0 && hfh.buffer_available == 0) {
-			auto new_buffer_available = MinValue<idx_t>(hfh.read_buffer.GetSize(), hfh.length - start_offset);
-
-			// Bypass buffer if we read more than buffer size
-			if (to_read > new_buffer_available) {
-				if (!TryRangeRequest(hfh, hfh.path, {}, location + buffer_offset, (char *)buffer + buffer_offset,
-				                     to_read)) {
-					return false;
-				}
-				hfh.buffer_available = 0;
-				hfh.buffer_idx = 0;
-				start_offset += to_read;
-				break;
-			} else {
-				hfh.AdaptReadBufferSize(start_offset);
-				new_buffer_available = MinValue<idx_t>(hfh.read_buffer.GetSize(), hfh.length - start_offset);
-				if (!TryRangeRequest(hfh, hfh.path, {}, start_offset, (char *)hfh.read_buffer.get(),
-				                     new_buffer_available)) {
-					return false;
-				}
-				hfh.buffer_available = new_buffer_available;
-				hfh.buffer_idx = 0;
-				hfh.buffer_start = start_offset;
-				hfh.buffer_end = hfh.buffer_start + new_buffer_available;
-			}
-		}
-	}
-	hfh.file_offset = location + nr_bytes;
-	DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
+	DUCKDB_LOG_FILE_SYSTEM_READ(handle, NumericCast<int64_t>(read_size), location);
 	return true;
 }
 
-// Buffered read from http file.
-// Note that buffering is disabled when FileFlags::FILE_FLAGS_DIRECT_IO is set
-void HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
-	auto success = ReadInternal(handle, buffer, nr_bytes, location);
+void HTTPFileSystem::ReadAtWithFallback(FileHandle &handle, void *buffer, idx_t read_size, idx_t location,
+                                        const HTTPReadConfig &read_config) {
+	auto success = ReadAt(handle, buffer, read_size, location, read_config);
 	if (success) {
 		return;
 	}
 
-	// ReadInternal returned false. This means the regular path of querying the file with range requests failed. We will
+	// ReadAt returned false. This means the regular path of querying the file with range requests failed. We will
 	// attempt to download the full file and retry.
 
 	if (handle.logger) {
@@ -709,7 +687,7 @@ void HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 	const auto head_reported_length = hfh.length;
 
 	bool should_write_cache = false;
-	auto cached_file = FullDownload(hfh, should_write_cache);
+	auto cached_file = FullDownload(hfh, read_config, should_write_cache);
 
 	const auto downloaded_length = cached_file->GetSize();
 	if (downloaded_length != head_reported_length) {
@@ -722,17 +700,34 @@ void HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 		    static_cast<unsigned long long>(downloaded_length)));
 	}
 
-	if (!ReadInternal(handle, buffer, nr_bytes, location)) {
+	if (!ReadAt(handle, buffer, read_size, location, read_config)) {
 		throw HTTPException("Failed to read from HTTP file after automatically retrying a full file download.");
 	}
 }
 
+void HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+	auto &hfh = handle.Cast<HTTPFileHandle>();
+	auto read_size = NumericCast<idx_t>(nr_bytes);
+	if (read_size == 0) {
+		return;
+	}
+	auto read_config = hfh.GetReadConfig();
+	ReadAtWithFallback(handle, buffer, read_size, location, read_config);
+}
+
 int64_t HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
-	idx_t max_read = hfh.length - hfh.file_offset;
-	nr_bytes = MinValue<idx_t>(max_read, nr_bytes);
-	Read(handle, buffer, nr_bytes, hfh.file_offset);
-	return nr_bytes;
+	auto read_size = NumericCast<idx_t>(nr_bytes);
+	annotated_lock_guard<annotated_mutex> guard(hfh.cursor_mutex);
+	if (read_size == 0 || hfh.file_offset >= hfh.length) {
+		return 0;
+	}
+	read_size = MinValue<idx_t>(hfh.length - hfh.file_offset, read_size);
+	const auto location = hfh.file_offset;
+	auto read_config = hfh.GetReadConfig();
+	ReadAtWithFallback(handle, buffer, read_size, location, read_config);
+	hfh.file_offset += read_size;
+	return NumericCast<int64_t>(read_size);
 }
 
 void HTTPFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
@@ -741,7 +736,12 @@ void HTTPFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, i
 
 int64_t HTTPFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
-	Write(handle, buffer, nr_bytes, hfh.file_offset);
+	idx_t location;
+	{
+		annotated_lock_guard<annotated_mutex> guard(hfh.cursor_mutex);
+		location = hfh.file_offset;
+	}
+	Write(handle, buffer, nr_bytes, location);
 	return nr_bytes;
 }
 
@@ -780,11 +780,13 @@ bool HTTPFileSystem::CanHandleFile(const string &fpath) {
 
 void HTTPFileSystem::Seek(FileHandle &handle, idx_t location) {
 	auto &sfh = handle.Cast<HTTPFileHandle>();
+	annotated_lock_guard<annotated_mutex> guard(sfh.cursor_mutex);
 	sfh.file_offset = location;
 }
 
 idx_t HTTPFileSystem::SeekPosition(FileHandle &handle) {
 	auto &sfh = handle.Cast<HTTPFileHandle>();
+	annotated_lock_guard<annotated_mutex> guard(sfh.cursor_mutex);
 	return sfh.file_offset;
 }
 
@@ -826,7 +828,8 @@ static optional_ptr<HTTPMetadataCache> TryGetMetadataCache(optional_ptr<FileOpen
 	return nullptr;
 }
 
-unique_ptr<CachedFileHandle> HTTPFileSystem::FullDownload(HTTPFileHandle &hfh, bool &should_write_cache) {
+unique_ptr<CachedFileHandle> HTTPFileSystem::FullDownload(HTTPFileHandle &hfh, const HTTPReadConfig &read_config,
+                                                          bool &should_write_cache) {
 	D_ASSERT(hfh.file_state);
 	D_ASSERT(hfh.buffer_allocator);
 	should_write_cache = false;
@@ -840,7 +843,8 @@ unique_ptr<CachedFileHandle> HTTPFileSystem::FullDownload(HTTPFileHandle &hfh, b
 		if (!download) {
 			continue;
 		}
-		auto full_download_result = GetRequest(hfh, hfh.path, {}, *download);
+		auto full_download_result = GetRequest(hfh, hfh.path, {}, read_config, *download);
+		ThrowIfReadConditionFailed(hfh, read_config, *full_download_result);
 		if (full_download_result->status != HTTPStatusCode::OK_200) {
 			throw HTTPException(*full_download_result, "Full download failed to to URL \"%s\": %d (%s)",
 			                    full_download_result->url, static_cast<int>(full_download_result->status),
@@ -929,12 +933,13 @@ void HTTPFileHandle::LoadFileInfo() {
 			// HEAD request fail, use Range request for another try (read only one byte)
 			if (flags.OpenForReading() && res->status != HTTPStatusCode::NotFound_404 &&
 			    res->status != HTTPStatusCode::MovedPermanently_301) {
-				auto range_res = hfs.GetRangeRequest(*this, path, {}, 0, nullptr, 2);
+				auto read_config = BuildReadConfig();
+				auto range_res = hfs.GetRangeRequest(*this, path, {}, read_config, 0, nullptr, 2);
 				if (range_res->status != HTTPStatusCode::PartialContent_206 &&
 				    range_res->status != HTTPStatusCode::Accepted_202 && range_res->status != HTTPStatusCode::OK_200) {
 					// It failed again, check whether we can fall back to full download
 					if (RespondedWithRangeRequestNotSupported(*range_res) &&
-					    request_session->Capture().snapshot->Params().auto_fallback_to_full_download) {
+					    read_config.auto_fallback_to_full_download) {
 						force_full_download = true;
 					} else {
 						throw hfs.GetHTTPError(*this, *range_res, path);
@@ -963,7 +968,7 @@ void HTTPFileHandle::LoadFileInfo() {
 	}
 	if (request_session->Capture().snapshot->Params().s3_version_id_pinning &&
 	    res->headers.HasHeader("x-amz-version-id")) {
-		version_id = res->headers.GetHeaderValue("x-amz-version-id");
+		SetVersionId(res->headers.GetHeaderValue("x-amz-version-id"));
 	}
 	if (res->headers.HasHeader("Accept-Ranges")) {
 		auto accept_ranges = res->headers.GetHeaderValue("Accept-Ranges");
@@ -987,19 +992,11 @@ void HTTPFileHandle::TryAddLogger(FileOpener &opener) {
 	}
 }
 
-void HTTPFileHandle::AllocateReadBuffer(optional_ptr<FileOpener> opener) {
-	D_ASSERT(!SkipBuffer());
-	D_ASSERT(!read_buffer.IsSet());
-	auto &allocator = opener && opener->TryGetClientContext() ? BufferAllocator::Get(*opener->TryGetClientContext())
-	                                                          : Allocator::DefaultAllocator();
-	read_buffer = allocator.Allocate(INITIAL_READ_BUFFER_LEN);
-}
-
 void HTTPFileHandle::InitializeFromCacheEntry(const HTTPMetadataCacheEntry &cache_entry) {
 	last_modified = cache_entry.last_modified;
 	length = cache_entry.length;
 	etag = cache_entry.etag;
-	version_id = cache_entry.version_id;
+	SetVersionId(cache_entry.version_id);
 
 	// TODO: handle properties
 }
@@ -1009,7 +1006,7 @@ HTTPMetadataCacheEntry HTTPFileHandle::GetCacheEntry() const {
 	result.length = length;
 	result.last_modified = last_modified;
 	result.etag = etag;
-	result.version_id = version_id;
+	result.version_id = GetVersionId();
 	// TODO: handle properties
 	return result;
 }
@@ -1042,7 +1039,8 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 	bool should_write_cache = false;
 	if (flags.OpenForReading()) {
 		if (request_snapshot->Params().force_download) {
-			length = hfs.FullDownload(*this, should_write_cache)->GetSize();
+			FinalizeReadConfig();
+			length = hfs.FullDownload(*this, GetReadConfig(), should_write_cache)->GetSize();
 			return;
 		}
 
@@ -1052,10 +1050,7 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 
 			if (found) {
 				InitializeFromCacheEntry(value);
-
-				if (flags.OpenForReading() && !SkipBuffer()) {
-					AllocateReadBuffer(opener);
-				}
+				FinalizeReadConfig();
 				return;
 			}
 
@@ -1063,6 +1058,7 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 		}
 	}
 	LoadFileInfo();
+	FinalizeReadConfig();
 
 	if (flags.OpenForReading()) {
 
@@ -1073,15 +1069,10 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 		const auto should_full_download = has_cache_state || meets_threshold || always_download;
 
 		if (should_full_download) {
-			length = hfs.FullDownload(*this, should_write_cache)->GetSize();
+			length = hfs.FullDownload(*this, GetReadConfig(), should_write_cache)->GetSize();
 		}
 		if (should_write_cache) {
 			current_cache->Insert(path, GetCacheEntry());
-		}
-
-		if (!should_full_download && !SkipBuffer()) {
-			// Initialize the read buffer now that we know the file exists
-			AllocateReadBuffer(opener);
 		}
 	}
 

@@ -6,8 +6,13 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../src/include)
 
 add_executable(
   unittest_httpfs EXCLUDE_FROM_ALL
-  main.cpp mock_s3_server.cpp httpfs_refresh_test.cpp s3_list_retry_test.cpp
-  short_read_test.cpp http_request_session_test.cpp)
+  main.cpp
+  mock_s3_server.cpp
+  httpfs_refresh_test.cpp
+  s3_list_retry_test.cpp
+  short_read_test.cpp
+  positional_read_test.cpp
+  http_request_session_test.cpp)
 set_target_properties(unittest_httpfs PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                  ${CMAKE_BINARY_DIR}/test)
 

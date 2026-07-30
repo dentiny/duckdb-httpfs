@@ -19,17 +19,35 @@ enum class MockS3RefreshTarget : uint8_t {
 
 enum class MockS3RangeBehavior : uint8_t { NORMAL, IGNORE_RANGE, TRUNCATE_TRANSFER, SHORT_SUCCESS };
 
-struct MockS3ServerConfig {
+struct MockS3ObjectConfig {
 	string bucket = "refresh-bucket";
-	string object_key = "object.bin";
-	string object_data = "abcdefghijklmnopqrstuvwxyz0123456789";
+	string key = "object.bin";
+	string data = "abcdefghijklmnopqrstuvwxyz0123456789";
+};
+
+struct MockS3AuthConfig {
 	string stale_key_id = "STALE_KEY";
-	int stale_auth_status = 403;
-	string stale_auth_error_code = "AccessDenied";
-	string etag = "\"httpfs-refresh-test-etag\"";
-	//! Redirect signed requests to this region when their credential scope uses a different one
+	int stale_status = 403;
+	string stale_error_code = "AccessDenied";
 	string required_region;
 	MockS3RefreshTarget refresh_target = MockS3RefreshTarget::HEAD;
+};
+
+struct MockS3MetadataConfig {
+	string etag = "\"httpfs-refresh-test-etag\"";
+	//! ETag returned by GET; use etag when empty
+	string get_etag;
+	//! S3 version ID returned by selected metadata/data responses
+	string version_id;
+	bool version_on_head = false;
+	bool version_on_get = false;
+	//! Reject GETs whose If-Match does not equal the GET ETag
+	bool enforce_if_match = false;
+	//! Override the Content-Length reported by HEAD while keeping the GET body unchanged
+	optional_idx head_content_length;
+};
+
+struct MockS3FailureConfig {
 	//! Answer this many leading ListObjectsV2 requests with HTTP 503 SlowDown
 	idx_t transient_503_lists = 0;
 	//! Answer this many leading ListObjectsV2 requests with HTTP 400
@@ -38,22 +56,6 @@ struct MockS3ServerConfig {
 	idx_t transient_put_failures = 0;
 	//! Number of object GETs to fail with a 400 before succeeding
 	idx_t transient_get_failures = 0;
-	//! Range response behavior to inject
-	MockS3RangeBehavior range_behavior = MockS3RangeBehavior::NORMAL;
-	//! Number of leading range GETs affected by transient range behaviors
-	idx_t range_behavior_requests = 0;
-	//! Number of bytes to omit from an injected truncated range response
-	idx_t truncated_range_bytes = 1;
-	//! Override the Content-Length reported by HEAD while keeping the GET body unchanged
-	optional_idx head_content_length;
-	//! Send successful full GETs with chunked transfer encoding and no Content-Length
-	bool chunked_full_get = false;
-	//! Advertise byte-range support on HEAD responses
-	bool advertise_ranges = true;
-	//! Hold the first range response body until a second range request arrives
-	bool block_first_range_body_until_second_range = false;
-	//! Hold a full GET response body until ReleaseFullGet is called
-	bool block_full_get_until_released = false;
 	//! Number of object HEADs to fail with a 400 before succeeding
 	idx_t transient_head_failures = 0;
 	//! Number of object HEADs to answer with 404 before succeeding
@@ -70,11 +72,44 @@ struct MockS3ServerConfig {
 	bool truncated_failure_body = false;
 };
 
+struct MockS3RangeConfig {
+	MockS3RangeBehavior behavior = MockS3RangeBehavior::NORMAL;
+	//! Number of leading range GETs affected by transient range behaviors
+	idx_t behavior_requests = 0;
+	//! Number of bytes to omit from an injected truncated range response
+	idx_t truncated_bytes = 1;
+	//! Advertise byte-range support on HEAD responses
+	bool advertise = true;
+	//! Hold the first range response body until a second range request arrives
+	bool block_first_body_until_second = false;
+	//! Hold this exact range response body until release_range has emitted its body
+	string blocked;
+	string release;
+};
+
+struct MockS3FullGetConfig {
+	//! Send successful responses with chunked transfer encoding and no Content-Length
+	bool chunked = false;
+	//! Hold the response body until ReleaseFullGet is called
+	bool block_until_released = false;
+};
+
+struct MockS3ServerConfig {
+	MockS3ObjectConfig object;
+	MockS3AuthConfig auth;
+	MockS3MetadataConfig metadata;
+	MockS3FailureConfig failures;
+	MockS3RangeConfig range;
+	MockS3FullGetConfig full_get;
+};
+
 struct MockS3RequestObservation {
 	string method;
 	string path;
 	string target;
 	string range;
+	string if_match;
+	string version_id;
 	string key_id;
 	string region;
 	string user_agent;

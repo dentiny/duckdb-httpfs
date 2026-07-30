@@ -1,6 +1,7 @@
 #include "mock_s3_server.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 
 #include "httplib.hpp"
@@ -96,19 +97,26 @@ static idx_t CountHeader(const httplib::Request &request, const string &header) 
 	return result;
 }
 
+static string GetParameter(const httplib::Request &request, const string &parameter) {
+	if (!request.has_param(parameter)) {
+		return string();
+	}
+	return request.get_param_value(parameter);
+}
+
 } // namespace
 
 struct MockS3Server::Impl {
 	explicit Impl(MockS3ServerConfig config_p) : config(std::move(config_p)) {
-		remaining_put_failures = config.transient_put_failures;
-		remaining_get_failures = config.transient_get_failures;
-		remaining_range_behavior_requests = config.range_behavior_requests;
-		remaining_head_failures = config.transient_head_failures;
-		remaining_head_not_found = config.head_not_found_requests;
-		remaining_delete_failures = config.transient_delete_failures;
-		remaining_post_failures = config.transient_post_failures;
-		remaining_complete_post_failures = config.transient_complete_post_failures;
-		if (config.range_behavior == MockS3RangeBehavior::SHORT_SUCCESS && config.range_behavior_requests > 0) {
+		remaining_put_failures = config.failures.transient_put_failures;
+		remaining_get_failures = config.failures.transient_get_failures;
+		remaining_range_behavior_requests = config.range.behavior_requests;
+		remaining_head_failures = config.failures.transient_head_failures;
+		remaining_head_not_found = config.failures.head_not_found_requests;
+		remaining_delete_failures = config.failures.transient_delete_failures;
+		remaining_post_failures = config.failures.transient_post_failures;
+		remaining_complete_post_failures = config.failures.transient_complete_post_failures;
+		if (config.range.behavior == MockS3RangeBehavior::SHORT_SUCCESS && config.range.behavior_requests > 0) {
 			server.set_keep_alive_max_count(1);
 		}
 		RegisterRoutes();
@@ -132,15 +140,15 @@ struct MockS3Server::Impl {
 	}
 
 	string S3Path() const {
-		return StringUtil::Format("s3://%s/%s", config.bucket, config.object_key);
+		return StringUtil::Format("s3://%s/%s", config.object.bucket, config.object.key);
 	}
 
 	string HTTPPath() const {
-		return StringUtil::Format("http://%s/%s/%s", Endpoint(), config.bucket, config.object_key);
+		return StringUtil::Format("http://%s/%s/%s", Endpoint(), config.object.bucket, config.object.key);
 	}
 
-	vector<MockS3RequestObservation> Observations() const {
-		std::lock_guard<std::mutex> lock(observation_lock);
+	vector<MockS3RequestObservation> Observations() const DUCKDB_EXCLUDES(observation_lock) {
+		annotated_lock_guard<annotated_mutex> lock(observation_lock);
 		return observations;
 	}
 
@@ -159,7 +167,7 @@ struct MockS3Server::Impl {
 
 	bool MatchesRefreshTarget(const httplib::Request &request) const {
 		auto range = GetHeader(request, "Range");
-		switch (config.refresh_target) {
+		switch (config.auth.refresh_target) {
 		case MockS3RefreshTarget::HEAD:
 			return request.method == "HEAD";
 		case MockS3RefreshTarget::FULL_GET:
@@ -184,21 +192,23 @@ struct MockS3Server::Impl {
 	}
 
 	bool ShouldRejectStaleCredentials(const httplib::Request &request) const {
-		return ExtractCredentialKey(GetHeader(request, "Authorization")) == config.stale_key_id &&
+		return ExtractCredentialKey(GetHeader(request, "Authorization")) == config.auth.stale_key_id &&
 		       MatchesRefreshTarget(request);
 	}
 
 	bool ShouldRedirectRegion(const httplib::Request &request) const {
-		return !config.required_region.empty() &&
-		       ExtractCredentialRegion(GetHeader(request, "Authorization")) != config.required_region;
+		return !config.auth.required_region.empty() &&
+		       ExtractCredentialRegion(GetHeader(request, "Authorization")) != config.auth.required_region;
 	}
 
-	void Record(const httplib::Request &request, int status) const {
+	void Record(const httplib::Request &request, int status) const DUCKDB_EXCLUDES(observation_lock) {
 		MockS3RequestObservation observation;
 		observation.method = request.method;
 		observation.path = request.path;
 		observation.target = request.target;
 		observation.range = GetHeader(request, "Range");
+		observation.if_match = GetHeader(request, "If-Match");
+		observation.version_id = GetParameter(request, "versionId");
 		observation.key_id = ExtractCredentialKey(GetHeader(request, "Authorization"));
 		observation.region = ExtractCredentialRegion(GetHeader(request, "Authorization"));
 		observation.user_agent = GetHeader(request, "User-Agent");
@@ -208,20 +218,35 @@ struct MockS3Server::Impl {
 		observation.status = status;
 		observation.remote_port = request.remote_port;
 
-		std::lock_guard<std::mutex> lock(observation_lock);
+		annotated_lock_guard<annotated_mutex> lock(observation_lock);
 		observations.push_back(std::move(observation));
 	}
 
 	void SetObjectHeaders(httplib::Response &response) const {
-		if (config.advertise_ranges) {
+		if (config.range.advertise) {
 			response.set_header("Accept-Ranges", "bytes");
 		} else {
 			response.set_header("Accept-Ranges", "none");
 		}
-		auto content_length =
-		    config.head_content_length.IsValid() ? config.head_content_length.GetIndex() : config.object_data.size();
+		auto content_length = config.metadata.head_content_length.IsValid()
+		                          ? config.metadata.head_content_length.GetIndex()
+		                          : config.object.data.size();
 		response.set_header("Content-Length", std::to_string(content_length));
-		response.set_header("ETag", config.etag);
+		response.set_header("ETag", config.metadata.etag);
+		if (config.metadata.version_on_head && !config.metadata.version_id.empty()) {
+			response.set_header("x-amz-version-id", config.metadata.version_id);
+		}
+	}
+
+	string GetResponseETag() const {
+		return config.metadata.get_etag.empty() ? config.metadata.etag : config.metadata.get_etag;
+	}
+
+	void SetGetHeaders(httplib::Response &response) const {
+		response.set_header("ETag", GetResponseETag());
+		if (config.metadata.version_on_get && !config.metadata.version_id.empty()) {
+			response.set_header("x-amz-version-id", config.metadata.version_id);
+		}
 	}
 
 	void SendSlowDown(const httplib::Request &request, httplib::Response &response) const {
@@ -232,16 +257,16 @@ struct MockS3Server::Impl {
 	}
 
 	void SendAuthFailure(const httplib::Request &request, httplib::Response &response) const {
-		response.status = config.stale_auth_status;
+		response.status = config.auth.stale_status;
 		response.set_content(StringUtil::Format("<Error><Code>%s</Code><Message>stale credentials</Message></Error>",
-		                                        config.stale_auth_error_code),
+		                                        config.auth.stale_error_code),
 		                     "application/xml");
 		Record(request, response.status);
 	}
 
 	void SendRegionRedirect(const httplib::Request &request, httplib::Response &response) const {
 		response.status = 301;
-		response.set_header("x-amz-bucket-region", config.required_region);
+		response.set_header("x-amz-bucket-region", config.auth.required_region);
 		response.set_content("<Error><Code>PermanentRedirect</Code></Error>", "application/xml");
 		Record(request, response.status);
 	}
@@ -254,7 +279,7 @@ struct MockS3Server::Impl {
 
 	void SendS3Error400(const httplib::Request &request, httplib::Response &response, bool request_timeout) const {
 		response.status = 400;
-		if (config.truncated_failure_body) {
+		if (config.failures.truncated_failure_body) {
 			response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>RequestTimeout",
 			                     "application/xml");
 		} else if (request_timeout) {
@@ -296,7 +321,7 @@ struct MockS3Server::Impl {
 
 	void SendListObjectsSuccess(const httplib::Request &request, httplib::Response &response) const {
 		response.status = 200;
-		auto unquoted_etag = StringUtil::Replace(config.etag, "\"", "");
+		auto unquoted_etag = StringUtil::Replace(config.metadata.etag, "\"", "");
 		response.set_content(StringUtil::Format("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
 		                                        "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
 		                                        "<Name>%s</Name>"
@@ -310,21 +335,21 @@ struct MockS3Server::Impl {
 		                                        "<Size>%llu</Size>"
 		                                        "</Contents>"
 		                                        "</ListBucketResult>",
-		                                        config.bucket, config.object_key, unquoted_etag,
-		                                        static_cast<unsigned long long>(config.object_data.size())),
+		                                        config.object.bucket, config.object.key, unquoted_etag,
+		                                        static_cast<unsigned long long>(config.object.data.size())),
 		                     "application/xml");
 		Record(request, response.status);
 	}
 
 	void RegisterRoutes() {
-		const string path = StringUtil::Format("/%s/%s", config.bucket, config.object_key);
-		const string bucket_path = StringUtil::Format("/%s", config.bucket);
+		const string path = StringUtil::Format("/%s/%s", config.object.bucket, config.object.key);
+		const string bucket_path = StringUtil::Format("/%s", config.object.bucket);
 		const string bucket_path_with_slash = bucket_path + "/";
 		server.set_post_routing_handler([this](const httplib::Request &, httplib::Response &response) {
 			if (!response.has_header("X-Mock-Successful-Short-Response")) {
 				return;
 			}
-			auto omitted_bytes = MinValue<idx_t>(config.truncated_range_bytes, response.body.size());
+			auto omitted_bytes = MinValue<idx_t>(config.range.truncated_bytes, response.body.size());
 			response.body.resize(response.body.size() - omitted_bytes);
 			auto content_length = response.headers.equal_range("Content-Length");
 			response.headers.erase(content_length.first, content_length.second);
@@ -352,7 +377,7 @@ struct MockS3Server::Impl {
 			}
 			if (remaining_head_failures.load() > 0) {
 				remaining_head_failures--;
-				SendS3Error400(request, response, config.failure_is_request_timeout);
+				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
 				return httplib::Server::HandlerResponse::Handled;
 			}
 			response.status = 200;
@@ -368,17 +393,22 @@ struct MockS3Server::Impl {
 			}
 			if (remaining_get_failures.load() > 0) {
 				remaining_get_failures--;
-				SendS3Error400(request, response, config.failure_is_request_timeout);
+				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
+				return;
+			}
+			if (config.metadata.enforce_if_match && GetHeader(request, "If-Match") != GetResponseETag()) {
+				response.status = 412;
+				Record(request, response.status);
 				return;
 			}
 
 			auto range = GetHeader(request, "Range");
 			if (range.empty()) {
 				response.status = 200;
-				response.set_header("ETag", config.etag);
-				if (config.block_full_get_until_released) {
+				SetGetHeaders(response);
+				if (config.full_get.block_until_released) {
 					response.set_content_provider(
-					    config.object_data.size(), "application/octet-stream",
+					    config.object.data.size(), "application/octet-stream",
 					    [this](size_t offset, size_t length, httplib::DataSink &sink) {
 						    if (offset == 0) {
 							    std::unique_lock<std::mutex> lock(full_get_lock);
@@ -389,23 +419,23 @@ struct MockS3Server::Impl {
 								    return false;
 							    }
 						    }
-						    return sink.write(config.object_data.data() + offset, length);
+						    return sink.write(config.object.data.data() + offset, length);
 					    });
 					Record(request, response.status);
 					return;
 				}
-				if (config.chunked_full_get) {
+				if (config.full_get.chunked) {
 					response.set_chunked_content_provider(
 					    "application/octet-stream", [this](size_t offset, httplib::DataSink &sink) {
-						    if (offset >= config.object_data.size()) {
+						    if (offset >= config.object.data.size()) {
 							    sink.done();
 							    return true;
 						    }
-						    const auto length = MinValue<size_t>(7, config.object_data.size() - offset);
-						    if (!sink.write(config.object_data.data() + offset, length)) {
+						    const auto length = MinValue<size_t>(7, config.object.data.size() - offset);
+						    if (!sink.write(config.object.data.data() + offset, length)) {
 							    return false;
 						    }
-						    if (offset + length == config.object_data.size()) {
+						    if (offset + length == config.object.data.size()) {
 							    sink.done();
 						    }
 						    return true;
@@ -413,21 +443,21 @@ struct MockS3Server::Impl {
 					Record(request, response.status);
 					return;
 				}
-				response.set_content(config.object_data, "application/octet-stream");
+				response.set_content(config.object.data, "application/octet-stream");
 				Record(request, response.status);
 				return;
 			}
-			if (config.range_behavior == MockS3RangeBehavior::IGNORE_RANGE) {
+			if (config.range.behavior == MockS3RangeBehavior::IGNORE_RANGE) {
 				response.status = 200;
-				response.set_header("ETag", config.etag);
-				response.set_content(config.object_data, "application/octet-stream");
+				SetGetHeaders(response);
+				response.set_content(config.object.data, "application/octet-stream");
 				Record(request, response.status);
 				return;
 			}
 
 			idx_t range_start;
 			idx_t range_end;
-			if (!ParseRange(range, config.object_data.size(), range_start, range_end)) {
+			if (!ParseRange(range, config.object.data.size(), range_start, range_end)) {
 				response.status = 416;
 				Record(request, response.status);
 				return;
@@ -441,11 +471,42 @@ struct MockS3Server::Impl {
 			range_request_started.notify_all();
 			response.status = 206;
 			response.set_header("Accept-Ranges", "bytes");
-			response.set_header("ETag", config.etag);
-			if (config.block_first_range_body_until_second_range && range_request_index == 1) {
+			SetGetHeaders(response);
+			if (!config.range.blocked.empty() && range == config.range.blocked) {
+				response.set_content_provider(config.object.data.size(), "application/octet-stream",
+				                              [this](size_t offset, size_t length, httplib::DataSink &sink) {
+					                              std::unique_lock<std::mutex> lock(range_release_lock);
+					                              if (!range_release.wait_for(lock, std::chrono::seconds(5), [this]() {
+						                                  return release_range_completed;
+					                                  })) {
+						                              return false;
+					                              }
+					                              return sink.write(config.object.data.data() + offset, length);
+				                              });
+				Record(request, response.status);
+				return;
+			}
+			if (!config.range.release.empty() && range == config.range.release) {
+				response.set_content_provider(config.object.data.size(), "application/octet-stream",
+				                              [this](size_t offset, size_t length, httplib::DataSink &sink) {
+					                              const auto success =
+					                                  sink.write(config.object.data.data() + offset, length);
+					                              if (success) {
+						                              {
+							                              std::lock_guard<std::mutex> lock(range_release_lock);
+							                              release_range_completed = true;
+						                              }
+						                              range_release.notify_all();
+					                              }
+					                              return success;
+				                              });
+				Record(request, response.status);
+				return;
+			}
+			if (config.range.block_first_body_until_second && range_request_index == 1) {
 				auto wait_for_second_request = make_shared_ptr<std::atomic<bool>>(true);
 				response.set_content_provider(
-				    config.object_data.size(), "application/octet-stream",
+				    config.object.data.size(), "application/octet-stream",
 				    [this, wait_for_second_request](size_t offset, size_t length, httplib::DataSink &sink) {
 					    if (wait_for_second_request->exchange(false)) {
 						    std::unique_lock<std::mutex> lock(range_request_lock);
@@ -454,34 +515,34 @@ struct MockS3Server::Impl {
 							    return false;
 						    }
 					    }
-					    return sink.write(config.object_data.data() + offset, length);
+					    return sink.write(config.object.data.data() + offset, length);
 				    });
 				Record(request, response.status);
 				return;
 			}
-			if (config.range_behavior == MockS3RangeBehavior::SHORT_SUCCESS &&
+			if (config.range.behavior == MockS3RangeBehavior::SHORT_SUCCESS &&
 			    ConsumeBehavior(remaining_range_behavior_requests)) {
 				response.set_header("X-Mock-Successful-Short-Response", "1");
-				response.set_content(config.object_data, "application/octet-stream");
+				response.set_content(config.object.data, "application/octet-stream");
 				Record(request, response.status);
 				return;
 			}
-			if (config.range_behavior == MockS3RangeBehavior::TRUNCATE_TRANSFER &&
+			if (config.range.behavior == MockS3RangeBehavior::TRUNCATE_TRANSFER &&
 			    ConsumeBehavior(remaining_range_behavior_requests)) {
-				response.set_content_provider(config.object_data.size(), "application/octet-stream",
+				response.set_content_provider(config.object.data.size(), "application/octet-stream",
 				                              [this](size_t offset, size_t length, httplib::DataSink &sink) {
 					                              auto omitted_bytes =
-					                                  MinValue<idx_t>(config.truncated_range_bytes, length);
+					                                  MinValue<idx_t>(config.range.truncated_bytes, length);
 					                              auto emitted_bytes = length - omitted_bytes;
 					                              if (emitted_bytes > 0) {
-						                              sink.write(config.object_data.data() + offset, emitted_bytes);
+						                              sink.write(config.object.data.data() + offset, emitted_bytes);
 					                              }
 					                              return false;
 				                              });
 				Record(request, response.status);
 				return;
 			}
-			response.set_content(config.object_data, "application/octet-stream");
+			response.set_content(config.object.data, "application/octet-stream");
 			Record(request, response.status);
 		});
 
@@ -499,12 +560,14 @@ struct MockS3Server::Impl {
 				SendAuthFailure(request, response);
 				return;
 			}
-			if (config.transient_503_lists > 0 && transient_503_lists_sent.fetch_add(1) < config.transient_503_lists) {
+			if (config.failures.transient_503_lists > 0 &&
+			    transient_503_lists_sent.fetch_add(1) < config.failures.transient_503_lists) {
 				SendSlowDown(request, response);
 				return;
 			}
-			if (config.transient_400_lists > 0 && transient_400_lists_sent.fetch_add(1) < config.transient_400_lists) {
-				SendS3Error400(request, response, config.failure_is_request_timeout);
+			if (config.failures.transient_400_lists > 0 &&
+			    transient_400_lists_sent.fetch_add(1) < config.failures.transient_400_lists) {
+				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
 				return;
 			}
 			SendListObjectsSuccess(request, response);
@@ -519,7 +582,7 @@ struct MockS3Server::Impl {
 			}
 			if (remaining_put_failures.load() > 0) {
 				remaining_put_failures--;
-				SendS3Error400(request, response, config.failure_is_request_timeout);
+				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
 				return;
 			}
 			SendPutSuccess(request, response);
@@ -532,12 +595,12 @@ struct MockS3Server::Impl {
 			}
 			if (request.target.find("uploads") != string::npos && remaining_post_failures.load() > 0) {
 				remaining_post_failures--;
-				SendS3Error400(request, response, config.failure_is_request_timeout);
+				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
 				return;
 			}
 			if (request.target.find("uploadId") != string::npos && remaining_complete_post_failures.load() > 0) {
 				remaining_complete_post_failures--;
-				SendS3Error400(request, response, config.failure_is_request_timeout);
+				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
 				return;
 			}
 			SendMultipartPostSuccess(request, response);
@@ -560,7 +623,7 @@ struct MockS3Server::Impl {
 			}
 			if (remaining_delete_failures.load() > 0) {
 				remaining_delete_failures--;
-				SendS3Error400(request, response, config.failure_is_request_timeout);
+				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
 				return;
 			}
 			response.status = 204;
@@ -582,11 +645,14 @@ struct MockS3Server::Impl {
 	mutable std::atomic<idx_t> remaining_delete_failures {0};
 	mutable std::atomic<idx_t> remaining_post_failures {0};
 	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
-	mutable std::mutex observation_lock;
-	mutable vector<MockS3RequestObservation> observations;
+	mutable annotated_mutex observation_lock;
+	mutable vector<MockS3RequestObservation> observations DUCKDB_GUARDED_BY(observation_lock);
 	std::mutex range_request_lock;
 	std::condition_variable range_request_started;
 	idx_t range_requests_seen = 0;
+	std::mutex range_release_lock;
+	std::condition_variable range_release;
+	bool release_range_completed = false;
 	std::mutex full_get_lock;
 	std::condition_variable full_get_started;
 	std::condition_variable full_get_release;
@@ -613,7 +679,7 @@ string MockS3Server::HTTPPath() const {
 }
 
 const string &MockS3Server::ObjectData() const {
-	return impl->config.object_data;
+	return impl->config.object.data;
 }
 
 vector<MockS3RequestObservation> MockS3Server::Observations() const {
@@ -672,9 +738,11 @@ string MockS3DescribeObservations(const vector<MockS3RequestObservation> &observ
 			result += "\n";
 		}
 		result += StringUtil::Format(
-		    "%s %s status=%d key=%s region=%s range=%s target=%s user_agent=%s session_header=%s", observation.method,
-		    observation.path, observation.status, observation.key_id, observation.region, observation.range,
-		    observation.target, observation.user_agent, observation.session_header);
+		    "%s %s status=%d key=%s region=%s range=%s if_match=%s version_id=%s target=%s user_agent=%s "
+		    "session_header=%s",
+		    observation.method, observation.path, observation.status, observation.key_id, observation.region,
+		    observation.range, observation.if_match, observation.version_id, observation.target, observation.user_agent,
+		    observation.session_header);
 	}
 	return result;
 }
