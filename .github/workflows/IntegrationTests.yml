@@ -93,6 +93,13 @@ jobs:
           source ./scripts/set_s3_test_server_variables.sh
           ./build/release/test/unittest "*" --test-config test/configs/httpfs_dynamic.json
 
+      - name: Run tests with extension autoloading
+        shell: bash
+        run: |
+          source ./scripts/run_s3_test_server.sh
+          source ./scripts/set_s3_test_server_variables.sh
+          ./build/release/test/unittest "*" --autoloading available --skip-compiled
+
       - name: Run tests with statically loaded extensions (curl)
         shell: bash
         run: |
