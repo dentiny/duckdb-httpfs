@@ -47,13 +47,13 @@ struct HTTPFSExtensionLoader {
 
 	static void Load(ExtensionLoader &loader) {
 		auto &instance = loader.GetDatabaseInstance();
-		RegisterFileSystems(instance);
-		instance.GetLogManager().RegisterLogType(make_uniq<HTTPFSInfoLogType>());
-
 		auto &config = DBConfig::GetConfig(instance);
 		RegisterSettings(config);
 		RegisterSecrets(loader);
 		ConfigureEncryption(config);
+
+		instance.GetLogManager().RegisterLogType(make_uniq<HTTPFSInfoLogType>());
+		RegisterFileSystems(instance);
 	}
 };
 

@@ -7,6 +7,12 @@ require json
 require httpfs
 
 statement ok
+LOAD json;
+
+statement ok
+LOAD httpfs;
+
+statement ok
 CALL enable_logging('HTTP');
 
 statement ok
