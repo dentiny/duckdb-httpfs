@@ -4,7 +4,7 @@
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/shared_ptr.hpp"
-#include "httpfs_client.hpp"
+#include "http/httpfs_client.hpp"
 
 namespace duckdb {
 

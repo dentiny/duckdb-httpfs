@@ -1,5 +1,5 @@
-#include "httpfs_client.hpp"
-#include "http_state.hpp"
+#include "http/httpfs_client.hpp"
+#include "http/http_state.hpp"
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.hpp"
 

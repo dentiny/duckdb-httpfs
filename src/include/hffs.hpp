@@ -1,6 +1,6 @@
 #pragma once
 
-#include "httpfs.hpp"
+#include "http/httpfs.hpp"
 
 namespace duckdb {
 

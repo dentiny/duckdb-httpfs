@@ -2,14 +2,14 @@
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/file_system.hpp"
-#include "http_state.hpp"
+#include "http/http_state.hpp"
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/exception/http_exception.hpp"
 #include "duckdb/main/client_data.hpp"
-#include "http_metadata_cache.hpp"
-#include "httpfs_client.hpp"
-#include "http_request_session.hpp"
+#include "http/http_metadata_cache.hpp"
+#include "http/httpfs_client.hpp"
+#include "http/http_request_session.hpp"
 
 #include <functional>
 

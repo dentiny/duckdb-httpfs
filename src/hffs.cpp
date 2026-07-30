@@ -3,7 +3,7 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/exception/http_exception.hpp"
 #include "duckdb/common/file_opener.hpp"
-#include "http_state.hpp"
+#include "http/http_state.hpp"
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
