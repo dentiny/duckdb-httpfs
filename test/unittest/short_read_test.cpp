@@ -138,10 +138,10 @@ static void RunPersistentShortRead() {
 	const string expected_range = "bytes=113-1136";
 
 	MockS3ServerConfig config;
-	config.object_data = string(8192, 'x');
-	config.range_behavior = MockS3RangeBehavior::TRUNCATE_TRANSFER;
-	config.range_behavior_requests = 4;
-	config.truncated_range_bytes = 17;
+	config.object.data = string(8192, 'x');
+	config.range.behavior = MockS3RangeBehavior::TRUNCATE_TRANSFER;
+	config.range.behavior_requests = 4;
+	config.range.truncated_bytes = 17;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -165,11 +165,11 @@ static void RunTransientShortRead() {
 	const string expected_range = "bytes=113-1136";
 
 	MockS3ServerConfig config;
-	config.object_data = string(8192, 'x');
-	config.range_behavior = MockS3RangeBehavior::TRUNCATE_TRANSFER;
-	config.range_behavior_requests = 1;
-	config.truncated_range_bytes = 17;
-	auto expected = config.object_data.substr(READ_OFFSET, READ_LENGTH);
+	config.object.data = string(8192, 'x');
+	config.range.behavior = MockS3RangeBehavior::TRUNCATE_TRANSFER;
+	config.range.behavior_requests = 1;
+	config.range.truncated_bytes = 17;
+	auto expected = config.object.data.substr(READ_OFFSET, READ_LENGTH);
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -191,10 +191,10 @@ static void RunSuccessfulShortResponse() {
 	const string expected_range = "bytes=113-1136";
 
 	MockS3ServerConfig config;
-	config.object_data = string(8192, 'x');
-	config.range_behavior = MockS3RangeBehavior::SHORT_SUCCESS;
-	config.range_behavior_requests = 1;
-	config.truncated_range_bytes = 17;
+	config.object.data = string(8192, 'x');
+	config.range.behavior = MockS3RangeBehavior::SHORT_SUCCESS;
+	config.range.behavior_requests = 1;
+	config.range.truncated_bytes = 17;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -215,9 +215,9 @@ static void RunSuccessfulShortResponse() {
 
 static void RunParallelRangeHeaderRelease(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.object_data = string(8192, 'x');
-	config.advertise_ranges = false;
-	config.block_first_range_body_until_second_range = true;
+	config.object.data = string(8192, 'x');
+	config.range.advertise = false;
+	config.range.block_first_body_until_second = true;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -261,8 +261,8 @@ static void RunParallelRangeHeaderRelease(const string &client_implementation) {
 
 static void RunCompletedErrorConnectionReuse(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.transient_head_failures = 1;
-	config.failure_is_request_timeout = false;
+	config.failures.transient_head_failures = 1;
+	config.failures.failure_is_request_timeout = false;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -287,7 +287,7 @@ static void RunCompletedErrorConnectionReuse(const string &client_implementation
 
 static void RunSharedConnectionNotFoundReuse() {
 	MockS3ServerConfig config;
-	config.head_not_found_requests = 2;
+	config.failures.head_not_found_requests = 2;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -313,14 +313,14 @@ static void RunFullDownloadSingleFlight(const string &client_implementation, boo
 	const vector<idx_t> offsets {0, 2048, 4096, 6144};
 
 	MockS3ServerConfig config;
-	config.object_data.resize(8192);
-	for (idx_t i = 0; i < config.object_data.size(); i++) {
-		config.object_data[i] = NumericCast<char>('a' + (i % 26));
+	config.object.data.resize(8192);
+	for (idx_t i = 0; i < config.object.data.size(); i++) {
+		config.object.data[i] = NumericCast<char>('a' + (i % 26));
 	}
-	const auto expected_data = config.object_data;
-	config.advertise_ranges = false;
-	config.range_behavior = MockS3RangeBehavior::IGNORE_RANGE;
-	config.block_full_get_until_released = true;
+	const auto expected_data = config.object.data;
+	config.range.advertise = false;
+	config.range.behavior = MockS3RangeBehavior::IGNORE_RANGE;
+	config.full_get.block_until_released = true;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -371,8 +371,8 @@ static void RunFullDownloadSingleFlight(const string &client_implementation, boo
 
 static void RunExactSequentialReadGeometry(const string &client_implementation, FileOpenFlags flags) {
 	MockS3ServerConfig config;
-	config.object_data = CreateObjectData(8192);
-	auto expected_data = config.object_data;
+	config.object.data = CreateObjectData(8192);
+	auto expected_data = config.object.data;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -412,11 +412,11 @@ static void RunSequentialFailureKeepsPosition(const string &client_implementatio
 	static constexpr idx_t READ_LENGTH = 1024;
 
 	MockS3ServerConfig config;
-	config.object_data = CreateObjectData(8192);
-	auto expected_data = config.object_data;
-	config.range_behavior = MockS3RangeBehavior::TRUNCATE_TRANSFER;
-	config.range_behavior_requests = 1;
-	config.truncated_range_bytes = 17;
+	config.object.data = CreateObjectData(8192);
+	auto expected_data = config.object.data;
+	config.range.behavior = MockS3RangeBehavior::TRUNCATE_TRANSFER;
+	config.range.behavior_requests = 1;
+	config.range.truncated_bytes = 17;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -455,10 +455,10 @@ static void RunSequentialFailureKeepsPosition(const string &client_implementatio
 
 static void RunSequentialFullDownloadFallback(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.object_data = CreateObjectData(8192);
-	auto expected_data = config.object_data;
-	config.advertise_ranges = false;
-	config.range_behavior = MockS3RangeBehavior::IGNORE_RANGE;
+	config.object.data = CreateObjectData(8192);
+	auto expected_data = config.object.data;
+	config.range.advertise = false;
+	config.range.behavior = MockS3RangeBehavior::IGNORE_RANGE;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -533,9 +533,9 @@ TEST_CASE("HTTP full-download fallback is single-flight", "[httpfs][full-downloa
 
 TEST_CASE("HTTP full-download fallback rejects HEAD and GET length mismatches", "[httpfs][full-download][issue-354]") {
 	MockS3ServerConfig config;
-	config.object_data = "AB";
-	config.head_content_length = 3;
-	config.range_behavior = MockS3RangeBehavior::IGNORE_RANGE;
+	config.object.data = "AB";
+	config.metadata.head_content_length = 3;
+	config.range.behavior = MockS3RangeBehavior::IGNORE_RANGE;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);

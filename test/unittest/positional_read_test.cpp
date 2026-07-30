@@ -106,18 +106,18 @@ static void RunConcurrentPositionalRead(const string &client_implementation, boo
 	static constexpr idx_t READ_SIZE = 64 * 1024;
 	static constexpr idx_t SECOND_OFFSET = READ_SIZE / 2;
 	MockS3ServerConfig config;
-	config.object_data.resize(READ_SIZE * 2);
-	for (idx_t i = 0; i < config.object_data.size(); i++) {
-		config.object_data[i] = NumericCast<char>('a' + (i % 26));
+	config.object.data.resize(READ_SIZE * 2);
+	for (idx_t i = 0; i < config.object.data.size(); i++) {
+		config.object.data[i] = NumericCast<char>('a' + (i % 26));
 	}
-	config.blocked_range = StringUtil::Format("bytes=0-%llu", static_cast<unsigned long long>(READ_SIZE - 1));
-	config.release_range = StringUtil::Format("bytes=%llu-%llu", static_cast<unsigned long long>(SECOND_OFFSET),
+	config.range.blocked = StringUtil::Format("bytes=0-%llu", static_cast<unsigned long long>(READ_SIZE - 1));
+	config.range.release = StringUtil::Format("bytes=%llu-%llu", static_cast<unsigned long long>(SECOND_OFFSET),
 	                                          static_cast<unsigned long long>(SECOND_OFFSET + READ_SIZE - 1));
-	config.version_id = "version-concurrent";
-	config.version_id_on_head = s3;
-	auto expected_data = config.object_data;
-	auto blocked_range = config.blocked_range;
-	auto release_range = config.release_range;
+	config.metadata.version_id = "version-concurrent";
+	config.metadata.version_on_head = s3;
+	auto expected_data = config.object.data;
+	auto blocked_range = config.range.blocked;
+	auto release_range = config.range.release;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -188,8 +188,8 @@ static void RunConcurrentPositionalRead(const string &client_implementation, boo
 
 static void RunSequentialPositionalSeparation(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.object_data = "abcdefghijklmnopqrstuvwxyz0123456789";
-	auto expected_data = config.object_data;
+	config.object.data = "abcdefghijklmnopqrstuvwxyz0123456789";
+	auto expected_data = config.object.data;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -209,7 +209,7 @@ static void RunSequentialPositionalSeparation(const string &client_implementatio
 
 static void RunETagConditionCase(const string &etag, const string &expected_if_match, bool disable_checks = false) {
 	MockS3ServerConfig config;
-	config.etag = etag;
+	config.metadata.etag = etag;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -234,8 +234,8 @@ static void RunETagConditionCase(const string &etag, const string &expected_if_m
 
 static void RunConfiguredReadHeaderCollision() {
 	MockS3ServerConfig config;
-	config.object_data = "abcdefghijklmnopqrstuvwxyz";
-	auto expected_data = config.object_data;
+	config.object.data = "abcdefghijklmnopqrstuvwxyz";
+	auto expected_data = config.object.data;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -272,7 +272,7 @@ CREATE SECRET positional_read_headers (
 
 static void RunConfiguredIfMatchCollision() {
 	MockS3ServerConfig config;
-	config.enforce_if_match = true;
+	config.metadata.enforce_if_match = true;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -304,9 +304,9 @@ CREATE SECRET positional_read_headers (
 
 static void RunPreconditionFailure(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.etag = "\"opened-etag\"";
-	config.get_etag = "\"changed-etag\"";
-	config.enforce_if_match = true;
+	config.metadata.etag = "\"opened-etag\"";
+	config.metadata.get_etag = "\"changed-etag\"";
+	config.metadata.enforce_if_match = true;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -334,8 +334,8 @@ static void RunPreconditionFailure(const string &client_implementation) {
 
 static void RunImmutableS3ReadCondition(const string &client_implementation, bool disable_etag_checks) {
 	MockS3ServerConfig config;
-	config.version_id = "version-from-get";
-	config.version_id_on_get = true;
+	config.metadata.version_id = "version-from-get";
+	config.metadata.version_on_get = true;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -369,7 +369,7 @@ static void RunImmutableS3ReadCondition(const string &client_implementation, boo
 
 static void RunConditionalFullDownload(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.range_behavior = MockS3RangeBehavior::IGNORE_RANGE;
+	config.range.behavior = MockS3RangeBehavior::IGNORE_RANGE;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -400,9 +400,9 @@ static void RunConditionalFullDownload(const string &client_implementation) {
 
 static void RunConditionSurvivesRetry(const string &client_implementation, bool s3) {
 	MockS3ServerConfig config;
-	config.transient_get_failures = 1;
-	config.version_id = "version-retry";
-	config.version_id_on_head = s3;
+	config.failures.transient_get_failures = 1;
+	config.metadata.version_id = "version-retry";
+	config.metadata.version_on_head = s3;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -441,8 +441,8 @@ static void RunConditionSurvivesRetry(const string &client_implementation, bool 
 
 static void RunS3ThresholdFullDownload(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.version_id = "version-threshold";
-	config.version_id_on_head = true;
+	config.metadata.version_id = "version-threshold";
+	config.metadata.version_on_head = true;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);

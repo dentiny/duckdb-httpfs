@@ -67,10 +67,10 @@ static idx_t CountListObservations(const vector<MockS3RequestObservation> &obser
 static void RunRecoveringListRetryTest(const string &client_implementation, int status) {
 	MockS3ServerConfig config;
 	if (status == 503) {
-		config.transient_503_lists = 1;
+		config.failures.transient_503_lists = 1;
 	} else {
 		D_ASSERT(status == 400);
-		config.transient_400_lists = 1;
+		config.failures.transient_400_lists = 1;
 	}
 	MockS3Server server(std::move(config));
 
@@ -94,10 +94,10 @@ static void RunRecoveringListRetryTest(const string &client_implementation, int 
 static void RunExhaustedListRetryTest(const string &client_implementation, int status) {
 	MockS3ServerConfig config;
 	if (status == 503) {
-		config.transient_503_lists = 1000;
+		config.failures.transient_503_lists = 1000;
 	} else {
 		D_ASSERT(status == 400);
-		config.transient_400_lists = 1000;
+		config.failures.transient_400_lists = 1000;
 	}
 	MockS3Server server(std::move(config));
 
@@ -120,8 +120,8 @@ static void RunExhaustedListRetryTest(const string &client_implementation, int s
 
 static void RunGeneric400ListTest(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.transient_400_lists = 1000;
-	config.failure_is_request_timeout = false;
+	config.failures.transient_400_lists = 1000;
+	config.failures.failure_is_request_timeout = false;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);

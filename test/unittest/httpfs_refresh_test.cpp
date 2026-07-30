@@ -293,13 +293,13 @@ static vector<MockS3RequestObservation>
 RunRefreshScenario(MockS3RefreshTarget refresh_target, const string &client_implementation, bool connection_caching,
                    OPERATION operation, int stale_auth_status = 403, string stale_auth_error_code = "AccessDenied") {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.stale_auth_status = stale_auth_status;
-	config.stale_auth_error_code = std::move(stale_auth_error_code);
-	config.refresh_target = refresh_target;
-	auto object_data = config.object_data;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.stale_status = stale_auth_status;
+	config.auth.stale_error_code = std::move(stale_auth_error_code);
+	config.auth.refresh_target = refresh_target;
+	auto object_data = config.object.data;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -435,17 +435,17 @@ static void RunBulkDeletePostRefreshScenario(const string &client_implementation
 
 static void RunBulkDeleteEndpointRefreshScenario(const string &client_implementation) {
 	MockS3ServerConfig stale_config;
-	stale_config.bucket = BUCKET;
-	stale_config.object_key = OBJECT_KEY;
-	stale_config.stale_key_id = STALE_KEY_ID;
-	stale_config.refresh_target = MockS3RefreshTarget::BULK_DELETE_POST;
+	stale_config.object.bucket = BUCKET;
+	stale_config.object.key = OBJECT_KEY;
+	stale_config.auth.stale_key_id = STALE_KEY_ID;
+	stale_config.auth.refresh_target = MockS3RefreshTarget::BULK_DELETE_POST;
 	MockS3Server stale_server(std::move(stale_config));
 
 	MockS3ServerConfig fresh_config;
-	fresh_config.bucket = BUCKET;
-	fresh_config.object_key = OBJECT_KEY;
-	fresh_config.stale_key_id = "NEVER_STALE";
-	fresh_config.refresh_target = MockS3RefreshTarget::BULK_DELETE_POST;
+	fresh_config.object.bucket = BUCKET;
+	fresh_config.object.key = OBJECT_KEY;
+	fresh_config.auth.stale_key_id = "NEVER_STALE";
+	fresh_config.auth.refresh_target = MockS3RefreshTarget::BULK_DELETE_POST;
 	MockS3Server fresh_server(std::move(fresh_config));
 
 	DuckDB db(nullptr);
@@ -521,12 +521,12 @@ static void RunTokenListRefreshScenario(const string &client_implementation, con
 
 static void RunNonAuth400NoRefreshScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.stale_auth_status = 400;
-	config.stale_auth_error_code = "InvalidRequest";
-	config.refresh_target = MockS3RefreshTarget::FULL_GET;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.stale_status = 400;
+	config.auth.stale_error_code = "InvalidRequest";
+	config.auth.refresh_target = MockS3RefreshTarget::FULL_GET;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -573,10 +573,10 @@ static void RunHandleRequestRefreshScenarios(const string &client_implementation
 
 static void RunRangeRefreshDisabledScenario() {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::RANGE_GET;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::RANGE_GET;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -602,10 +602,10 @@ static void RunRangeRefreshDisabledScenario() {
 
 static void RunFullGetErrorBodyScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::FULL_GET;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::FULL_GET;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -634,12 +634,12 @@ static void RunFullGetErrorBodyScenario(const string &client_implementation) {
 
 static void RunChunkedFullGetScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.chunked_full_get = true;
-	auto object_data = config.object_data;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.full_get.chunked = true;
+	auto object_data = config.object.data;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -663,10 +663,10 @@ static void RunChunkedFullGetScenario(const string &client_implementation) {
 
 static void RunListGlobRefreshDisabledScenario() {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::LIST_OBJECTS_GET;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::LIST_OBJECTS_GET;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -688,7 +688,7 @@ static void RunListGlobRefreshDisabledScenario() {
 
 static void RunS3HeaderScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.stale_key_id = "NEVER_STALE";
+	config.auth.stale_key_id = "NEVER_STALE";
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -731,8 +731,8 @@ CREATE SECRET s3_headers (
 
 static void RunS3RegionRedirectScenario(const string &client_implementation, bool list_request) {
 	MockS3ServerConfig config;
-	config.stale_key_id = "NEVER_STALE";
-	config.required_region = "us-east-1";
+	config.auth.stale_key_id = "NEVER_STALE";
+	config.auth.required_region = "us-east-1";
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -794,11 +794,11 @@ CREATE SECRET s3_region_redirect (
 
 static void RunMultipleStaleHandlesSingleRefreshScenario() {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::RANGE_GET;
-	auto object_data = config.object_data;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::RANGE_GET;
+	auto object_data = config.object.data;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -851,11 +851,11 @@ static void PublishTestS3Region(const shared_ptr<HTTPRequestSession> &session, c
 static void RunRefreshPublicationScenario(const string &client_implementation, bool invalidate_clients,
                                           bool publish_region) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::RANGE_GET;
-	auto object_data = config.object_data;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::RANGE_GET;
+	auto object_data = config.object.data;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -909,12 +909,12 @@ static void RunRefreshPublicationScenario(const string &client_implementation, b
 
 static void RunTransientPutRetryScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
 	// Use a refresh target that writes never exercise, so credential refresh never triggers here.
-	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.transient_put_failures = 2;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.failures.transient_put_failures = 2;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -952,12 +952,12 @@ static idx_t CountObservationsTarget(const vector<MockS3RequestObservation> &obs
 // request is expected, distinguishing "not retried" from "retried N times and still failed".
 static void RunGenericErrorNotRetriedScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.transient_put_failures = 1000;
-	config.failure_is_request_timeout = false;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.failures.transient_put_failures = 1000;
+	config.failures.failure_is_request_timeout = false;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -979,12 +979,12 @@ static void RunGenericErrorNotRetriedScenario(const string &client_implementatio
 // not classified as transient (no retry) and never escalated to a DB-invalidating InternalException.
 static void RunTruncatedErrorBodyScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.transient_put_failures = 1000;
-	config.truncated_failure_body = true;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.failures.transient_put_failures = 1000;
+	config.failures.truncated_failure_body = true;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -1016,11 +1016,11 @@ static void RunTruncatedErrorBodyScenario(const string &client_implementation) {
 // Even a retryable RequestTimeout must NOT replay a multipart-init POST (it would orphan an upload id).
 static void RunMultipartInitNotRetriedScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.transient_post_failures = 1000;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.failures.transient_post_failures = 1000;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -1041,11 +1041,11 @@ static void RunMultipartInitNotRetriedScenario(const string &client_implementati
 // A RequestTimeout retry must run on a fresh connection instead of the stalled one.
 static void RunFreshConnectionRetryScenario(const string &client_implementation, bool connection_caching) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.transient_put_failures = 1;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.failures.transient_put_failures = 1;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -1080,11 +1080,11 @@ static void RunFreshConnectionRetryScenario(const string &client_implementation,
 // A RequestTimeout that never clears exhausts exactly http_retries retries (one initial + http_retries).
 static void RunRetryBudgetScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.transient_put_failures = 1000;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.failures.transient_put_failures = 1000;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -1105,12 +1105,12 @@ static void RunRetryBudgetScenario(const string &client_implementation) {
 
 static void RunTransientGetRetryScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.transient_get_failures = 2;
-	auto object_data = config.object_data;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.failures.transient_get_failures = 2;
+	auto object_data = config.object.data;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -1137,12 +1137,12 @@ static void RunTransientGetRetryScenario(const string &client_implementation) {
 
 static void RunTransientDeleteRetryScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
 	// Use a refresh target that deletes never exercise, so credential refresh never triggers here.
-	config.refresh_target = MockS3RefreshTarget::PUT;
-	config.transient_delete_failures = 2;
+	config.auth.refresh_target = MockS3RefreshTarget::PUT;
+	config.failures.transient_delete_failures = 2;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -1166,11 +1166,11 @@ static void RunTransientDeleteRetryScenario(const string &client_implementation)
 // the HEAD is not retried and the open recovers through httpfs's range-GET fallback instead.
 static void RunHeadNotRetriedScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.transient_head_failures = 1000;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.failures.transient_head_failures = 1000;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
@@ -1200,11 +1200,11 @@ static void RunHeadNotRetriedScenario(const string &client_implementation) {
 // Like multipart-init, a multipart-complete POST must not be replayed even on RequestTimeout.
 static void RunMultipartCompleteNotRetriedScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
-	config.bucket = BUCKET;
-	config.object_key = OBJECT_KEY;
-	config.stale_key_id = STALE_KEY_ID;
-	config.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.transient_complete_post_failures = 1000;
+	config.object.bucket = BUCKET;
+	config.object.key = OBJECT_KEY;
+	config.auth.stale_key_id = STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.failures.transient_complete_post_failures = 1000;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
