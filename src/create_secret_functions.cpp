@@ -135,7 +135,7 @@ unique_ptr<BaseSecret> CreateS3SecretFunctions::CreateSecretFunctionInternal(Cli
 
 CreateSecretInput CreateS3SecretFunctions::GenerateRefreshSecretInfo(const SecretEntry &secret_entry,
                                                                      Value &refresh_info) {
-	const auto &kv_secret = dynamic_cast<const KeyValueSecret &>(*secret_entry.secret);
+	const auto &kv_secret = secret_entry.secret->Cast<KeyValueSecret>();
 
 	CreateSecretInput result;
 	result.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
@@ -180,7 +180,7 @@ static bool SecretCredentialMaterialChanged(const KeyValueSecret &old_secret, co
 
 //! Function that will automatically try to refresh a secret
 bool CreateS3SecretFunctions::TryRefreshS3Secret(ClientContext &context, const SecretEntry &secret_to_refresh) {
-	const auto &kv_secret = dynamic_cast<const KeyValueSecret &>(*secret_to_refresh.secret);
+	const auto &kv_secret = secret_to_refresh.secret->Cast<KeyValueSecret>();
 
 	Value refresh_info;
 	if (!kv_secret.TryGetValue("refresh_info", refresh_info)) {
@@ -192,7 +192,7 @@ bool CreateS3SecretFunctions::TryRefreshS3Secret(ClientContext &context, const S
 	// TODO: change SecretManager API to avoid requiring catching this exception
 	try {
 		auto res = secret_manager.CreateSecret(context, refresh_input);
-		auto &new_secret = dynamic_cast<const KeyValueSecret &>(*res->secret);
+		auto &new_secret = res->secret->Cast<KeyValueSecret>();
 		if (SecretCredentialMaterialChanged(kv_secret, new_secret)) {
 			DUCKDB_LOG_INFO(context, "Successfully refreshed secret: %s, new key_id: %s",
 			                secret_to_refresh.secret->GetName(), new_secret.TryGetValue("key_id").ToString());

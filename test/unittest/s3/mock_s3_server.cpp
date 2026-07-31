@@ -6,6 +6,7 @@
 
 #include "httplib.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
@@ -104,9 +105,95 @@ static string GetParameter(const httplib::Request &request, const string &parame
 	return request.get_param_value(parameter);
 }
 
+struct MockS3BodyDigest {
+	static string Compute(const string &body) {
+		uint64_t hash = 14695981039346656037ULL;
+		for (const auto byte : body) {
+			hash ^= static_cast<uint8_t>(byte);
+			hash *= 1099511628211ULL;
+		}
+		return StringUtil::Format("%016llx", static_cast<unsigned long long>(hash));
+	}
+};
+
+static optional_idx GetPartNumber(const httplib::Request &request) {
+	auto part_number = GetParameter(request, "partNumber");
+	if (part_number.empty()) {
+		return optional_idx();
+	}
+	try {
+		return optional_idx(NumericCast<idx_t>(std::stoull(part_number)));
+	} catch (...) {
+		return optional_idx();
+	}
+}
+
+struct MockS3ManifestPart {
+	idx_t part_number;
+	string etag;
+};
+
+struct MockS3CompletionManifest {
+	static bool TryParse(const string &body, vector<MockS3ManifestPart> &parts) {
+		idx_t position = 0;
+		if (!Consume(body, position, "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">")) {
+			return false;
+		}
+
+		while (!Consume(body, position, "</CompleteMultipartUpload>")) {
+			MockS3ManifestPart part;
+			string part_number;
+			if (!Consume(body, position, "<Part><ETag>") || !ReadUntil(body, position, "</ETag>", part.etag) ||
+			    !Consume(body, position, "<PartNumber>") || !ReadUntil(body, position, "</PartNumber>", part_number) ||
+			    !Consume(body, position, "</Part>") || !TryParsePartNumber(part_number, part.part_number)) {
+				return false;
+			}
+			parts.push_back(std::move(part));
+		}
+		return !parts.empty() && position == body.size();
+	}
+
+private:
+	static bool Consume(const string &body, idx_t &position, const string &value) {
+		if (body.compare(position, value.size(), value) != 0) {
+			return false;
+		}
+		position += value.size();
+		return true;
+	}
+
+	static bool ReadUntil(const string &body, idx_t &position, const string &delimiter, string &result) {
+		auto delimiter_position = body.find(delimiter, position);
+		if (delimiter_position == string::npos) {
+			return false;
+		}
+		result = body.substr(position, delimiter_position - position);
+		position = delimiter_position + delimiter.size();
+		return true;
+	}
+
+	static bool TryParsePartNumber(const string &value, idx_t &result) {
+		if (value.empty()) {
+			return false;
+		}
+		try {
+			size_t parsed_length;
+			result = NumericCast<idx_t>(std::stoull(value, &parsed_length));
+			return parsed_length == value.size() && result > 0;
+		} catch (...) {
+			return false;
+		}
+	}
+};
+
 } // namespace
 
 struct MockS3Server::Impl {
+	struct UploadedPart {
+		string etag;
+		string body;
+	};
+
 	explicit Impl(MockS3ServerConfig config_p) : config(std::move(config_p)) {
 		remaining_put_failures = config.failures.transient_put_failures;
 		remaining_get_failures = config.failures.transient_get_failures;
@@ -129,6 +216,7 @@ struct MockS3Server::Impl {
 	}
 
 	~Impl() {
+		ReleasePartUploads();
 		server.stop();
 		if (server_thread.joinable()) {
 			server_thread.join();
@@ -150,6 +238,37 @@ struct MockS3Server::Impl {
 	vector<MockS3RequestObservation> Observations() const DUCKDB_EXCLUDES(observation_lock) {
 		annotated_lock_guard<annotated_mutex> lock(observation_lock);
 		return observations;
+	}
+
+	string UploadedObject() const DUCKDB_EXCLUDES(upload_lock) {
+		annotated_lock_guard<annotated_mutex> lock(upload_lock);
+		return uploaded_object;
+	}
+
+	string CompletionBody() const DUCKDB_EXCLUDES(upload_lock) {
+		annotated_lock_guard<annotated_mutex> lock(upload_lock);
+		return completion_body;
+	}
+
+	idx_t MaximumConcurrentPartUploads() const DUCKDB_EXCLUDES(upload_lock) {
+		annotated_lock_guard<annotated_mutex> lock(upload_lock);
+		return maximum_active_part_uploads;
+	}
+
+	bool WaitForPartUpload(idx_t part_number) DUCKDB_EXCLUDES(upload_lock) {
+		annotated_unique_lock<annotated_mutex> lock(upload_lock);
+		return part_upload_started.wait_for(lock, std::chrono::seconds(5),
+		                                    [this, part_number]() DUCKDB_REQUIRES(upload_lock) {
+			                                    return parts_seen.find(part_number) != parts_seen.end();
+		                                    });
+	}
+
+	void ReleasePartUploads() DUCKDB_EXCLUDES(upload_lock) {
+		{
+			annotated_lock_guard<annotated_mutex> lock(upload_lock);
+			part_uploads_released = true;
+		}
+		part_upload_release.notify_all();
 	}
 
 	bool WaitForFullGet() DUCKDB_EXCLUDES(full_get_lock) {
@@ -214,6 +333,10 @@ struct MockS3Server::Impl {
 		observation.region = ExtractCredentialRegion(GetHeader(request, "Authorization"));
 		observation.user_agent = GetHeader(request, "User-Agent");
 		observation.session_header = GetHeader(request, "X-HTTPFS-Session");
+		observation.upload_id = GetParameter(request, "uploadId");
+		observation.part_number = GetPartNumber(request);
+		observation.body_size = request.body.size();
+		observation.body_digest = MockS3BodyDigest::Compute(request.body);
 		observation.user_agent_count = CountHeader(request, "User-Agent");
 		observation.session_header_count = CountHeader(request, "X-HTTPFS-Session");
 		observation.status = status;
@@ -272,9 +395,20 @@ struct MockS3Server::Impl {
 		Record(request, response.status);
 	}
 
-	void SendPutSuccess(const httplib::Request &request, httplib::Response &response) const {
+	void SendPutSuccess(const httplib::Request &request, httplib::Response &response) {
 		response.status = 200;
-		response.set_header("ETag", "\"httpfs-refresh-test-upload-etag\"");
+		auto part_number = GetPartNumber(request);
+		if (part_number.IsValid()) {
+			auto part = part_number.GetIndex();
+			auto etag = StringUtil::Format("\"mock-part-%llu\"", part);
+			response.set_header("ETag", etag);
+			annotated_lock_guard<annotated_mutex> lock(upload_lock);
+			uploaded_parts[part] = {std::move(etag), request.body};
+		} else {
+			response.set_header("ETag", "\"httpfs-refresh-test-upload-etag\"");
+			annotated_lock_guard<annotated_mutex> lock(upload_lock);
+			uploaded_object = request.body;
+		}
 		Record(request, response.status);
 	}
 
@@ -296,14 +430,58 @@ struct MockS3Server::Impl {
 		Record(request, response.status);
 	}
 
-	void SendMultipartPostSuccess(const httplib::Request &request, httplib::Response &response) const {
-		response.status = 200;
+	bool TryCompleteMultipartUpload(const httplib::Request &request) DUCKDB_EXCLUDES(upload_lock) {
+		vector<MockS3ManifestPart> manifest;
+		auto valid_manifest = MockS3CompletionManifest::TryParse(request.body, manifest);
+		auto upload_id = GetParameter(request, "uploadId");
+
+		annotated_lock_guard<annotated_mutex> lock(upload_lock);
+		completion_body = request.body;
+		if (!valid_manifest || upload_id != config.upload.upload_id || manifest.size() != uploaded_parts.size()) {
+			return false;
+		}
+
+		idx_t completed_size = 0;
+		for (const auto &uploaded_part : uploaded_parts) {
+			if (uploaded_part.second.body.size() > NumericLimits<idx_t>::Maximum() - completed_size) {
+				return false;
+			}
+			completed_size += uploaded_part.second.body.size();
+		}
+		string completed_object;
+		completed_object.reserve(completed_size);
+		idx_t previous_part_number = 0;
+		for (const auto &manifest_part : manifest) {
+			auto uploaded_part = uploaded_parts.find(manifest_part.part_number);
+			if (manifest_part.part_number <= previous_part_number || uploaded_part == uploaded_parts.end() ||
+			    manifest_part.etag != uploaded_part->second.etag) {
+				return false;
+			}
+			completed_object += uploaded_part->second.body;
+			previous_part_number = manifest_part.part_number;
+		}
+		uploaded_object = std::move(completed_object);
+		return true;
+	}
+
+	void SendMultipartPost(const httplib::Request &request, httplib::Response &response) {
 		if (request.target.find("uploads") != string::npos) {
-			response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-			                     "<InitiateMultipartUploadResult><UploadId>refresh-test-upload-id</UploadId></"
-			                     "InitiateMultipartUploadResult>",
+			response.status = 200;
+			response.set_content(StringUtil::Format("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+			                                        "<InitiateMultipartUploadResult><UploadId>%s</UploadId></"
+			                                        "InitiateMultipartUploadResult>",
+			                                        config.upload.upload_id),
 			                     "application/xml");
 		} else {
+			if (!TryCompleteMultipartUpload(request)) {
+				response.status = 400;
+				response.set_content("<Error><Code>InvalidPart</Code><Message>Invalid multipart completion "
+				                     "manifest.</Message></Error>",
+				                     "application/xml");
+				Record(request, response.status);
+				return;
+			}
+			response.status = 200;
 			response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
 			                     "<CompleteMultipartUploadResult><ETag>\"httpfs-refresh-test-final-etag\"</ETag></"
 			                     "CompleteMultipartUploadResult>",
@@ -311,6 +489,44 @@ struct MockS3Server::Impl {
 		}
 		Record(request, response.status);
 	}
+
+	void BeginPartUpload(idx_t part_number) DUCKDB_EXCLUDES(upload_lock) {
+		{
+			annotated_lock_guard<annotated_mutex> lock(upload_lock);
+			active_part_uploads++;
+			maximum_active_part_uploads = MaxValue(maximum_active_part_uploads, active_part_uploads);
+			parts_seen.insert(part_number);
+		}
+		part_upload_started.notify_all();
+	}
+
+	void WaitForPartRelease(idx_t part_number) DUCKDB_EXCLUDES(upload_lock) {
+		if (std::find(config.upload.blocked_part_numbers.begin(), config.upload.blocked_part_numbers.end(),
+		              part_number) == config.upload.blocked_part_numbers.end()) {
+			return;
+		}
+		annotated_unique_lock<annotated_mutex> lock(upload_lock);
+		part_upload_release.wait_for(lock, std::chrono::seconds(30),
+		                             [this]() DUCKDB_REQUIRES(upload_lock) { return part_uploads_released; });
+	}
+
+	void FinishPartUpload() DUCKDB_EXCLUDES(upload_lock) {
+		annotated_lock_guard<annotated_mutex> lock(upload_lock);
+		D_ASSERT(active_part_uploads > 0);
+		active_part_uploads--;
+	}
+
+	struct ActivePartUpload {
+		ActivePartUpload(Impl &server_p, idx_t part_number) : server(server_p) {
+			server.get().BeginPartUpload(part_number);
+		}
+
+		~ActivePartUpload() {
+			server.get().FinishPartUpload();
+		}
+
+		reference<Impl> server;
+	};
 
 	void SendBulkDeleteSuccess(const httplib::Request &request, httplib::Response &response) const {
 		response.status = 200;
@@ -582,6 +798,12 @@ struct MockS3Server::Impl {
 		server.Get(bucket_path_with_slash, list_objects);
 
 		server.Put(path, [this](const httplib::Request &request, httplib::Response &response) {
+			auto part_number = GetPartNumber(request);
+			unique_ptr<ActivePartUpload> active_upload;
+			if (part_number.IsValid()) {
+				active_upload = make_uniq<ActivePartUpload>(*this, part_number.GetIndex());
+				WaitForPartRelease(part_number.GetIndex());
+			}
 			if (ShouldRejectStaleCredentials(request)) {
 				SendAuthFailure(request, response);
 				return;
@@ -609,7 +831,7 @@ struct MockS3Server::Impl {
 				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
 				return;
 			}
-			SendMultipartPostSuccess(request, response);
+			SendMultipartPost(request, response);
 		});
 
 		auto bulk_delete = [this](const httplib::Request &request, httplib::Response &response) {
@@ -653,6 +875,16 @@ struct MockS3Server::Impl {
 	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
 	mutable annotated_mutex observation_lock;
 	mutable vector<MockS3RequestObservation> observations DUCKDB_GUARDED_BY(observation_lock);
+	mutable annotated_mutex upload_lock;
+	map<idx_t, UploadedPart> uploaded_parts DUCKDB_GUARDED_BY(upload_lock);
+	set<idx_t> parts_seen DUCKDB_GUARDED_BY(upload_lock);
+	string uploaded_object DUCKDB_GUARDED_BY(upload_lock);
+	string completion_body DUCKDB_GUARDED_BY(upload_lock);
+	idx_t active_part_uploads DUCKDB_GUARDED_BY(upload_lock) = 0;
+	idx_t maximum_active_part_uploads DUCKDB_GUARDED_BY(upload_lock) = 0;
+	bool part_uploads_released DUCKDB_GUARDED_BY(upload_lock) = false;
+	std::condition_variable part_upload_started;
+	std::condition_variable part_upload_release;
 	annotated_mutex range_request_lock;
 	std::condition_variable range_request_started;
 	idx_t range_requests_seen DUCKDB_GUARDED_BY(range_request_lock) = 0;
@@ -688,8 +920,28 @@ const string &MockS3Server::ObjectData() const {
 	return impl->config.object.data;
 }
 
+string MockS3Server::UploadedObject() const {
+	return impl->UploadedObject();
+}
+
+string MockS3Server::CompletionBody() const {
+	return impl->CompletionBody();
+}
+
 vector<MockS3RequestObservation> MockS3Server::Observations() const {
 	return impl->Observations();
+}
+
+idx_t MockS3Server::MaximumConcurrentPartUploads() const {
+	return impl->MaximumConcurrentPartUploads();
+}
+
+bool MockS3Server::WaitForPartUpload(idx_t part_number) {
+	return impl->WaitForPartUpload(part_number);
+}
+
+void MockS3Server::ReleasePartUploads() {
+	impl->ReleasePartUploads();
 }
 
 bool MockS3Server::WaitForFullGet() {
@@ -744,11 +996,12 @@ string MockS3DescribeObservations(const vector<MockS3RequestObservation> &observ
 			result += "\n";
 		}
 		result += StringUtil::Format(
-		    "%s %s status=%d key=%s region=%s range=%s if_match=%s version_id=%s target=%s user_agent=%s "
-		    "session_header=%s",
+		    "%s %s status=%d key=%s region=%s range=%s if_match=%s version_id=%s target=%s upload_id=%s "
+		    "part_number=%s body_size=%llu body_digest=%s user_agent=%s session_header=%s",
 		    observation.method, observation.path, observation.status, observation.key_id, observation.region,
-		    observation.range, observation.if_match, observation.version_id, observation.target, observation.user_agent,
-		    observation.session_header);
+		    observation.range, observation.if_match, observation.version_id, observation.target, observation.upload_id,
+		    observation.part_number.IsValid() ? std::to_string(observation.part_number.GetIndex()) : string(),
+		    observation.body_size, observation.body_digest, observation.user_agent, observation.session_header);
 	}
 	return result;
 }

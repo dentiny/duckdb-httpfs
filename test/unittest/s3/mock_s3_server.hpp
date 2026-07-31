@@ -94,6 +94,13 @@ struct MockS3FullGetConfig {
 	bool block_until_released = false;
 };
 
+struct MockS3UploadConfig {
+	//! Multipart upload ID returned by the mock server
+	string upload_id = "refresh-test-upload-id";
+	//! Hold these one-based part numbers until ReleasePartUploads is called
+	vector<idx_t> blocked_part_numbers;
+};
+
 struct MockS3ServerConfig {
 	MockS3ObjectConfig object;
 	MockS3AuthConfig auth;
@@ -101,6 +108,7 @@ struct MockS3ServerConfig {
 	MockS3FailureConfig failures;
 	MockS3RangeConfig range;
 	MockS3FullGetConfig full_get;
+	MockS3UploadConfig upload;
 };
 
 struct MockS3RequestObservation {
@@ -114,6 +122,10 @@ struct MockS3RequestObservation {
 	string region;
 	string user_agent;
 	string session_header;
+	string upload_id;
+	string body_digest;
+	optional_idx part_number;
+	idx_t body_size = 0;
 	idx_t user_agent_count = 0;
 	idx_t session_header_count = 0;
 	int status = 0;
@@ -133,7 +145,12 @@ public:
 	string HTTPPath() const;
 	string S3Path() const;
 	const string &ObjectData() const;
+	string UploadedObject() const;
+	string CompletionBody() const;
 	vector<MockS3RequestObservation> Observations() const;
+	idx_t MaximumConcurrentPartUploads() const;
+	bool WaitForPartUpload(idx_t part_number);
+	void ReleasePartUploads();
 	bool WaitForFullGet();
 	void ReleaseFullGet();
 
