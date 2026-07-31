@@ -7,4 +7,5 @@ target_sources(
           s3_settings.cpp
           s3_upload_session.cpp
           s3_url.cpp
+          s3_xml_response.cpp
           s3fs.cpp)

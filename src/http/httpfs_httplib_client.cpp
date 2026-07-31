@@ -213,8 +213,7 @@ public:
 		// First assign body, this is the body that will be uploaded
 		req.body.assign(const_char_ptr_cast(info.buffer_in), info.buffer_in_len);
 		auto transformed_req = TransformResult(client->send(req));
-		// Then, after actual re-quest, re-assign body to the response value of the POST request
-		transformed_req->body.assign(const_char_ptr_cast(info.buffer_in), info.buffer_in_len);
+		transformed_req->body = info.buffer_out;
 		return transformed_req;
 	}
 

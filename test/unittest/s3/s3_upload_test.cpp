@@ -446,7 +446,7 @@ struct S3UploadTest {
 		MockS3ServerConfig config;
 		config.object.bucket = S3TestHelper::BUCKET;
 		config.object.key = S3TestHelper::OBJECT_KEY;
-		config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+		config.auth.refresh_target = MockS3RefreshTarget::HEAD;
 		config.failures.transient_complete_post_failures = 1000;
 		MockS3Server server(std::move(config));
 
@@ -469,14 +469,15 @@ struct S3UploadTest {
 		REQUIRE(Count(observations, "POST", "uploads") == 1);
 		REQUIRE(Count(observations, "POST", "uploadId") == 1);
 		REQUIRE(Count(observations, "PUT", "partNumber") == 1);
-		REQUIRE(Count(observations, "DELETE") == 0);
+		REQUIRE(Count(observations, "DELETE") == 1);
+		REQUIRE(Count(observations, "DELETE", "uploadId") == 1);
 	}
 
 	static void RunStablePartFailure(const string &client_implementation) {
 		MockS3ServerConfig config;
 		config.object.bucket = S3TestHelper::BUCKET;
 		config.object.key = S3TestHelper::OBJECT_KEY;
-		config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+		config.auth.refresh_target = MockS3RefreshTarget::HEAD;
 		config.failures.transient_put_failures = 1000;
 		config.failures.failure_is_request_timeout = false;
 		MockS3Server server(std::move(config));
@@ -500,7 +501,8 @@ struct S3UploadTest {
 		REQUIRE(Count(observations, "POST", "uploads") == 1);
 		REQUIRE(Count(observations, "POST", "uploadId") == 0);
 		REQUIRE(Count(observations, "PUT", "partNumber") == 1);
-		REQUIRE(Count(observations, "DELETE") == 0);
+		REQUIRE(Count(observations, "DELETE") == 1);
+		REQUIRE(Count(observations, "DELETE", "uploadId") == 1);
 	}
 
 	static void RunOutOfOrderFailure(const string &client_implementation) {

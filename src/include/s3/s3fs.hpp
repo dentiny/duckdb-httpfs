@@ -22,6 +22,8 @@ namespace duckdb {
 class S3FileSystem;
 class S3UploadSession;
 
+enum class S3PostRequestMode : uint8_t { REPLAYABLE, NON_REPLAYABLE };
+
 class S3FileHandle : public HTTPFileHandle {
 	friend class S3FileSystem;
 
@@ -79,9 +81,11 @@ public:
 	                                         const HTTPReadConfig &read_config, idx_t file_offset,
 	                                         data_ptr_t buffer_out, idx_t buffer_out_len) override;
 	unique_ptr<HTTPResponse> PostRequest(HTTPRequestSession &session, string s3_url, string &buffer_out,
-	                                     const_data_ptr_t buffer_in, idx_t buffer_in_len, string http_params = "");
+	                                     const_data_ptr_t buffer_in, idx_t buffer_in_len, string http_params = "",
+	                                     S3PostRequestMode mode = S3PostRequestMode::REPLAYABLE);
 	unique_ptr<HTTPResponse> PutRequest(HTTPRequestSession &session, string s3_url, const_data_ptr_t buffer_in,
 	                                    idx_t buffer_in_len, string http_params = "");
+	unique_ptr<HTTPResponse> DeleteRequest(HTTPRequestSession &session, string s3_url, string http_params);
 	unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) override;
 	HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) override;
 

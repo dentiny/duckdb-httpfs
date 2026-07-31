@@ -2,15 +2,39 @@
 
 #include "s3/s3_request.hpp"
 #include "s3/s3_url.hpp"
+#include "s3/s3_xml_response.hpp"
 #include "s3/s3fs.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/limits.hpp"
+#include "duckdb/common/string_util.hpp"
 
 #include <cstring>
 #include <sstream>
 
 namespace duckdb {
+
+namespace {
+
+class S3AmbiguousUploadException : public IOException {
+public:
+	explicit S3AmbiguousUploadException(const string &message) : IOException(message) {
+	}
+};
+
+struct S3UploadErrorUtil {
+	static string RedactPath(const string &path) {
+		auto query_position = path.find('?');
+		return query_position == string::npos ? path : path.substr(0, query_position);
+	}
+};
+
+static bool IsSuccessfulStatus(HTTPStatusCode status) {
+	auto status_code = static_cast<int>(status);
+	return status_code >= 200 && status_code < 300;
+}
+
+} // namespace
 
 S3UploadSession::WriteClaim::WriteClaim(S3UploadSession &session_p) : session(session_p) {
 }
@@ -34,60 +58,68 @@ void S3UploadSession::WriteClaim::Finish() {
 
 S3UploadSession::S3UploadSession(S3FileSystem &s3fs_p, shared_ptr<HTTPRequestSession> request_session_p, string path_p,
                                  S3UploadConfig config_p)
-    : s3fs(s3fs_p), request_session(std::move(request_session_p)), path(std::move(path_p)), config(config_p) {
+    : s3fs(s3fs_p), request_session(std::move(request_session_p)), path(std::move(path_p)),
+      display_path(S3UploadErrorUtil::RedactPath(path)), config(config_p) {
 }
 
+S3UploadSession::~S3UploadSession() noexcept = default;
+
 S3UploadSession::FailureSnapshot S3UploadSession::CaptureFailure() const DUCKDB_REQUIRES(state_lock) {
-	D_ASSERT(state == State::FAILED);
+	D_ASSERT(state == State::FAILED || state == State::AMBIGUOUS);
+	D_ASSERT(primary_failure.primary_error);
 	return primary_failure;
 }
 
 void S3UploadSession::ThrowFailure(const FailureSnapshot &failure) {
-	switch (failure.type) {
-	case FailureType::ERROR_DATA:
-		D_ASSERT(failure.error);
-		failure.error->Throw();
-	case FailureType::NON_SEQUENTIAL_WRITE:
-		throw IOException("S3 writes must be sequential: expected offset %llu, got %llu", failure.expected_offset,
-		                  failure.actual_offset);
-	case FailureType::SIZE_OVERFLOW:
-		throw IOException("S3 upload size exceeds the supported range");
-	case FailureType::NONE:
-		break;
+	D_ASSERT(failure.primary_error);
+	if (!failure.abort_error) {
+		failure.primary_error->Throw();
 	}
-	throw InternalException("S3 upload entered a failed state without an error");
+	throw Exception(failure.primary_error->ExtraInfo(), failure.primary_error->Type(),
+	                failure.primary_error->RawMessage() + "\n\nAdditionally, " + failure.abort_error->RawMessage());
 }
 
 unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginWrite(idx_t location, idx_t size)
     DUCKDB_EXCLUDES(state_lock) {
+	enum class LocalFailure : uint8_t { NONE, NON_SEQUENTIAL_WRITE, SIZE_OVERFLOW };
+
 	const char *error_message = nullptr;
 	FailureSnapshot failure;
+	LocalFailure local_failure = LocalFailure::NONE;
+	idx_t expected_offset = 0;
 	unique_ptr<BufferedPart> result;
 	{
 		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		if (state == State::FAILED) {
+		if (operation != Operation::NONE) {
+			error_message = "Concurrent S3 upload operations are not supported";
+		} else if (state == State::FAILED || state == State::AMBIGUOUS) {
 			failure = CaptureFailure();
 		} else if (state == State::FINALIZED) {
 			error_message = "Cannot write to a finalized S3 upload";
-		} else if (operation != Operation::NONE) {
-			error_message = "Concurrent S3 upload operations are not supported";
 		} else if (location != next_offset) {
-			primary_failure.type = FailureType::NON_SEQUENTIAL_WRITE;
-			primary_failure.expected_offset = next_offset;
-			primary_failure.actual_offset = location;
-			state = State::FAILED;
-			failure = CaptureFailure();
+			operation = Operation::WRITE;
+			local_failure = LocalFailure::NON_SEQUENTIAL_WRITE;
+			expected_offset = next_offset;
 		} else if (size > NumericLimits<idx_t>::Maximum() - next_offset) {
-			primary_failure.type = FailureType::SIZE_OVERFLOW;
-			state = State::FAILED;
-			failure = CaptureFailure();
+			operation = Operation::WRITE;
+			local_failure = LocalFailure::SIZE_OVERFLOW;
 		} else {
 			operation = Operation::WRITE;
 			result = std::move(buffered_part);
 		}
 	}
-	if (failure.type != FailureType::NONE) {
+	if (failure.primary_error) {
 		ThrowFailure(failure);
+	}
+	if (local_failure == LocalFailure::NON_SEQUENTIAL_WRITE) {
+		FailOperation(ErrorData(ExceptionType::IO,
+		                        StringUtil::Format("S3 writes must be sequential: expected offset %llu, got %llu",
+		                                           expected_offset, location)),
+		              FailureDisposition::DEFINITIVE);
+	}
+	if (local_failure == LocalFailure::SIZE_OVERFLOW) {
+		FailOperation(ErrorData(ExceptionType::IO, "S3 upload size exceeds the supported range"),
+		              FailureDisposition::DEFINITIVE);
 	}
 	if (error_message) {
 		throw IOException(error_message);
@@ -103,18 +135,18 @@ unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginFinalize(bool &a
 	already_finalized = false;
 	{
 		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		if (state == State::FAILED) {
+		if (operation != Operation::NONE) {
+			error_message = "Concurrent S3 upload operations are not supported";
+		} else if (state == State::FAILED || state == State::AMBIGUOUS) {
 			failure = CaptureFailure();
 		} else if (state == State::FINALIZED) {
 			already_finalized = true;
-		} else if (operation != Operation::NONE) {
-			error_message = "Concurrent S3 upload operations are not supported";
 		} else {
 			operation = Operation::FINALIZE;
 			result = std::move(buffered_part);
 		}
 	}
-	if (failure.type != FailureType::NONE) {
+	if (failure.primary_error) {
 		ThrowFailure(failure);
 	}
 	if (error_message) {
@@ -146,21 +178,54 @@ void S3UploadSession::FinishFinalize() DUCKDB_EXCLUDES(state_lock) {
 	operation = Operation::NONE;
 }
 
-void S3UploadSession::FailOperation(ErrorData error) DUCKDB_EXCLUDES(state_lock) {
+void S3UploadSession::FailOperation(ErrorData error, FailureDisposition disposition) DUCKDB_EXCLUDES(state_lock) {
 	auto stored_error = make_shared_ptr<const ErrorData>(std::move(error));
+	shared_ptr<const string> upload_id;
 	FailureSnapshot failure;
 	{
 		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		if (state != State::FAILED) {
-			D_ASSERT(primary_failure.type == FailureType::NONE);
-			primary_failure.type = FailureType::ERROR_DATA;
-			primary_failure.error = std::move(stored_error);
-			state = State::FAILED;
+		if (state != State::FAILED && state != State::AMBIGUOUS) {
+			D_ASSERT(!primary_failure.primary_error);
+			primary_failure.primary_error = std::move(stored_error);
+			state = disposition == FailureDisposition::DEFINITIVE ? State::FAILED : State::AMBIGUOUS;
+			if (state == State::FAILED) {
+				upload_id = multipart_upload_id;
+			}
+		}
+	}
+
+	shared_ptr<const ErrorData> abort_error;
+	if (upload_id) {
+		abort_error = AbortMultipartUpload(*upload_id);
+	}
+	{
+		annotated_lock_guard<annotated_mutex> guard(state_lock);
+		if (abort_error && !primary_failure.abort_error) {
+			primary_failure.abort_error = std::move(abort_error);
 		}
 		operation = Operation::NONE;
 		failure = CaptureFailure();
 	}
 	ThrowFailure(failure);
+}
+
+shared_ptr<const ErrorData> S3UploadSession::AbortMultipartUpload(const string &upload_id) {
+	auto query_param = "uploadId=" + S3Url::Encode(upload_id, true);
+	try {
+		auto response = s3fs.get().DeleteRequest(*request_session, path, std::move(query_param));
+		if (response->status == HTTPStatusCode::NoContent_204) {
+			return nullptr;
+		}
+		auto message =
+		    StringUtil::Format("Failed to abort S3 multipart upload for \"%s\": HTTP %d%s", display_path,
+		                       static_cast<int>(response->status), S3RequestUtil::ParseError(response->body));
+		return make_shared_ptr<const ErrorData>(ExceptionType::HTTP, std::move(message));
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		auto message = StringUtil::Format(
+		    "Failed to abort S3 multipart upload for \"%s\": the cleanup request could not be completed", display_path);
+		return make_shared_ptr<const ErrorData>(error.Type(), std::move(message));
+	}
 }
 
 unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::AllocateBufferedPart() {
@@ -199,27 +264,36 @@ void S3UploadSession::WriteUnbufferedSpan(unique_ptr<BufferedPart> &buffered_par
 	}
 }
 
-bool S3UploadSession::UsesKMSKey() const {
-	auto captured = request_session->Capture();
-	auto &snapshot = captured.snapshot->Cast<S3RequestSnapshot>();
-	return !snapshot.auth_params.kms_key_id.empty();
-}
-
 string S3UploadSession::InitializeMultipartUpload() {
 	string result;
-	auto response = s3fs.get().PostRequest(*request_session, path, result, nullptr, 0, "uploads=");
-	if (response->status != HTTPStatusCode::OK_200) {
-		throw HTTPException(*response, "Unable to connect to URL %s: %s (HTTP code %d)", path, response->GetError(),
-		                    static_cast<int>(response->status));
+	auto response = s3fs.get().PostRequest(*request_session, path, result, nullptr, 0,
+	                                       "uploads=", S3PostRequestMode::NON_REPLAYABLE);
+	if (response->HasRequestError()) {
+		throw S3AmbiguousUploadException(StringUtil::Format(
+		    "S3 multipart upload initialization for \"%s\" has an unknown outcome because the response was not "
+		    "received; the request was not retried and cannot be aborted without an upload ID",
+		    display_path));
+	}
+	if (!IsSuccessfulStatus(response->status)) {
+		throw HTTPException(StringUtil::Format("S3 multipart upload initialization for \"%s\" failed with HTTP %d%s",
+		                                       display_path, static_cast<int>(response->status),
+		                                       S3RequestUtil::ParseError(response->body)));
 	}
 
-	auto open_tag = result.find("<UploadId>");
-	auto close_tag = result.find("</UploadId>", open_tag);
-	if (open_tag == string::npos || close_tag == string::npos) {
-		throw HTTPException("Unexpected response while initializing S3 multipart upload");
+	S3XMLResponse parsed_response;
+	if (!S3XMLResponseParser::TryParse(result, parsed_response)) {
+		throw S3AmbiguousUploadException(StringUtil::Format(
+		    "S3 multipart upload initialization for \"%s\" returned malformed XML; the request was not retried and "
+		    "cannot be aborted without an upload ID",
+		    display_path));
 	}
-	open_tag += strlen("<UploadId>");
-	return result.substr(open_tag, close_tag - open_tag);
+	if (parsed_response.type != S3XMLResponseType::MULTIPART_INITIALIZATION) {
+		throw S3AmbiguousUploadException(StringUtil::Format(
+		    "S3 multipart upload initialization for \"%s\" returned an unrecognized response; the request was not "
+		    "retried and cannot be aborted without an upload ID",
+		    display_path));
+	}
+	return parsed_response.upload_id;
 }
 
 void S3UploadSession::EnsureMultipartUpload() {
@@ -244,9 +318,13 @@ void S3UploadSession::EnsureMultipartUpload() {
 
 string S3UploadSession::Upload(const_data_ptr_t data, idx_t size, const string &query_param) {
 	auto response = s3fs.get().PutRequest(*request_session, path, data, size, query_param);
+	if (response->HasRequestError()) {
+		throw IOException("S3 upload request for \"%s\" could not be completed", display_path);
+	}
 	if (response->status != HTTPStatusCode::OK_200) {
-		throw HTTPException(*response, "Unable to connect to URL %s: %s (HTTP code %d)%s", path, response->GetError(),
-		                    static_cast<int>(response->status), S3RequestUtil::ParseError(response->body));
+		throw HTTPException(*response, "Unable to connect to URL %s: %s (HTTP code %d)%s", display_path,
+		                    response->GetError(), static_cast<int>(response->status),
+		                    S3RequestUtil::ParseError(response->body));
 	}
 	if (!response->headers.HasHeader("ETag")) {
 		throw IOException("Unexpected response when uploading to S3");
@@ -318,28 +396,48 @@ void S3UploadSession::RestorePartETags(vector<string> etags) DUCKDB_EXCLUDES(sta
 void S3UploadSession::CompleteMultipartUpload() {
 	auto snapshot = TakeMultipartSnapshot();
 	D_ASSERT(snapshot.upload_id);
-	try {
-		std::stringstream body;
-		body << "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">";
-		for (idx_t part_index = 0; part_index < snapshot.etags.size(); part_index++) {
-			body << "<Part><ETag>" << snapshot.etags[part_index] << "</ETag><PartNumber>" << part_index + 1
-			     << "</PartNumber></Part>";
-		}
-		body << "</CompleteMultipartUpload>";
-		auto completion_body = body.str();
+	std::stringstream body;
+	body << "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">";
+	for (idx_t part_index = 0; part_index < snapshot.etags.size(); part_index++) {
+		body << "<Part><ETag>" << snapshot.etags[part_index] << "</ETag><PartNumber>" << part_index + 1
+		     << "</PartNumber></Part>";
+	}
+	body << "</CompleteMultipartUpload>";
+	auto completion_body = body.str();
 
-		string result;
-		auto query_param = "uploadId=" + S3Url::Encode(*snapshot.upload_id, true);
-		auto response =
-		    s3fs.get().PostRequest(*request_session, path, result, const_data_ptr_cast(completion_body.data()),
-		                           completion_body.size(), query_param);
-		if (result.find("<CompleteMultipartUploadResult") == string::npos) {
-			throw HTTPException(*response, "Unexpected response during S3 multipart upload finalization: %d\n\n%s",
-			                    static_cast<int>(response->status), result);
-		}
-	} catch (...) {
-		RestorePartETags(std::move(snapshot.etags));
-		throw;
+	string result;
+	auto query_param = "uploadId=" + S3Url::Encode(*snapshot.upload_id, true);
+	auto response = s3fs.get().PostRequest(*request_session, path, result, const_data_ptr_cast(completion_body.data()),
+	                                       completion_body.size(), query_param, S3PostRequestMode::NON_REPLAYABLE);
+	if (response->HasRequestError()) {
+		throw S3AmbiguousUploadException(StringUtil::Format(
+		    "S3 multipart upload completion for \"%s\" has an unknown outcome because the response was not received; "
+		    "the request was not retried or aborted",
+		    display_path));
+	}
+	if (!IsSuccessfulStatus(response->status)) {
+		throw HTTPException(StringUtil::Format("S3 multipart upload completion for \"%s\" failed with HTTP %d%s",
+		                                       display_path, static_cast<int>(response->status),
+		                                       S3RequestUtil::ParseError(response->body)));
+	}
+
+	S3XMLResponse parsed_response;
+	if (!S3XMLResponseParser::TryParse(result, parsed_response)) {
+		throw S3AmbiguousUploadException(StringUtil::Format(
+		    "S3 multipart upload completion for \"%s\" returned malformed XML; the request was not retried or aborted",
+		    display_path));
+	}
+	if (parsed_response.type == S3XMLResponseType::ERROR) {
+		throw HTTPException(StringUtil::Format(
+		    "S3 multipart upload completion for \"%s\" failed: %s%s%s", display_path,
+		    parsed_response.error_code.empty() ? "S3 returned an embedded error" : parsed_response.error_code,
+		    parsed_response.error_message.empty() ? "" : ": ", parsed_response.error_message));
+	}
+	if (parsed_response.type != S3XMLResponseType::MULTIPART_COMPLETION) {
+		throw S3AmbiguousUploadException(StringUtil::Format(
+		    "S3 multipart upload completion for \"%s\" returned an unrecognized response; the request was not retried "
+		    "or aborted",
+		    display_path));
 	}
 }
 
@@ -364,8 +462,10 @@ S3UploadSession::WriteClaim S3UploadSession::Write(const_data_ptr_t data, idx_t 
 		}
 		StoreWriteResult(std::move(local_buffered_part), size);
 		return WriteClaim(*this);
+	} catch (S3AmbiguousUploadException &ex) {
+		FailOperation(ErrorData(ex), FailureDisposition::AMBIGUOUS);
 	} catch (std::exception &ex) {
-		FailOperation(ErrorData(ex));
+		FailOperation(ErrorData(ex), FailureDisposition::DEFINITIVE);
 	}
 }
 
@@ -385,12 +485,8 @@ void S3UploadSession::Finalize() {
 		if (current_state == State::OPEN) {
 			if (!local_buffered_part) {
 				UploadEmpty();
-			} else if (!UsesKMSKey()) {
-				UploadSingle(*local_buffered_part);
 			} else {
-				UploadBufferedPart(*local_buffered_part);
-				local_buffered_part.reset();
-				CompleteMultipartUpload();
+				UploadSingle(*local_buffered_part);
 			}
 		} else {
 			D_ASSERT(current_state == State::MULTIPART_ACTIVE);
@@ -401,8 +497,10 @@ void S3UploadSession::Finalize() {
 			CompleteMultipartUpload();
 		}
 		FinishFinalize();
+	} catch (S3AmbiguousUploadException &ex) {
+		FailOperation(ErrorData(ex), FailureDisposition::AMBIGUOUS);
 	} catch (std::exception &ex) {
-		FailOperation(ErrorData(ex));
+		FailOperation(ErrorData(ex), FailureDisposition::DEFINITIVE);
 	}
 }
 

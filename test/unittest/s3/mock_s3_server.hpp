@@ -19,6 +19,24 @@ enum class MockS3RefreshTarget : uint8_t {
 
 enum class MockS3RangeBehavior : uint8_t { NORMAL, IGNORE_RANGE, TRUNCATE_TRANSFER, SHORT_SUCCESS };
 
+enum class MockS3MultipartInitializationBehavior : uint8_t {
+	SUCCESS,
+	NAMESPACED_ESCAPED_SUCCESS,
+	MALFORMED_SUCCESS,
+	CREATE_THEN_DISCONNECT
+};
+
+enum class MockS3MultipartCompletionBehavior : uint8_t {
+	SUCCESS,
+	EMBEDDED_ERROR,
+	EMPTY_SUCCESS,
+	UNKNOWN_SUCCESS,
+	MALFORMED_SUCCESS,
+	COMMIT_THEN_DISCONNECT
+};
+
+enum class MockS3MultipartAbortBehavior : uint8_t { SUCCESS, ERROR };
+
 struct MockS3ObjectConfig {
 	string bucket = "refresh-bucket";
 	string key = "object.bin";
@@ -99,6 +117,9 @@ struct MockS3UploadConfig {
 	string upload_id = "refresh-test-upload-id";
 	//! Hold these one-based part numbers until ReleasePartUploads is called
 	vector<idx_t> blocked_part_numbers;
+	MockS3MultipartInitializationBehavior initialization_behavior = MockS3MultipartInitializationBehavior::SUCCESS;
+	MockS3MultipartCompletionBehavior completion_behavior = MockS3MultipartCompletionBehavior::SUCCESS;
+	MockS3MultipartAbortBehavior abort_behavior = MockS3MultipartAbortBehavior::SUCCESS;
 };
 
 struct MockS3ServerConfig {
@@ -123,6 +144,8 @@ struct MockS3RequestObservation {
 	string user_agent;
 	string session_header;
 	string upload_id;
+	string server_side_encryption;
+	string kms_key_id;
 	string body_digest;
 	optional_idx part_number;
 	idx_t body_size = 0;

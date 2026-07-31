@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <sstream>
 #include <thread>
 
 namespace httplib = duckdb_httplib;
@@ -113,6 +114,28 @@ struct MockS3BodyDigest {
 			hash *= 1099511628211ULL;
 		}
 		return StringUtil::Format("%016llx", static_cast<unsigned long long>(hash));
+	}
+};
+
+struct MockS3XMLText {
+	static string Escape(const string &text) {
+		std::stringstream result;
+		for (const auto character : text) {
+			switch (character) {
+			case '&':
+				result << "&amp;";
+				break;
+			case '<':
+				result << "&lt;";
+				break;
+			case '>':
+				result << "&gt;";
+				break;
+			default:
+				result << character;
+			}
+		}
+		return result.str();
 	}
 };
 
@@ -334,6 +357,8 @@ struct MockS3Server::Impl {
 		observation.user_agent = GetHeader(request, "User-Agent");
 		observation.session_header = GetHeader(request, "X-HTTPFS-Session");
 		observation.upload_id = GetParameter(request, "uploadId");
+		observation.server_side_encryption = GetHeader(request, "x-amz-server-side-encryption");
+		observation.kms_key_id = GetHeader(request, "x-amz-server-side-encryption-aws-kms-key-id");
 		observation.part_number = GetPartNumber(request);
 		observation.body_size = request.body.size();
 		observation.body_digest = MockS3BodyDigest::Compute(request.body);
@@ -377,6 +402,12 @@ struct MockS3Server::Impl {
 		response.status = 503;
 		response.set_content("<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
 		                     "application/xml");
+		Record(request, response.status);
+	}
+
+	void SendDisconnectedSuccess(const httplib::Request &request, httplib::Response &response) const {
+		response.status = 200;
+		response.set_content_provider(1, "application/xml", [](size_t, size_t, httplib::DataSink &) { return false; });
 		Record(request, response.status);
 	}
 
@@ -466,28 +497,92 @@ struct MockS3Server::Impl {
 
 	void SendMultipartPost(const httplib::Request &request, httplib::Response &response) {
 		if (request.target.find("uploads") != string::npos) {
-			response.status = 200;
-			response.set_content(StringUtil::Format("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-			                                        "<InitiateMultipartUploadResult><UploadId>%s</UploadId></"
-			                                        "InitiateMultipartUploadResult>",
-			                                        config.upload.upload_id),
-			                     "application/xml");
-		} else {
-			if (!TryCompleteMultipartUpload(request)) {
-				response.status = 400;
-				response.set_content("<Error><Code>InvalidPart</Code><Message>Invalid multipart completion "
-				                     "manifest.</Message></Error>",
+			switch (config.upload.initialization_behavior) {
+			case MockS3MultipartInitializationBehavior::SUCCESS:
+				response.status = 200;
+				response.set_content(StringUtil::Format("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+				                                        "<InitiateMultipartUploadResult><UploadId>%s</UploadId></"
+				                                        "InitiateMultipartUploadResult>",
+				                                        config.upload.upload_id),
 				                     "application/xml");
 				Record(request, response.status);
 				return;
+			case MockS3MultipartInitializationBehavior::NAMESPACED_ESCAPED_SUCCESS:
+				response.status = 200;
+				response.set_content(
+				    StringUtil::Format("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+				                       "<s3:InitiateMultipartUploadResult "
+				                       "xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+				                       "<s3:UploadId>%s</s3:UploadId></s3:InitiateMultipartUploadResult>",
+				                       MockS3XMLText::Escape(config.upload.upload_id)),
+				    "application/xml");
+				Record(request, response.status);
+				return;
+			case MockS3MultipartInitializationBehavior::MALFORMED_SUCCESS:
+				response.status = 200;
+				response.set_content("<InitiateMultipartUploadResult><UploadId>unknown", "application/xml");
+				Record(request, response.status);
+				return;
+			case MockS3MultipartInitializationBehavior::CREATE_THEN_DISCONNECT:
+				SendDisconnectedSuccess(request, response);
+				return;
+			default:
+				throw InternalException("Unknown multipart initialization behavior");
 			}
+		}
+
+		if (config.upload.completion_behavior == MockS3MultipartCompletionBehavior::EMBEDDED_ERROR) {
+			{
+				annotated_lock_guard<annotated_mutex> lock(upload_lock);
+				completion_body = request.body;
+			}
+			response.status = 200;
+			response.set_content(
+			    "<Error><Code>InternalError</Code><Message>Multipart completion failed.</Message></Error>",
+			    "application/xml");
+			Record(request, response.status);
+			return;
+		}
+		if (!TryCompleteMultipartUpload(request)) {
+			response.status = 400;
+			response.set_content("<Error><Code>InvalidPart</Code><Message>Invalid multipart completion "
+			                     "manifest.</Message></Error>",
+			                     "application/xml");
+			Record(request, response.status);
+			return;
+		}
+		switch (config.upload.completion_behavior) {
+		case MockS3MultipartCompletionBehavior::SUCCESS:
 			response.status = 200;
 			response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
 			                     "<CompleteMultipartUploadResult><ETag>\"httpfs-refresh-test-final-etag\"</ETag></"
 			                     "CompleteMultipartUploadResult>",
 			                     "application/xml");
+			Record(request, response.status);
+			return;
+		case MockS3MultipartCompletionBehavior::UNKNOWN_SUCCESS:
+			response.status = 200;
+			response.set_content("<UnexpectedMultipartResponse/>", "application/xml");
+			Record(request, response.status);
+			return;
+		case MockS3MultipartCompletionBehavior::EMPTY_SUCCESS:
+			response.status = 200;
+			response.set_content("", "application/xml");
+			Record(request, response.status);
+			return;
+		case MockS3MultipartCompletionBehavior::MALFORMED_SUCCESS:
+			response.status = 200;
+			response.set_content("<CompleteMultipartUploadResult><ETag>incomplete", "application/xml");
+			Record(request, response.status);
+			return;
+		case MockS3MultipartCompletionBehavior::COMMIT_THEN_DISCONNECT:
+			SendDisconnectedSuccess(request, response);
+			return;
+		case MockS3MultipartCompletionBehavior::EMBEDDED_ERROR:
+			throw InternalException("Embedded multipart errors must be handled before committing the upload");
+		default:
+			throw InternalException("Unknown multipart completion behavior");
 		}
-		Record(request, response.status);
 	}
 
 	void BeginPartUpload(idx_t part_number) DUCKDB_EXCLUDES(upload_lock) {
@@ -849,6 +944,26 @@ struct MockS3Server::Impl {
 				SendAuthFailure(request, response);
 				return;
 			}
+			auto upload_id = GetParameter(request, "uploadId");
+			if (!upload_id.empty()) {
+				if (config.upload.abort_behavior == MockS3MultipartAbortBehavior::ERROR) {
+					SendS3Error400(request, response, false);
+					return;
+				}
+				if (upload_id != config.upload.upload_id) {
+					response.status = 404;
+					response.set_content("<Error><Code>NoSuchUpload</Code></Error>", "application/xml");
+					Record(request, response.status);
+					return;
+				}
+				{
+					annotated_lock_guard<annotated_mutex> lock(upload_lock);
+					uploaded_parts.clear();
+				}
+				response.status = 204;
+				Record(request, response.status);
+				return;
+			}
 			if (remaining_delete_failures.load() > 0) {
 				remaining_delete_failures--;
 				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
@@ -997,11 +1112,12 @@ string MockS3DescribeObservations(const vector<MockS3RequestObservation> &observ
 		}
 		result += StringUtil::Format(
 		    "%s %s status=%d key=%s region=%s range=%s if_match=%s version_id=%s target=%s upload_id=%s "
-		    "part_number=%s body_size=%llu body_digest=%s user_agent=%s session_header=%s",
+		    "part_number=%s body_size=%llu body_digest=%s sse=%s kms_key_id=%s user_agent=%s session_header=%s",
 		    observation.method, observation.path, observation.status, observation.key_id, observation.region,
 		    observation.range, observation.if_match, observation.version_id, observation.target, observation.upload_id,
 		    observation.part_number.IsValid() ? std::to_string(observation.part_number.GetIndex()) : string(),
-		    observation.body_size, observation.body_digest, observation.user_agent, observation.session_header);
+		    observation.body_size, observation.body_digest, observation.server_side_encryption, observation.kms_key_id,
+		    observation.user_agent, observation.session_header);
 	}
 	return result;
 }

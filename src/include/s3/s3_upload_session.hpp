@@ -37,20 +37,19 @@ public:
 public:
 	S3UploadSession(S3FileSystem &s3fs, shared_ptr<HTTPRequestSession> request_session, string path,
 	                S3UploadConfig config);
+	~S3UploadSession() noexcept;
 
 	WriteClaim Write(const_data_ptr_t data, idx_t size, idx_t location);
 	void Finalize();
 
 private:
-	enum class State : uint8_t { OPEN, MULTIPART_ACTIVE, FINALIZED, FAILED };
+	enum class State : uint8_t { OPEN, MULTIPART_ACTIVE, FINALIZED, FAILED, AMBIGUOUS };
 	enum class Operation : uint8_t { NONE, WRITE, FINALIZE };
-	enum class FailureType : uint8_t { NONE, ERROR_DATA, NON_SEQUENTIAL_WRITE, SIZE_OVERFLOW };
+	enum class FailureDisposition : uint8_t { DEFINITIVE, AMBIGUOUS };
 
 	struct FailureSnapshot {
-		FailureType type = FailureType::NONE;
-		shared_ptr<const ErrorData> error;
-		idx_t expected_offset = 0;
-		idx_t actual_offset = 0;
+		shared_ptr<const ErrorData> primary_error;
+		shared_ptr<const ErrorData> abort_error;
 	};
 
 	struct BufferedPart {
@@ -76,15 +75,15 @@ private:
 	void StoreWriteResult(unique_ptr<BufferedPart> buffered_part, idx_t size) DUCKDB_EXCLUDES(state_lock);
 	void ReleaseWrite() DUCKDB_EXCLUDES(state_lock);
 	void FinishFinalize() DUCKDB_EXCLUDES(state_lock);
-	[[noreturn]] void FailOperation(ErrorData error) DUCKDB_EXCLUDES(state_lock);
+	[[noreturn]] void FailOperation(ErrorData error, FailureDisposition disposition) DUCKDB_EXCLUDES(state_lock);
 	FailureSnapshot CaptureFailure() const DUCKDB_REQUIRES(state_lock);
 	[[noreturn]] static void ThrowFailure(const FailureSnapshot &failure);
+	shared_ptr<const ErrorData> AbortMultipartUpload(const string &upload_id);
 
 	unique_ptr<BufferedPart> AllocateBufferedPart();
 	idx_t AppendToBufferedPart(BufferedPart &buffered_part, const_data_ptr_t data, idx_t size);
 	bool ShouldBufferUnbufferedSpan(idx_t size) DUCKDB_EXCLUDES(state_lock);
 	void WriteUnbufferedSpan(unique_ptr<BufferedPart> &buffered_part, const_data_ptr_t data, idx_t size);
-	bool UsesKMSKey() const;
 	void EnsureMultipartUpload();
 	string InitializeMultipartUpload();
 	string Upload(const_data_ptr_t data, idx_t size, const string &query_param);
@@ -101,6 +100,7 @@ private:
 	reference<S3FileSystem> s3fs;
 	shared_ptr<HTTPRequestSession> request_session;
 	const string path;
+	const string display_path;
 	const S3UploadConfig config;
 
 	annotated_mutex state_lock;
