@@ -98,9 +98,6 @@ concurrentloop threadid 0 100
 statement ok
 SET s3_secret_access_key='{AWS_SECRET_ACCESS_KEY}';SET s3_access_key_id='{AWS_ACCESS_KEY_ID}';SET s3_region='{AWS_DEFAULT_REGION}'; SET s3_endpoint='{DUCKDB_S3_ENDPOINT}';SET s3_use_ssl={DUCKDB_S3_USE_SSL};
 
-statement ok
-SET s3_uploader_thread_limit=1
-
 # Parquet file
 statement ok
 COPY lineitem_small TO 's3://test-bucket/multipart/export_small_{threadid}.parquet' (FORMAT 'parquet');

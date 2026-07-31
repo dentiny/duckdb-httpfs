@@ -292,7 +292,6 @@ vector<int> S3TestHelper::ObservationPorts(const vector<MockS3RequestObservation
 
 void S3TestHelper::WriteMultipartPayload(Connection &con) {
 	RequireQueryOk(con, "SET s3_uploader_max_filesize='50GB'");
-	RequireQueryOk(con, "SET s3_uploader_thread_limit=1");
 	auto &fs = FileSystem::GetFileSystem(*con.context);
 	auto handle =
 	    fs.OpenFile(S3TestHelper::S3_PATH, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);

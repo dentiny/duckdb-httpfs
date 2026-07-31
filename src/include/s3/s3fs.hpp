@@ -1,11 +1,8 @@
 #pragma once
 
-#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/chrono.hpp"
 #include "duckdb/common/file_opener.hpp"
-#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
-#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -13,42 +10,25 @@
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "http/httpfs.hpp"
 #include "s3/s3_request.hpp"
+#include "s3/s3_settings.hpp"
 
-#include <condition_variable>
 #include <exception>
-#include <iostream>
 #include <unordered_map>
 
 #undef RemoveDirectory
 
 namespace duckdb {
 
-struct S3ConfigParams {
-	static constexpr uint64_t DEFAULT_MAX_FILESIZE = 800000000000; // 800GB
-	static constexpr uint64_t DEFAULT_MAX_PARTS_PER_FILE = 10000;  // AWS DEFAULT
-	static constexpr uint64_t DEFAULT_MAX_UPLOAD_THREADS = 50;
-
-	uint64_t max_file_size;
-	uint64_t max_parts_per_file;
-	uint64_t max_upload_threads;
-
-	static S3ConfigParams ReadFrom(optional_ptr<FileOpener> opener);
-};
-
 class S3FileSystem;
-class S3MultiPartUpload;
-class S3WriteBuffer;
+class S3UploadSession;
 
 class S3FileHandle : public HTTPFileHandle {
 	friend class S3FileSystem;
 
 public:
 	S3FileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpenFlags flags, unique_ptr<HTTPParams> http_params_p,
-	             const S3AuthParams &auth_params_p, const S3ConfigParams &config_params_p);
+	             const S3AuthParams &auth_params_p, const S3UploadConfig &upload_config);
 	~S3FileHandle() override;
-
-	const S3ConfigParams config_params;
-	shared_ptr<S3MultiPartUpload> multi_part_upload;
 
 	void Close() override;
 	void Initialize(optional_ptr<FileOpener> opener) override;
@@ -62,6 +42,9 @@ protected:
 
 private:
 	void SetRegion(string region_p);
+
+private:
+	unique_ptr<S3UploadSession> upload_session;
 };
 
 class S3FileSystem : public HTTPFileSystem {
@@ -102,7 +85,6 @@ public:
 	unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) override;
 	HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) override;
 
-	BufferHandle Allocate(idx_t part_size, uint16_t max_threads);
 	EncryptionUtil &GetEncryptionUtil();
 
 protected:

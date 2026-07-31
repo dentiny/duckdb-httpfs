@@ -1,9 +1,39 @@
 #include "s3/s3_settings.hpp"
 
 #include "s3/s3_auth.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/storage/storage_info.hpp"
 
 namespace duckdb {
+
+S3UploadConfig S3UploadConfig::ReadFrom(optional_ptr<FileOpener> opener) {
+	uint64_t uploader_max_filesize;
+	uint64_t max_parts_per_file;
+	Value value;
+
+	if (FileOpener::TryGetCurrentSetting(opener, "s3_uploader_max_filesize", value)) {
+		uploader_max_filesize = DBConfig::ParseMemoryLimit(value.GetValue<string>());
+	} else {
+		uploader_max_filesize = S3UploadConfig::DEFAULT_MAX_FILESIZE;
+	}
+	if (FileOpener::TryGetCurrentSetting(opener, "s3_uploader_max_parts_per_file", value)) {
+		max_parts_per_file = value.GetValue<uint64_t>();
+	} else {
+		max_parts_per_file = S3UploadConfig::DEFAULT_MAX_PARTS_PER_FILE;
+	}
+	if (max_parts_per_file == 0) {
+		throw InvalidInputException("s3_uploader_max_parts_per_file must be greater than zero");
+	}
+
+	const idx_t aws_minimum_part_size = 5242880;
+	auto required_part_size = uploader_max_filesize / max_parts_per_file;
+	auto minimum_part_size = MaxValue<uint64_t>(aws_minimum_part_size, required_part_size);
+	auto part_size = ((minimum_part_size + Storage::DEFAULT_BLOCK_SIZE - 1) / Storage::DEFAULT_BLOCK_SIZE) *
+	                 Storage::DEFAULT_BLOCK_SIZE;
+	D_ASSERT(part_size * max_parts_per_file >= uploader_max_filesize);
+	return {NumericCast<idx_t>(part_size), NumericCast<idx_t>(max_parts_per_file)};
+}
 
 void S3Settings::Register(DBConfig &config) {
 	config.AddExtensionOption("s3_region", "S3 Region", LogicalType::VARCHAR);
@@ -25,8 +55,6 @@ void S3Settings::Register(DBConfig &config) {
 	                          LogicalType::VARCHAR, "800GB");
 	config.AddExtensionOption("s3_uploader_max_parts_per_file", "S3 Uploader max parts per file (between 1 and 10000)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(10000));
-	config.AddExtensionOption("s3_uploader_thread_limit", "S3 Uploader global thread limit", LogicalType::UBIGINT,
-	                          Value::UBIGINT(50));
 	config.AddExtensionOption("s3_version_id_pinning", "Pin S3 reads to a specific object version for consistency",
 	                          LogicalType::BOOLEAN, Value(false));
 	config.AddExtensionOption("merge_http_secret_into_s3_request", "Merges HTTP secret parameters into S3 requests",
