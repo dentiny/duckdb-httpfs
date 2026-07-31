@@ -53,8 +53,8 @@ private:
 		idx_t actual_offset = 0;
 	};
 
-	struct WriteBuffer {
-		explicit WriteBuffer(BufferHandle buffer_p) : buffer(std::move(buffer_p)) {
+	struct BufferedPart {
+		explicit BufferedPart(BufferHandle buffer_p) : buffer(std::move(buffer_p)) {
 		}
 
 		data_ptr_t Ptr() {
@@ -71,22 +71,26 @@ private:
 	};
 
 private:
-	unique_ptr<WriteBuffer> BeginWrite(idx_t location, idx_t size) DUCKDB_EXCLUDES(state_lock);
-	unique_ptr<WriteBuffer> BeginFinalize(bool &already_finalized) DUCKDB_EXCLUDES(state_lock);
-	void StoreWriteResult(unique_ptr<WriteBuffer> write_buffer, idx_t size) DUCKDB_EXCLUDES(state_lock);
+	unique_ptr<BufferedPart> BeginWrite(idx_t location, idx_t size) DUCKDB_EXCLUDES(state_lock);
+	unique_ptr<BufferedPart> BeginFinalize(bool &already_finalized) DUCKDB_EXCLUDES(state_lock);
+	void StoreWriteResult(unique_ptr<BufferedPart> buffered_part, idx_t size) DUCKDB_EXCLUDES(state_lock);
 	void ReleaseWrite() DUCKDB_EXCLUDES(state_lock);
 	void FinishFinalize() DUCKDB_EXCLUDES(state_lock);
 	[[noreturn]] void FailOperation(ErrorData error) DUCKDB_EXCLUDES(state_lock);
 	FailureSnapshot CaptureFailure() const DUCKDB_REQUIRES(state_lock);
 	[[noreturn]] static void ThrowFailure(const FailureSnapshot &failure);
 
-	unique_ptr<WriteBuffer> AllocateBuffer();
+	unique_ptr<BufferedPart> AllocateBufferedPart();
+	idx_t AppendToBufferedPart(BufferedPart &buffered_part, const_data_ptr_t data, idx_t size);
+	bool ShouldBufferUnbufferedSpan(idx_t size) DUCKDB_EXCLUDES(state_lock);
+	void WriteUnbufferedSpan(unique_ptr<BufferedPart> &buffered_part, const_data_ptr_t data, idx_t size);
 	bool UsesKMSKey() const;
 	void EnsureMultipartUpload();
 	string InitializeMultipartUpload();
 	string Upload(const_data_ptr_t data, idx_t size, const string &query_param);
-	void UploadPart(WriteBuffer &write_buffer);
-	void UploadSingle(WriteBuffer &write_buffer);
+	void UploadPart(const_data_ptr_t data, idx_t size);
+	void UploadBufferedPart(BufferedPart &buffered_part);
+	void UploadSingle(BufferedPart &buffered_part);
 	void UploadEmpty();
 	void StorePartETag(idx_t part_number, string etag) DUCKDB_EXCLUDES(state_lock);
 	MultipartSnapshot TakeMultipartSnapshot() DUCKDB_EXCLUDES(state_lock);
@@ -103,7 +107,7 @@ private:
 	State state DUCKDB_GUARDED_BY(state_lock) = State::OPEN;
 	Operation operation DUCKDB_GUARDED_BY(state_lock) = Operation::NONE;
 	idx_t next_offset DUCKDB_GUARDED_BY(state_lock) = 0;
-	unique_ptr<WriteBuffer> write_buffer DUCKDB_GUARDED_BY(state_lock);
+	unique_ptr<BufferedPart> buffered_part DUCKDB_GUARDED_BY(state_lock);
 	shared_ptr<const string> multipart_upload_id DUCKDB_GUARDED_BY(state_lock);
 	vector<string> part_etags DUCKDB_GUARDED_BY(state_lock);
 	FailureSnapshot primary_failure DUCKDB_GUARDED_BY(state_lock);

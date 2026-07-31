@@ -26,13 +26,19 @@ S3UploadConfig S3UploadConfig::ReadFrom(optional_ptr<FileOpener> opener) {
 		throw InvalidInputException("s3_uploader_max_parts_per_file must be greater than zero");
 	}
 
-	const idx_t aws_minimum_part_size = 5242880;
-	auto required_part_size = uploader_max_filesize / max_parts_per_file;
-	auto minimum_part_size = MaxValue<uint64_t>(aws_minimum_part_size, required_part_size);
-	auto part_size = ((minimum_part_size + Storage::DEFAULT_BLOCK_SIZE - 1) / Storage::DEFAULT_BLOCK_SIZE) *
-	                 Storage::DEFAULT_BLOCK_SIZE;
-	D_ASSERT(part_size * max_parts_per_file >= uploader_max_filesize);
-	return {NumericCast<idx_t>(part_size), NumericCast<idx_t>(max_parts_per_file)};
+	const auto required_part_size =
+	    uploader_max_filesize / max_parts_per_file + (uploader_max_filesize % max_parts_per_file != 0);
+	const auto minimum_part_size = MaxValue<uint64_t>(S3UploadConfig::MIN_MULTIPART_PART_SIZE, required_part_size);
+	const auto block_size = NumericCast<uint64_t>(Storage::DEFAULT_BLOCK_SIZE);
+	if (minimum_part_size > NumericLimits<uint64_t>::Maximum() - (block_size - 1)) {
+		throw InvalidInputException("The configured S3 upload size is too large");
+	}
+	const auto aggregation_threshold = ((minimum_part_size + block_size - 1) / block_size) * block_size;
+	if (aggregation_threshold > S3UploadConfig::MAX_MULTIPART_PART_SIZE) {
+		throw InvalidInputException("The configured S3 upload aggregation threshold exceeds the 5 GiB S3 part limit");
+	}
+	D_ASSERT(aggregation_threshold >= required_part_size);
+	return {NumericCast<idx_t>(aggregation_threshold), NumericCast<idx_t>(max_parts_per_file)};
 }
 
 void S3Settings::Register(DBConfig &config) {
@@ -52,7 +58,7 @@ void S3Settings::Register(DBConfig &config) {
 	    "Whether globs on S3-like storage are optimized with recursive strategy (alternative is listing)",
 	    LogicalType::BOOLEAN, Value(true));
 	config.AddExtensionOption("s3_uploader_max_filesize", "S3 Uploader max filesize (between 50GB and 5TB)",
-	                          LogicalType::VARCHAR, "800GB");
+	                          LogicalType::VARCHAR, "80GB");
 	config.AddExtensionOption("s3_uploader_max_parts_per_file", "S3 Uploader max parts per file (between 1 and 10000)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(10000));
 	config.AddExtensionOption("s3_version_id_pinning", "Pin S3 reads to a specific object version for consistency",

@@ -58,11 +58,11 @@ void S3UploadSession::ThrowFailure(const FailureSnapshot &failure) {
 	throw InternalException("S3 upload entered a failed state without an error");
 }
 
-unique_ptr<S3UploadSession::WriteBuffer> S3UploadSession::BeginWrite(idx_t location, idx_t size)
+unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginWrite(idx_t location, idx_t size)
     DUCKDB_EXCLUDES(state_lock) {
 	const char *error_message = nullptr;
 	FailureSnapshot failure;
-	unique_ptr<WriteBuffer> result;
+	unique_ptr<BufferedPart> result;
 	{
 		annotated_lock_guard<annotated_mutex> guard(state_lock);
 		if (state == State::FAILED) {
@@ -83,7 +83,7 @@ unique_ptr<S3UploadSession::WriteBuffer> S3UploadSession::BeginWrite(idx_t locat
 			failure = CaptureFailure();
 		} else {
 			operation = Operation::WRITE;
-			result = std::move(write_buffer);
+			result = std::move(buffered_part);
 		}
 	}
 	if (failure.type != FailureType::NONE) {
@@ -95,11 +95,11 @@ unique_ptr<S3UploadSession::WriteBuffer> S3UploadSession::BeginWrite(idx_t locat
 	return result;
 }
 
-unique_ptr<S3UploadSession::WriteBuffer> S3UploadSession::BeginFinalize(bool &already_finalized)
+unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginFinalize(bool &already_finalized)
     DUCKDB_EXCLUDES(state_lock) {
 	const char *error_message = nullptr;
 	FailureSnapshot failure;
-	unique_ptr<WriteBuffer> result;
+	unique_ptr<BufferedPart> result;
 	already_finalized = false;
 	{
 		annotated_lock_guard<annotated_mutex> guard(state_lock);
@@ -111,7 +111,7 @@ unique_ptr<S3UploadSession::WriteBuffer> S3UploadSession::BeginFinalize(bool &al
 			error_message = "Concurrent S3 upload operations are not supported";
 		} else {
 			operation = Operation::FINALIZE;
-			result = std::move(write_buffer);
+			result = std::move(buffered_part);
 		}
 	}
 	if (failure.type != FailureType::NONE) {
@@ -123,12 +123,13 @@ unique_ptr<S3UploadSession::WriteBuffer> S3UploadSession::BeginFinalize(bool &al
 	return result;
 }
 
-void S3UploadSession::StoreWriteResult(unique_ptr<WriteBuffer> write_buffer_p, idx_t size) DUCKDB_EXCLUDES(state_lock) {
+void S3UploadSession::StoreWriteResult(unique_ptr<BufferedPart> buffered_part_p, idx_t size)
+    DUCKDB_EXCLUDES(state_lock) {
 	annotated_lock_guard<annotated_mutex> guard(state_lock);
 	D_ASSERT(operation == Operation::WRITE);
 	D_ASSERT(state == State::OPEN || state == State::MULTIPART_ACTIVE);
-	D_ASSERT(!write_buffer);
-	write_buffer = std::move(write_buffer_p);
+	D_ASSERT(!buffered_part);
+	buffered_part = std::move(buffered_part_p);
 	next_offset += size;
 }
 
@@ -162,9 +163,40 @@ void S3UploadSession::FailOperation(ErrorData error) DUCKDB_EXCLUDES(state_lock)
 	ThrowFailure(failure);
 }
 
-unique_ptr<S3UploadSession::WriteBuffer> S3UploadSession::AllocateBuffer() {
-	auto buffer = s3fs.get().buffer_manager.Allocate(MemoryTag::EXTENSION, config.part_size);
-	return make_uniq<WriteBuffer>(std::move(buffer));
+unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::AllocateBufferedPart() {
+	auto buffer = s3fs.get().buffer_manager.Allocate(MemoryTag::EXTENSION, config.aggregation_threshold);
+	return make_uniq<BufferedPart>(std::move(buffer));
+}
+
+idx_t S3UploadSession::AppendToBufferedPart(BufferedPart &buffered_part_p, const_data_ptr_t data, idx_t size) {
+	D_ASSERT(buffered_part_p.size < config.aggregation_threshold);
+	auto copy_size = MinValue<idx_t>(size, config.aggregation_threshold - buffered_part_p.size);
+	memcpy(buffered_part_p.Ptr() + buffered_part_p.size, data, copy_size);
+	buffered_part_p.size += copy_size;
+	return copy_size;
+}
+
+bool S3UploadSession::ShouldBufferUnbufferedSpan(idx_t size) DUCKDB_EXCLUDES(state_lock) {
+	annotated_lock_guard<annotated_mutex> guard(state_lock);
+	D_ASSERT(state == State::OPEN || state == State::MULTIPART_ACTIVE);
+	return state == State::OPEN ? size <= config.aggregation_threshold : size < config.aggregation_threshold;
+}
+
+void S3UploadSession::WriteUnbufferedSpan(unique_ptr<BufferedPart> &buffered_part_p, const_data_ptr_t data,
+                                          idx_t size) {
+	idx_t input_offset = 0;
+	while (input_offset < size) {
+		auto remaining = size - input_offset;
+		if (ShouldBufferUnbufferedSpan(remaining)) {
+			buffered_part_p = AllocateBufferedPart();
+			auto copied = AppendToBufferedPart(*buffered_part_p, data + input_offset, remaining);
+			D_ASSERT(copied == remaining);
+			return;
+		}
+		auto direct_size = MinValue<idx_t>(remaining, S3UploadConfig::MAX_MULTIPART_PART_SIZE);
+		UploadPart(data + input_offset, direct_size);
+		input_offset += direct_size;
+	}
 }
 
 bool S3UploadSession::UsesKMSKey() const {
@@ -222,7 +254,7 @@ string S3UploadSession::Upload(const_data_ptr_t data, idx_t size, const string &
 	return response->headers.GetHeaderValue("ETag");
 }
 
-void S3UploadSession::UploadPart(WriteBuffer &write_buffer_p) {
+void S3UploadSession::UploadPart(const_data_ptr_t data, idx_t size) {
 	EnsureMultipartUpload();
 	idx_t part_number;
 	shared_ptr<const string> upload_id;
@@ -234,8 +266,12 @@ void S3UploadSession::UploadPart(WriteBuffer &write_buffer_p) {
 	}
 	D_ASSERT(upload_id);
 	auto query_param = "partNumber=" + to_string(part_number) + "&uploadId=" + S3Url::Encode(*upload_id, true);
-	auto etag = Upload(write_buffer_p.Ptr(), write_buffer_p.size, query_param);
+	auto etag = Upload(data, size, query_param);
 	StorePartETag(part_number, std::move(etag));
+}
+
+void S3UploadSession::UploadBufferedPart(BufferedPart &buffered_part_p) {
+	UploadPart(buffered_part_p.Ptr(), buffered_part_p.size);
 }
 
 void S3UploadSession::StorePartETag(idx_t part_number, string etag) DUCKDB_EXCLUDES(state_lock) {
@@ -258,8 +294,8 @@ void S3UploadSession::StorePartETag(idx_t part_number, string etag) DUCKDB_EXCLU
 	}
 }
 
-void S3UploadSession::UploadSingle(WriteBuffer &write_buffer_p) {
-	Upload(write_buffer_p.Ptr(), write_buffer_p.size, string());
+void S3UploadSession::UploadSingle(BufferedPart &buffered_part_p) {
+	Upload(buffered_part_p.Ptr(), buffered_part_p.size, string());
 }
 
 void S3UploadSession::UploadEmpty() {
@@ -308,23 +344,25 @@ void S3UploadSession::CompleteMultipartUpload() {
 }
 
 S3UploadSession::WriteClaim S3UploadSession::Write(const_data_ptr_t data, idx_t size, idx_t location) {
-	auto local_buffer = BeginWrite(location, size);
+	auto local_buffered_part = BeginWrite(location, size);
 	try {
 		idx_t input_offset = 0;
-		while (input_offset < size) {
-			if (!local_buffer) {
-				local_buffer = AllocateBuffer();
-			}
-			auto copy_size = MinValue<idx_t>(size - input_offset, config.part_size - local_buffer->size);
-			memcpy(local_buffer->Ptr() + local_buffer->size, data + input_offset, copy_size);
-			local_buffer->size += copy_size;
-			input_offset += copy_size;
-			if (local_buffer->size == config.part_size) {
-				UploadPart(*local_buffer);
-				local_buffer.reset();
+		if (local_buffered_part && size > 0) {
+			if (local_buffered_part->size == config.aggregation_threshold) {
+				UploadBufferedPart(*local_buffered_part);
+				local_buffered_part.reset();
+			} else {
+				input_offset = AppendToBufferedPart(*local_buffered_part, data, size);
+				if (local_buffered_part->size == config.aggregation_threshold && input_offset < size) {
+					UploadBufferedPart(*local_buffered_part);
+					local_buffered_part.reset();
+				}
 			}
 		}
-		StoreWriteResult(std::move(local_buffer), size);
+		if (input_offset < size) {
+			WriteUnbufferedSpan(local_buffered_part, data + input_offset, size - input_offset);
+		}
+		StoreWriteResult(std::move(local_buffered_part), size);
 		return WriteClaim(*this);
 	} catch (std::exception &ex) {
 		FailOperation(ErrorData(ex));
@@ -333,7 +371,7 @@ S3UploadSession::WriteClaim S3UploadSession::Write(const_data_ptr_t data, idx_t 
 
 void S3UploadSession::Finalize() {
 	bool already_finalized;
-	auto local_buffer = BeginFinalize(already_finalized);
+	auto local_buffered_part = BeginFinalize(already_finalized);
 	if (already_finalized) {
 		return;
 	}
@@ -345,20 +383,20 @@ void S3UploadSession::Finalize() {
 			current_state = state;
 		}
 		if (current_state == State::OPEN) {
-			if (!local_buffer) {
+			if (!local_buffered_part) {
 				UploadEmpty();
 			} else if (!UsesKMSKey()) {
-				UploadSingle(*local_buffer);
+				UploadSingle(*local_buffered_part);
 			} else {
-				UploadPart(*local_buffer);
-				local_buffer.reset();
+				UploadBufferedPart(*local_buffered_part);
+				local_buffered_part.reset();
 				CompleteMultipartUpload();
 			}
 		} else {
 			D_ASSERT(current_state == State::MULTIPART_ACTIVE);
-			if (local_buffer) {
-				UploadPart(*local_buffer);
-				local_buffer.reset();
+			if (local_buffered_part) {
+				UploadBufferedPart(*local_buffered_part);
+				local_buffered_part.reset();
 			}
 			CompleteMultipartUpload();
 		}

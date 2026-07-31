@@ -1,12 +1,14 @@
 #include "catch.hpp"
 
 #include "s3/mock_s3_server.hpp"
+#include "s3/s3_settings.hpp"
 #include "s3/s3_test_helper.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/serializer/async_file_writer.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/storage/storage_info.hpp"
 
 #include <future>
 #include <thread>
@@ -15,8 +17,10 @@ namespace duckdb {
 
 namespace {
 
-struct S3UploadBaselineTest {
-	static constexpr idx_t MINIMUM_PART_SIZE = 5ULL * 1024ULL * 1024ULL;
+struct S3UploadTest {
+	static constexpr idx_t AGGREGATION_THRESHOLD =
+	    ((S3UploadConfig::MIN_MULTIPART_PART_SIZE + Storage::DEFAULT_BLOCK_SIZE - 1) / Storage::DEFAULT_BLOCK_SIZE) *
+	    Storage::DEFAULT_BLOCK_SIZE;
 
 	template <class CALLBACK>
 	static string RequireError(CALLBACK callback) {
@@ -34,9 +38,12 @@ struct S3UploadBaselineTest {
 		return fs.OpenFile(S3TestHelper::S3_PATH, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
 	}
 
-	static void Configure(DuckDB &db, Connection &con, MockS3Server &server, const string &client_implementation) {
+	static void Configure(DuckDB &db, Connection &con, MockS3Server &server, const string &client_implementation,
+	                      bool use_minimum_part_size = true) {
 		S3TestHelper::ConfigureRefresh(db, con, server, client_implementation, false);
-		S3TestHelper::RequireQueryOk(con, "SET s3_uploader_max_filesize='50GB'");
+		if (use_minimum_part_size) {
+			S3TestHelper::RequireQueryOk(con, "SET s3_uploader_max_filesize='50GB'");
+		}
 		S3TestHelper::RequireQueryOk(con, "SET http_retries=0");
 	}
 
@@ -62,12 +69,34 @@ struct S3UploadBaselineTest {
 		return result;
 	}
 
-	static string CreateMultipartPayload() {
-		string result(12ULL * 1024ULL * 1024ULL + 1, '\0');
+	static void RequirePartSizes(const vector<MockS3RequestObservation> &observations,
+	                             const vector<idx_t> &expected_sizes, const string &upload_id = string()) {
+		auto parts = SuccessfulParts(observations);
+		REQUIRE(parts.size() == expected_sizes.size());
+		vector<idx_t> actual_sizes(expected_sizes.size());
+		for (const auto &part : parts) {
+			if (!upload_id.empty()) {
+				REQUIRE(part.upload_id == upload_id);
+			}
+			auto part_number = part.part_number.GetIndex();
+			REQUIRE(part_number >= 1);
+			REQUIRE(part_number <= actual_sizes.size());
+			actual_sizes[part_number - 1] = part.body_size;
+			REQUIRE_FALSE(part.body_digest.empty());
+		}
+		REQUIRE(actual_sizes == expected_sizes);
+	}
+
+	static string CreatePayload(idx_t size) {
+		string result(size, '\0');
 		for (idx_t index = 0; index < result.size(); index++) {
 			result[index] = NumericCast<char>('a' + index % 23);
 		}
 		return result;
+	}
+
+	static string CreateMultipartPayload() {
+		return CreatePayload(12ULL * 1024ULL * 1024ULL + 1);
 	}
 
 	static void RunSinglePut(const string &client_implementation) {
@@ -193,29 +222,12 @@ struct S3UploadBaselineTest {
 		REQUIRE(server.UploadedObject() == payload);
 		REQUIRE(Count(observations, "POST", "uploads") == 1);
 		REQUIRE(Count(observations, "POST", "uploadId") == 1);
-		REQUIRE(Count(observations, "PUT", "partNumber") == 3);
-
-		auto parts = SuccessfulParts(observations);
-		REQUIRE(parts.size() == 3);
-		vector<idx_t> part_sizes(3);
-		for (const auto &part : parts) {
-			REQUIRE(part.upload_id == upload_id);
-			auto part_number = part.part_number.GetIndex();
-			REQUIRE(part_number >= 1);
-			REQUIRE(part_number <= part_sizes.size());
-			part_sizes[part_number - 1] = part.body_size;
-			REQUIRE_FALSE(part.body_digest.empty());
-		}
-		REQUIRE(part_sizes[0] >= MINIMUM_PART_SIZE);
-		REQUIRE(part_sizes[1] == part_sizes[0]);
-		REQUIRE(part_sizes[2] == payload.size() - part_sizes[0] - part_sizes[1]);
-		REQUIRE(part_sizes[2] < part_sizes[0]);
+		REQUIRE(Count(observations, "PUT", "partNumber") == 1);
+		RequirePartSizes(observations, {payload.size()}, upload_id);
 
 		const string expected_completion_body =
 		    "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
 		    "<Part><ETag>\"mock-part-1\"</ETag><PartNumber>1</PartNumber></Part>"
-		    "<Part><ETag>\"mock-part-2\"</ETag><PartNumber>2</PartNumber></Part>"
-		    "<Part><ETag>\"mock-part-3\"</ETag><PartNumber>3</PartNumber></Part>"
 		    "</CompleteMultipartUpload>";
 		REQUIRE(server.CompletionBody() == expected_completion_body);
 		for (const auto &observation : observations) {
@@ -223,6 +235,116 @@ struct S3UploadBaselineTest {
 				REQUIRE(observation.upload_id == upload_id);
 			}
 		}
+	}
+
+	static void RunWholeWriteGeometry(const string &client_implementation, idx_t payload_size) {
+		MockS3ServerConfig config;
+		config.object.bucket = S3TestHelper::BUCKET;
+		config.object.key = S3TestHelper::OBJECT_KEY;
+		config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+		MockS3Server server(std::move(config));
+
+		DuckDB db(nullptr);
+		Connection con(db);
+		Configure(db, con, server, client_implementation);
+
+		auto payload = CreatePayload(payload_size);
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		auto handle = OpenWriter(con);
+		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size());
+		auto before_close = server.Observations();
+		INFO(MockS3DescribeObservations(before_close));
+		if (payload_size <= AGGREGATION_THRESHOLD) {
+			REQUIRE(Count(before_close, "PUT") == 0);
+			REQUIRE(Count(before_close, "POST") == 0);
+		} else {
+			REQUIRE(Count(before_close, "POST", "uploads") == 1);
+			REQUIRE(Count(before_close, "PUT", "partNumber") == 1);
+		}
+
+		handle->Close();
+		handle.reset();
+		S3TestHelper::RequireQueryOk(con, "COMMIT");
+
+		auto observations = server.Observations();
+		INFO(MockS3DescribeObservations(observations));
+		REQUIRE(server.UploadedObject() == payload);
+		if (payload_size <= AGGREGATION_THRESHOLD) {
+			REQUIRE(Count(observations, "PUT") == 1);
+			REQUIRE(Count(observations, "POST") == 0);
+		} else {
+			REQUIRE(Count(observations, "POST", "uploads") == 1);
+			REQUIRE(Count(observations, "POST", "uploadId") == 1);
+			RequirePartSizes(observations, {payload.size()});
+		}
+	}
+
+	static void RunFullPartLookbehind(const string &client_implementation) {
+		MockS3ServerConfig config;
+		config.object.bucket = S3TestHelper::BUCKET;
+		config.object.key = S3TestHelper::OBJECT_KEY;
+		config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+		MockS3Server server(std::move(config));
+
+		DuckDB db(nullptr);
+		Connection con(db);
+		Configure(db, con, server, client_implementation);
+
+		auto payload = CreatePayload(AGGREGATION_THRESHOLD + 1);
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		auto handle = OpenWriter(con);
+		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), AGGREGATION_THRESHOLD);
+		auto after_first_write = server.Observations();
+		INFO(MockS3DescribeObservations(after_first_write));
+		REQUIRE(Count(after_first_write, "PUT") == 0);
+		REQUIRE(Count(after_first_write, "POST") == 0);
+
+		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()) + AGGREGATION_THRESHOLD, 1);
+		auto after_second_write = server.Observations();
+		INFO(MockS3DescribeObservations(after_second_write));
+		REQUIRE(Count(after_second_write, "POST", "uploads") == 1);
+		RequirePartSizes(after_second_write, {AGGREGATION_THRESHOLD});
+
+		handle->Close();
+		handle.reset();
+		S3TestHelper::RequireQueryOk(con, "COMMIT");
+
+		auto observations = server.Observations();
+		INFO(MockS3DescribeObservations(observations));
+		REQUIRE(server.UploadedObject() == payload);
+		RequirePartSizes(observations, {AGGREGATION_THRESHOLD, 1});
+	}
+
+	static void RunBufferedPrefix(const string &client_implementation) {
+		MockS3ServerConfig config;
+		config.object.bucket = S3TestHelper::BUCKET;
+		config.object.key = S3TestHelper::OBJECT_KEY;
+		config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+		MockS3Server server(std::move(config));
+
+		DuckDB db(nullptr);
+		Connection con(db);
+		Configure(db, con, server, client_implementation);
+
+		const idx_t prefix_size = 1ULL * 1024ULL * 1024ULL;
+		const idx_t second_write_size = 12ULL * 1024ULL * 1024ULL;
+		auto payload = CreatePayload(prefix_size + second_write_size);
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		auto handle = OpenWriter(con);
+		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), prefix_size);
+		REQUIRE(server.Observations().empty());
+		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()) + prefix_size, second_write_size);
+		RequirePartSizes(server.Observations(),
+		                 {AGGREGATION_THRESHOLD, prefix_size + second_write_size - AGGREGATION_THRESHOLD});
+		handle->Close();
+		handle.reset();
+		S3TestHelper::RequireQueryOk(con, "COMMIT");
+
+		auto observations = server.Observations();
+		INFO(MockS3DescribeObservations(observations));
+		REQUIRE(server.UploadedObject() == payload);
+		RequirePartSizes(observations,
+		                 {AGGREGATION_THRESHOLD, prefix_size + second_write_size - AGGREGATION_THRESHOLD});
 	}
 
 	static void RunFragmentedMultipart(const string &client_implementation) {
@@ -237,8 +359,8 @@ struct S3UploadBaselineTest {
 		Configure(db, con, server, client_implementation);
 
 		auto payload = CreateMultipartPayload();
-		const vector<idx_t> write_sizes {1, MINIMUM_PART_SIZE - 2, 3, MINIMUM_PART_SIZE,
-		                                 payload.size() - 2 * MINIMUM_PART_SIZE - 2};
+		const vector<idx_t> write_sizes {1, AGGREGATION_THRESHOLD - 2, 3, AGGREGATION_THRESHOLD,
+		                                 payload.size() - 2 * AGGREGATION_THRESHOLD - 2};
 		idx_t offset = 0;
 		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
 		auto handle = OpenWriter(con);
@@ -257,9 +379,11 @@ struct S3UploadBaselineTest {
 		REQUIRE(Count(observations, "POST", "uploads") == 1);
 		REQUIRE(Count(observations, "POST", "uploadId") == 1);
 		REQUIRE(Count(observations, "PUT", "partNumber") == 3);
+		RequirePartSizes(observations,
+		                 {AGGREGATION_THRESHOLD, AGGREGATION_THRESHOLD, payload.size() - 2 * AGGREGATION_THRESHOLD});
 	}
 
-	static void RunAsyncWriter(const string &client_implementation) {
+	static void RunAsyncWriter(const string &client_implementation, idx_t async_threads) {
 		MockS3ServerConfig config;
 		config.object.bucket = S3TestHelper::BUCKET;
 		config.object.key = S3TestHelper::OBJECT_KEY;
@@ -268,10 +392,10 @@ struct S3UploadBaselineTest {
 
 		DuckDB db(nullptr);
 		Connection con(db);
-		Configure(db, con, server, client_implementation);
-		S3TestHelper::RequireQueryOk(con, "SET async_threads=2");
+		Configure(db, con, server, client_implementation, false);
+		S3TestHelper::RequireQueryOk(con, "SET async_threads=" + to_string(async_threads));
 
-		auto payload = CreateMultipartPayload();
+		auto payload = CreatePayload(8ULL * 1024ULL * 1024ULL);
 		auto &fs = FileSystem::GetFileSystem(*con.context);
 		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
 		AsyncFileWriter writer(*con.context, fs, S3TestHelper::S3_PATH,
@@ -286,6 +410,7 @@ struct S3UploadBaselineTest {
 		REQUIRE(server.MaximumConcurrentPartUploads() == 1);
 		REQUIRE(Count(observations, "POST", "uploads") == 1);
 		REQUIRE(Count(observations, "POST", "uploadId") == 1);
+		RequirePartSizes(observations, {payload.size()});
 	}
 
 	static void RunStableSinglePutFailure(const string &client_implementation) {
@@ -343,7 +468,7 @@ struct S3UploadBaselineTest {
 		INFO(MockS3DescribeObservations(observations));
 		REQUIRE(Count(observations, "POST", "uploads") == 1);
 		REQUIRE(Count(observations, "POST", "uploadId") == 1);
-		REQUIRE(Count(observations, "PUT", "partNumber") == 3);
+		REQUIRE(Count(observations, "PUT", "partNumber") == 1);
 		REQUIRE(Count(observations, "DELETE") == 0);
 	}
 
@@ -415,11 +540,35 @@ struct S3UploadBaselineTest {
 		SECTION("multipart upload") {
 			RunMultipart(client_implementation);
 		}
+		SECTION("write below aggregation threshold") {
+			RunWholeWriteGeometry(client_implementation, AGGREGATION_THRESHOLD - 1);
+		}
+		SECTION("write at aggregation threshold") {
+			RunWholeWriteGeometry(client_implementation, AGGREGATION_THRESHOLD);
+		}
+		SECTION("write above aggregation threshold") {
+			RunWholeWriteGeometry(client_implementation, AGGREGATION_THRESHOLD + 1);
+		}
+		SECTION("write at twice the aggregation threshold") {
+			RunWholeWriteGeometry(client_implementation, 2 * AGGREGATION_THRESHOLD);
+		}
+		SECTION("full part lookbehind") {
+			RunFullPartLookbehind(client_implementation);
+		}
+		SECTION("buffered prefix followed by a large write") {
+			RunBufferedPrefix(client_implementation);
+		}
 		SECTION("fragmented multipart upload") {
 			RunFragmentedMultipart(client_implementation);
 		}
-		SECTION("async writer multipart upload") {
-			RunAsyncWriter(client_implementation);
+		SECTION("synchronous async writer multipart upload") {
+			RunAsyncWriter(client_implementation, 0);
+		}
+		SECTION("single-worker async writer multipart upload") {
+			RunAsyncWriter(client_implementation, 1);
+		}
+		SECTION("multi-worker async writer multipart upload") {
+			RunAsyncWriter(client_implementation, 2);
 		}
 		SECTION("stable single PUT failure") {
 			RunStableSinglePutFailure(client_implementation);
@@ -438,23 +587,28 @@ struct S3UploadBaselineTest {
 
 } // namespace
 
-TEST_CASE("S3 upload behavior baseline", "[httpfs][s3][upload]") {
+TEST_CASE("S3 upload request geometry", "[httpfs][s3][upload]") {
 	SECTION("curl") {
-		S3UploadBaselineTest::Run("curl");
+		S3UploadTest::Run("curl");
 	}
 	SECTION("httplib") {
-		S3UploadBaselineTest::Run("httplib");
+		S3UploadTest::Run("httplib");
 	}
 }
 
-TEST_CASE("S3 upload threads are scheduled by DuckDB", "[httpfs][s3][upload]") {
+TEST_CASE("S3 upload defaults use DuckDB scheduling", "[httpfs][s3][upload]") {
 	DuckDB db(nullptr);
 	S3TestHelper::LoadExtension(db);
 	Connection con(db);
-	auto result = con.Query("SELECT count(*) FROM duckdb_settings() WHERE name = 's3_uploader_thread_limit'");
-	REQUIRE(result);
-	REQUIRE_FALSE(result->HasError());
-	REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 0);
+	auto thread_setting = con.Query("SELECT count(*) FROM duckdb_settings() WHERE name = 's3_uploader_thread_limit'");
+	REQUIRE(thread_setting);
+	REQUIRE_FALSE(thread_setting->HasError());
+	REQUIRE(thread_setting->GetValue(0, 0).GetValue<int64_t>() == 0);
+
+	auto max_filesize = con.Query("SELECT value FROM duckdb_settings() WHERE name = 's3_uploader_max_filesize'");
+	REQUIRE(max_filesize);
+	REQUIRE_FALSE(max_filesize->HasError());
+	REQUIRE(max_filesize->GetValue(0, 0).ToString() == "80GB");
 }
 
 } // namespace duckdb

@@ -447,7 +447,7 @@ public:
 			curl_easy_setopt(*curl, CURLOPT_CUSTOMREQUEST, "PUT");
 			// Include PUT body
 			curl_easy_setopt(*curl, CURLOPT_POSTFIELDS, const_char_ptr_cast(info.buffer_in));
-			curl_easy_setopt(*curl, CURLOPT_POSTFIELDSIZE, info.buffer_in_len);
+			curl_easy_setopt(*curl, CURLOPT_POSTFIELDSIZE_LARGE, NumericCast<curl_off_t>(info.buffer_in_len));
 
 			// Apply headers
 			curl_easy_setopt(*curl, CURLOPT_HTTPHEADER, curl_headers ? curl_headers.headers : nullptr);
@@ -455,7 +455,7 @@ public:
 			res = curl->Execute();
 			curl_easy_setopt(*curl, CURLOPT_CUSTOMREQUEST, nullptr);
 			curl_easy_setopt(*curl, CURLOPT_POSTFIELDS, nullptr);
-			curl_easy_setopt(*curl, CURLOPT_POSTFIELDSIZE, 0);
+			curl_easy_setopt(*curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(0));
 		}
 
 		curl_easy_getinfo(*curl, CURLINFO_RESPONSE_CODE, &request_info->response_code);

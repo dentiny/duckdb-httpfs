@@ -39,8 +39,8 @@ set s3_region='${AWS_DEFAULT_REGION}'
 statement ok
 CREATE SECRET s1 (TYPE S3, KEY_ID '${AWS_ACCESS_KEY_ID}', SECRET '${AWS_SECRET_ACCESS_KEY}')
 
-# shrink the multipart part size to the 5 MiB minimum so a small write still
-# exercises the multipart path (part_size = max_filesize / max_parts)
+# shrink the aggregation threshold toward the 5 MiB minimum so a small write
+# still exercises the multipart path
 statement ok
 SET s3_uploader_max_filesize='50GB'
 
