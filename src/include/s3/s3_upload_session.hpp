@@ -53,7 +53,7 @@ private:
 	};
 
 	struct BufferedPart {
-		explicit BufferedPart(BufferHandle buffer_p) : buffer(std::move(buffer_p)) {
+		BufferedPart(BufferHandle buffer_p, idx_t capacity_p) : buffer(std::move(buffer_p)), capacity(capacity_p) {
 		}
 
 		data_ptr_t Ptr() {
@@ -61,6 +61,7 @@ private:
 		}
 
 		BufferHandle buffer;
+		const idx_t capacity;
 		idx_t size = 0;
 	};
 
@@ -82,6 +83,7 @@ private:
 
 	unique_ptr<BufferedPart> AllocateBufferedPart();
 	idx_t AppendToBufferedPart(BufferedPart &buffered_part, const_data_ptr_t data, idx_t size);
+	idx_t CurrentPartSize() DUCKDB_EXCLUDES(state_lock);
 	bool ShouldBufferUnbufferedSpan(idx_t size) DUCKDB_EXCLUDES(state_lock);
 	void WriteUnbufferedSpan(unique_ptr<BufferedPart> &buffered_part, const_data_ptr_t data, idx_t size);
 	void EnsureMultipartUpload();

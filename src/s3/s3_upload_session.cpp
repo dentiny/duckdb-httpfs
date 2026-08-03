@@ -81,7 +81,7 @@ void S3UploadSession::ThrowFailure(const FailureSnapshot &failure) {
 
 unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginWrite(idx_t location, idx_t size)
     DUCKDB_EXCLUDES(state_lock) {
-	enum class LocalFailure : uint8_t { NONE, NON_SEQUENTIAL_WRITE, SIZE_OVERFLOW };
+	enum class LocalFailure : uint8_t { NONE, NON_SEQUENTIAL_WRITE, FILE_SIZE_LIMIT };
 
 	const char *error_message = nullptr;
 	FailureSnapshot failure;
@@ -100,9 +100,9 @@ unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginWrite(idx_t loca
 			operation = Operation::WRITE;
 			local_failure = LocalFailure::NON_SEQUENTIAL_WRITE;
 			expected_offset = next_offset;
-		} else if (size > NumericLimits<idx_t>::Maximum() - next_offset) {
+		} else if (size > config.max_file_size - next_offset) {
 			operation = Operation::WRITE;
-			local_failure = LocalFailure::SIZE_OVERFLOW;
+			local_failure = LocalFailure::FILE_SIZE_LIMIT;
 		} else {
 			operation = Operation::WRITE;
 			result = std::move(buffered_part);
@@ -117,8 +117,10 @@ unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginWrite(idx_t loca
 		                                           expected_offset, location)),
 		              FailureDisposition::DEFINITIVE);
 	}
-	if (local_failure == LocalFailure::SIZE_OVERFLOW) {
-		FailOperation(ErrorData(ExceptionType::IO, "S3 upload size exceeds the supported range"),
+	if (local_failure == LocalFailure::FILE_SIZE_LIMIT) {
+		FailOperation(ErrorData(ExceptionType::IO,
+		                        StringUtil::Format("S3 upload exceeds the configured maximum file size of %llu bytes",
+		                                           config.max_file_size)),
 		              FailureDisposition::DEFINITIVE);
 	}
 	if (error_message) {
@@ -229,22 +231,29 @@ shared_ptr<const ErrorData> S3UploadSession::AbortMultipartUpload(const string &
 }
 
 unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::AllocateBufferedPart() {
-	auto buffer = s3fs.get().buffer_manager.Allocate(MemoryTag::EXTENSION, config.aggregation_threshold);
-	return make_uniq<BufferedPart>(std::move(buffer));
+	auto capacity = CurrentPartSize();
+	auto buffer = s3fs.get().buffer_manager.Allocate(MemoryTag::EXTENSION, capacity);
+	return make_uniq<BufferedPart>(std::move(buffer), capacity);
 }
 
 idx_t S3UploadSession::AppendToBufferedPart(BufferedPart &buffered_part_p, const_data_ptr_t data, idx_t size) {
-	D_ASSERT(buffered_part_p.size < config.aggregation_threshold);
-	auto copy_size = MinValue<idx_t>(size, config.aggregation_threshold - buffered_part_p.size);
+	D_ASSERT(buffered_part_p.size < buffered_part_p.capacity);
+	auto copy_size = MinValue<idx_t>(size, buffered_part_p.capacity - buffered_part_p.size);
 	memcpy(buffered_part_p.Ptr() + buffered_part_p.size, data, copy_size);
 	buffered_part_p.size += copy_size;
 	return copy_size;
 }
 
+idx_t S3UploadSession::CurrentPartSize() DUCKDB_EXCLUDES(state_lock) {
+	annotated_lock_guard<annotated_mutex> guard(state_lock);
+	return config.PartSize(part_etags.size());
+}
+
 bool S3UploadSession::ShouldBufferUnbufferedSpan(idx_t size) DUCKDB_EXCLUDES(state_lock) {
 	annotated_lock_guard<annotated_mutex> guard(state_lock);
 	D_ASSERT(state == State::OPEN || state == State::MULTIPART_ACTIVE);
-	return state == State::OPEN ? size <= config.aggregation_threshold : size < config.aggregation_threshold;
+	auto part_size = config.PartSize(part_etags.size());
+	return state == State::OPEN ? size <= part_size : size < part_size;
 }
 
 void S3UploadSession::WriteUnbufferedSpan(unique_ptr<BufferedPart> &buffered_part_p, const_data_ptr_t data,
@@ -333,13 +342,20 @@ string S3UploadSession::Upload(const_data_ptr_t data, idx_t size, const string &
 }
 
 void S3UploadSession::UploadPart(const_data_ptr_t data, idx_t size) {
-	EnsureMultipartUpload();
 	idx_t part_number;
 	shared_ptr<const string> upload_id;
 	{
 		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		D_ASSERT(state == State::MULTIPART_ACTIVE);
+		if (!config.HasPartCapacity(part_etags.size())) {
+			throw IOException("S3 upload exceeds the configured maximum of %llu multipart parts", config.max_parts);
+		}
 		part_number = part_etags.size() + 1;
+	}
+	EnsureMultipartUpload();
+	{
+		annotated_lock_guard<annotated_mutex> guard(state_lock);
+		D_ASSERT(state == State::MULTIPART_ACTIVE);
+		D_ASSERT(part_number == part_etags.size() + 1);
 		upload_id = multipart_upload_id;
 	}
 	D_ASSERT(upload_id);
@@ -446,12 +462,12 @@ S3UploadSession::WriteClaim S3UploadSession::Write(const_data_ptr_t data, idx_t 
 	try {
 		idx_t input_offset = 0;
 		if (local_buffered_part && size > 0) {
-			if (local_buffered_part->size == config.aggregation_threshold) {
+			if (local_buffered_part->size == local_buffered_part->capacity) {
 				UploadBufferedPart(*local_buffered_part);
 				local_buffered_part.reset();
 			} else {
 				input_offset = AppendToBufferedPart(*local_buffered_part, data, size);
-				if (local_buffered_part->size == config.aggregation_threshold && input_offset < size) {
+				if (local_buffered_part->size == local_buffered_part->capacity && input_offset < size) {
 					UploadBufferedPart(*local_buffered_part);
 					local_buffered_part.reset();
 				}

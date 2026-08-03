@@ -102,7 +102,7 @@ unique_ptr<HTTPFileHandle> S3FileSystem::CreateHandle(const OpenFileInfo &file, 
 
 	auto &http_util = HTTPFSUtil::GetHTTPUtil(opener);
 	auto params = http_util.InitializeParameters(opener, info);
-	S3UploadConfig upload_config {0, 0};
+	S3UploadConfig upload_config;
 	if (flags.OpenForWriting()) {
 		upload_config = S3UploadConfig::ReadFrom(opener);
 	}

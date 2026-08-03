@@ -7,6 +7,79 @@
 
 namespace duckdb {
 
+namespace {
+
+struct S3UploadSizing {
+	static bool ScheduleCovers(uint64_t initial_part_size, uint64_t max_file_size, idx_t max_parts,
+	                           idx_t growth_interval) {
+		uint64_t capacity = 0;
+		idx_t completed_parts = 0;
+		while (completed_parts < max_parts) {
+			auto part_size = PartSize(initial_part_size, growth_interval, completed_parts);
+			auto parts_at_size = MinValue<idx_t>(growth_interval, max_parts - completed_parts);
+			if (part_size > (max_file_size - MinValue<uint64_t>(capacity, max_file_size)) / parts_at_size) {
+				return true;
+			}
+			capacity += part_size * parts_at_size;
+			if (capacity >= max_file_size) {
+				return true;
+			}
+			completed_parts += parts_at_size;
+		}
+		return false;
+	}
+
+	static idx_t PartSize(uint64_t initial_part_size, idx_t growth_interval, idx_t completed_parts) {
+		auto result = initial_part_size;
+		auto doubling_count = completed_parts / growth_interval;
+		while (doubling_count > 0 && result < S3UploadConfig::MAX_MULTIPART_PART_SIZE) {
+			result = MinValue<uint64_t>(result * 2, S3UploadConfig::MAX_MULTIPART_PART_SIZE);
+			doubling_count--;
+		}
+		return NumericCast<idx_t>(result);
+	}
+
+	static idx_t InitialPartSize(uint64_t max_file_size, idx_t max_parts, idx_t growth_interval) {
+		const auto block_size = NumericCast<uint64_t>(Storage::DEFAULT_BLOCK_SIZE + Storage::DEFAULT_BLOCK_HEADER_SIZE);
+		D_ASSERT(S3UploadConfig::MIN_MULTIPART_PART_SIZE % block_size == 0);
+		D_ASSERT(S3UploadConfig::MAX_MULTIPART_PART_SIZE % block_size == 0);
+		auto lower = NumericCast<uint64_t>(S3UploadConfig::MIN_MULTIPART_PART_SIZE) / block_size;
+		auto upper = NumericCast<uint64_t>(S3UploadConfig::MAX_MULTIPART_PART_SIZE) / block_size;
+		while (lower < upper) {
+			auto middle = lower + (upper - lower) / 2;
+			if (ScheduleCovers(middle * block_size, max_file_size, max_parts, growth_interval)) {
+				upper = middle;
+			} else {
+				lower = middle + 1;
+			}
+		}
+		return NumericCast<idx_t>(lower * block_size);
+	}
+};
+
+} // namespace
+
+S3UploadConfig S3UploadConfig::Create(uint64_t max_file_size, uint64_t max_parts) {
+	if (max_file_size == 0) {
+		throw InvalidInputException("s3_uploader_max_filesize must be greater than zero");
+	}
+	if (max_parts == 0 || max_parts > MAX_MULTIPART_PARTS) {
+		throw InvalidInputException("s3_uploader_max_parts_per_file must be between 1 and 10000");
+	}
+	const auto supported_file_size = NumericCast<uint64_t>(MAX_MULTIPART_PART_SIZE) * max_parts;
+	if (max_file_size > supported_file_size) {
+		throw InvalidInputException(
+		    "s3_uploader_max_filesize exceeds the size supported by s3_uploader_max_parts_per_file");
+	}
+
+	S3UploadConfig result;
+	result.max_file_size = max_file_size;
+	result.max_parts = NumericCast<idx_t>(max_parts);
+	result.growth_interval = (result.max_parts + PART_SIZE_TIERS - 1) / PART_SIZE_TIERS;
+	result.initial_part_size = S3UploadSizing::InitialPartSize(max_file_size, result.max_parts, result.growth_interval);
+	return result;
+}
+
 S3UploadConfig S3UploadConfig::ReadFrom(optional_ptr<FileOpener> opener) {
 	uint64_t uploader_max_filesize;
 	uint64_t max_parts_per_file;
@@ -22,23 +95,18 @@ S3UploadConfig S3UploadConfig::ReadFrom(optional_ptr<FileOpener> opener) {
 	} else {
 		max_parts_per_file = S3UploadConfig::DEFAULT_MAX_PARTS_PER_FILE;
 	}
-	if (max_parts_per_file == 0) {
-		throw InvalidInputException("s3_uploader_max_parts_per_file must be greater than zero");
-	}
+	return Create(uploader_max_filesize, max_parts_per_file);
+}
 
-	const auto required_part_size =
-	    uploader_max_filesize / max_parts_per_file + (uploader_max_filesize % max_parts_per_file != 0);
-	const auto minimum_part_size = MaxValue<uint64_t>(S3UploadConfig::MIN_MULTIPART_PART_SIZE, required_part_size);
-	const auto block_size = NumericCast<uint64_t>(Storage::DEFAULT_BLOCK_SIZE);
-	if (minimum_part_size > NumericLimits<uint64_t>::Maximum() - (block_size - 1)) {
-		throw InvalidInputException("The configured S3 upload size is too large");
-	}
-	const auto aggregation_threshold = ((minimum_part_size + block_size - 1) / block_size) * block_size;
-	if (aggregation_threshold > S3UploadConfig::MAX_MULTIPART_PART_SIZE) {
-		throw InvalidInputException("The configured S3 upload aggregation threshold exceeds the 5 GiB S3 part limit");
-	}
-	D_ASSERT(aggregation_threshold >= required_part_size);
-	return {NumericCast<idx_t>(aggregation_threshold), NumericCast<idx_t>(max_parts_per_file)};
+idx_t S3UploadConfig::PartSize(idx_t completed_parts) const {
+	D_ASSERT(initial_part_size >= MIN_MULTIPART_PART_SIZE);
+	D_ASSERT(initial_part_size <= MAX_MULTIPART_PART_SIZE);
+	D_ASSERT(growth_interval > 0);
+	return S3UploadSizing::PartSize(initial_part_size, growth_interval, completed_parts);
+}
+
+bool S3UploadConfig::HasPartCapacity(idx_t completed_parts) const {
+	return completed_parts < max_parts;
 }
 
 void S3Settings::Register(DBConfig &config) {
@@ -57,9 +125,8 @@ void S3Settings::Register(DBConfig &config) {
 	    "s3_allow_recursive_globbing",
 	    "Whether globs on S3-like storage are optimized with recursive strategy (alternative is listing)",
 	    LogicalType::BOOLEAN, Value(true));
-	config.AddExtensionOption("s3_uploader_max_filesize", "S3 Uploader max filesize (between 50GB and 5TB)",
-	                          LogicalType::VARCHAR, "80GB");
-	config.AddExtensionOption("s3_uploader_max_parts_per_file", "S3 Uploader max parts per file (between 1 and 10000)",
+	config.AddExtensionOption("s3_uploader_max_filesize", "Maximum size of an S3 upload", LogicalType::VARCHAR, "80GB");
+	config.AddExtensionOption("s3_uploader_max_parts_per_file", "Maximum number of parts in an S3 multipart upload",
 	                          LogicalType::UBIGINT, Value::UBIGINT(10000));
 	config.AddExtensionOption("s3_version_id_pinning", "Pin S3 reads to a specific object version for consistency",
 	                          LogicalType::BOOLEAN, Value(false));

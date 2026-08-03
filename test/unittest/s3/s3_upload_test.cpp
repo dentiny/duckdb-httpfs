@@ -18,9 +18,7 @@ namespace duckdb {
 namespace {
 
 struct S3UploadTest {
-	static constexpr idx_t AGGREGATION_THRESHOLD =
-	    ((S3UploadConfig::MIN_MULTIPART_PART_SIZE + Storage::DEFAULT_BLOCK_SIZE - 1) / Storage::DEFAULT_BLOCK_SIZE) *
-	    Storage::DEFAULT_BLOCK_SIZE;
+	static constexpr idx_t INITIAL_PART_SIZE = S3UploadConfig::MIN_MULTIPART_PART_SIZE;
 
 	template <class CALLBACK>
 	static string RequireError(CALLBACK callback) {
@@ -254,7 +252,7 @@ struct S3UploadTest {
 		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size());
 		auto before_close = server.Observations();
 		INFO(MockS3DescribeObservations(before_close));
-		if (payload_size <= AGGREGATION_THRESHOLD) {
+		if (payload_size <= INITIAL_PART_SIZE) {
 			REQUIRE(Count(before_close, "PUT") == 0);
 			REQUIRE(Count(before_close, "POST") == 0);
 		} else {
@@ -269,7 +267,7 @@ struct S3UploadTest {
 		auto observations = server.Observations();
 		INFO(MockS3DescribeObservations(observations));
 		REQUIRE(server.UploadedObject() == payload);
-		if (payload_size <= AGGREGATION_THRESHOLD) {
+		if (payload_size <= INITIAL_PART_SIZE) {
 			REQUIRE(Count(observations, "PUT") == 1);
 			REQUIRE(Count(observations, "POST") == 0);
 		} else {
@@ -290,20 +288,20 @@ struct S3UploadTest {
 		Connection con(db);
 		Configure(db, con, server, client_implementation);
 
-		auto payload = CreatePayload(AGGREGATION_THRESHOLD + 1);
+		auto payload = CreatePayload(INITIAL_PART_SIZE + 1);
 		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
 		auto handle = OpenWriter(con);
-		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), AGGREGATION_THRESHOLD);
+		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), INITIAL_PART_SIZE);
 		auto after_first_write = server.Observations();
 		INFO(MockS3DescribeObservations(after_first_write));
 		REQUIRE(Count(after_first_write, "PUT") == 0);
 		REQUIRE(Count(after_first_write, "POST") == 0);
 
-		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()) + AGGREGATION_THRESHOLD, 1);
+		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()) + INITIAL_PART_SIZE, 1);
 		auto after_second_write = server.Observations();
 		INFO(MockS3DescribeObservations(after_second_write));
 		REQUIRE(Count(after_second_write, "POST", "uploads") == 1);
-		RequirePartSizes(after_second_write, {AGGREGATION_THRESHOLD});
+		RequirePartSizes(after_second_write, {INITIAL_PART_SIZE});
 
 		handle->Close();
 		handle.reset();
@@ -312,7 +310,7 @@ struct S3UploadTest {
 		auto observations = server.Observations();
 		INFO(MockS3DescribeObservations(observations));
 		REQUIRE(server.UploadedObject() == payload);
-		RequirePartSizes(observations, {AGGREGATION_THRESHOLD, 1});
+		RequirePartSizes(observations, {INITIAL_PART_SIZE, 1});
 	}
 
 	static void RunBufferedPrefix(const string &client_implementation) {
@@ -335,7 +333,7 @@ struct S3UploadTest {
 		REQUIRE(server.Observations().empty());
 		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()) + prefix_size, second_write_size);
 		RequirePartSizes(server.Observations(),
-		                 {AGGREGATION_THRESHOLD, prefix_size + second_write_size - AGGREGATION_THRESHOLD});
+		                 {INITIAL_PART_SIZE, prefix_size + second_write_size - INITIAL_PART_SIZE});
 		handle->Close();
 		handle.reset();
 		S3TestHelper::RequireQueryOk(con, "COMMIT");
@@ -343,8 +341,7 @@ struct S3UploadTest {
 		auto observations = server.Observations();
 		INFO(MockS3DescribeObservations(observations));
 		REQUIRE(server.UploadedObject() == payload);
-		RequirePartSizes(observations,
-		                 {AGGREGATION_THRESHOLD, prefix_size + second_write_size - AGGREGATION_THRESHOLD});
+		RequirePartSizes(observations, {INITIAL_PART_SIZE, prefix_size + second_write_size - INITIAL_PART_SIZE});
 	}
 
 	static void RunFragmentedMultipart(const string &client_implementation) {
@@ -359,8 +356,8 @@ struct S3UploadTest {
 		Configure(db, con, server, client_implementation);
 
 		auto payload = CreateMultipartPayload();
-		const vector<idx_t> write_sizes {1, AGGREGATION_THRESHOLD - 2, 3, AGGREGATION_THRESHOLD,
-		                                 payload.size() - 2 * AGGREGATION_THRESHOLD - 2};
+		const vector<idx_t> write_sizes {1, INITIAL_PART_SIZE - 2, 3, INITIAL_PART_SIZE,
+		                                 payload.size() - 2 * INITIAL_PART_SIZE - 2};
 		idx_t offset = 0;
 		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
 		auto handle = OpenWriter(con);
@@ -379,8 +376,7 @@ struct S3UploadTest {
 		REQUIRE(Count(observations, "POST", "uploads") == 1);
 		REQUIRE(Count(observations, "POST", "uploadId") == 1);
 		REQUIRE(Count(observations, "PUT", "partNumber") == 3);
-		RequirePartSizes(observations,
-		                 {AGGREGATION_THRESHOLD, AGGREGATION_THRESHOLD, payload.size() - 2 * AGGREGATION_THRESHOLD});
+		RequirePartSizes(observations, {INITIAL_PART_SIZE, INITIAL_PART_SIZE, payload.size() - 2 * INITIAL_PART_SIZE});
 	}
 
 	static void RunAsyncWriter(const string &client_implementation, idx_t async_threads) {
@@ -411,6 +407,126 @@ struct S3UploadTest {
 		REQUIRE(Count(observations, "POST", "uploads") == 1);
 		REQUIRE(Count(observations, "POST", "uploadId") == 1);
 		RequirePartSizes(observations, {payload.size()});
+	}
+
+	static void RunAdaptivePartSizes(const string &client_implementation) {
+		MockS3ServerConfig config;
+		config.object.bucket = S3TestHelper::BUCKET;
+		config.object.key = S3TestHelper::OBJECT_KEY;
+		config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+		MockS3Server server(std::move(config));
+
+		DuckDB db(nullptr);
+		Connection con(db);
+		Configure(db, con, server, client_implementation);
+		S3TestHelper::RequireQueryOk(con, "SET s3_uploader_max_parts_per_file=11");
+		S3TestHelper::RequireQueryOk(con, "SET s3_uploader_max_filesize='16MiB'");
+
+		const vector<idx_t> write_sizes {5ULL * 1024ULL * 1024ULL, 5ULL * 1024ULL * 1024ULL, 5ULL * 1024ULL * 1024ULL,
+		                                 1ULL * 1024ULL * 1024ULL};
+		auto payload = CreatePayload(16ULL * 1024ULL * 1024ULL);
+		idx_t offset = 0;
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		auto handle = OpenWriter(con);
+		for (auto write_size : write_sizes) {
+			handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()) + offset, write_size);
+			offset += write_size;
+		}
+		handle->Close();
+		handle.reset();
+		S3TestHelper::RequireQueryOk(con, "COMMIT");
+
+		auto observations = server.Observations();
+		INFO(MockS3DescribeObservations(observations));
+		REQUIRE(server.UploadedObject() == payload);
+		RequirePartSizes(observations, {5ULL * 1024ULL * 1024ULL, 10ULL * 1024ULL * 1024ULL, 1ULL * 1024ULL * 1024ULL});
+	}
+
+	static void RunExactFileSizeLimit(const string &client_implementation) {
+		MockS3ServerConfig config;
+		config.object.bucket = S3TestHelper::BUCKET;
+		config.object.key = S3TestHelper::OBJECT_KEY;
+		config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+		MockS3Server server(std::move(config));
+
+		DuckDB db(nullptr);
+		Connection con(db);
+		Configure(db, con, server, client_implementation);
+		S3TestHelper::RequireQueryOk(con, "SET s3_uploader_max_filesize='1MiB'");
+
+		auto payload = CreatePayload(1ULL * 1024ULL * 1024ULL);
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		auto handle = OpenWriter(con);
+		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size());
+		handle->Close();
+		handle.reset();
+		S3TestHelper::RequireQueryOk(con, "COMMIT");
+
+		auto observations = server.Observations();
+		INFO(MockS3DescribeObservations(observations));
+		REQUIRE(server.UploadedObject() == payload);
+		REQUIRE(Count(observations, "PUT") == 1);
+		REQUIRE(Count(observations, "POST") == 0);
+	}
+
+	static void RunFileSizeLimitBeforeHTTP(const string &client_implementation) {
+		MockS3ServerConfig config;
+		config.object.bucket = S3TestHelper::BUCKET;
+		config.object.key = S3TestHelper::OBJECT_KEY;
+		config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+		MockS3Server server(std::move(config));
+
+		DuckDB db(nullptr);
+		Connection con(db);
+		Configure(db, con, server, client_implementation);
+		S3TestHelper::RequireQueryOk(con, "SET s3_uploader_max_filesize='1MiB'");
+
+		auto payload = CreatePayload(1ULL * 1024ULL * 1024ULL + 1);
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		auto handle = OpenWriter(con);
+		auto first_error = RequireError(
+		    [&]() { handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size()); });
+		auto second_error = RequireError([&]() { handle->Close(); });
+		REQUIRE(second_error == first_error);
+		handle.reset();
+		S3TestHelper::RequireQueryOk(con, "ROLLBACK");
+
+		INFO(MockS3DescribeObservations(server.Observations()));
+		REQUIRE(server.Observations().empty());
+	}
+
+	static void RunFileSizeLimitAfterMultipart(const string &client_implementation) {
+		MockS3ServerConfig config;
+		config.object.bucket = S3TestHelper::BUCKET;
+		config.object.key = S3TestHelper::OBJECT_KEY;
+		config.auth.refresh_target = MockS3RefreshTarget::HEAD;
+		MockS3Server server(std::move(config));
+
+		DuckDB db(nullptr);
+		Connection con(db);
+		Configure(db, con, server, client_implementation);
+		S3TestHelper::RequireQueryOk(con, "SET s3_uploader_max_filesize='6MiB'");
+
+		auto payload = CreatePayload(INITIAL_PART_SIZE + 1);
+		auto excessive_tail = CreatePayload(1ULL * 1024ULL * 1024ULL);
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		auto handle = OpenWriter(con);
+		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), INITIAL_PART_SIZE);
+		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()) + INITIAL_PART_SIZE, 1);
+		auto first_error = RequireError([&]() {
+			handle->Write(QueryContext(*con.context), data_ptr_cast(excessive_tail.data()), excessive_tail.size());
+		});
+		auto second_error = RequireError([&]() { handle->Close(); });
+		REQUIRE(second_error == first_error);
+		handle.reset();
+		S3TestHelper::RequireQueryOk(con, "ROLLBACK");
+
+		auto observations = server.Observations();
+		INFO(MockS3DescribeObservations(observations));
+		REQUIRE(Count(observations, "POST", "uploads") == 1);
+		REQUIRE(Count(observations, "POST", "uploadId") == 0);
+		REQUIRE(Count(observations, "PUT", "partNumber") == 1);
+		REQUIRE(Count(observations, "DELETE", "uploadId") == 1);
 	}
 
 	static void RunStableSinglePutFailure(const string &client_implementation) {
@@ -542,17 +658,17 @@ struct S3UploadTest {
 		SECTION("multipart upload") {
 			RunMultipart(client_implementation);
 		}
-		SECTION("write below aggregation threshold") {
-			RunWholeWriteGeometry(client_implementation, AGGREGATION_THRESHOLD - 1);
+		SECTION("write below initial part size") {
+			RunWholeWriteGeometry(client_implementation, INITIAL_PART_SIZE - 1);
 		}
-		SECTION("write at aggregation threshold") {
-			RunWholeWriteGeometry(client_implementation, AGGREGATION_THRESHOLD);
+		SECTION("write at initial part size") {
+			RunWholeWriteGeometry(client_implementation, INITIAL_PART_SIZE);
 		}
-		SECTION("write above aggregation threshold") {
-			RunWholeWriteGeometry(client_implementation, AGGREGATION_THRESHOLD + 1);
+		SECTION("write above initial part size") {
+			RunWholeWriteGeometry(client_implementation, INITIAL_PART_SIZE + 1);
 		}
-		SECTION("write at twice the aggregation threshold") {
-			RunWholeWriteGeometry(client_implementation, 2 * AGGREGATION_THRESHOLD);
+		SECTION("write at twice the initial part size") {
+			RunWholeWriteGeometry(client_implementation, 2 * INITIAL_PART_SIZE);
 		}
 		SECTION("full part lookbehind") {
 			RunFullPartLookbehind(client_implementation);
@@ -571,6 +687,18 @@ struct S3UploadTest {
 		}
 		SECTION("multi-worker async writer multipart upload") {
 			RunAsyncWriter(client_implementation, 2);
+		}
+		SECTION("adaptive part sizes") {
+			RunAdaptivePartSizes(client_implementation);
+		}
+		SECTION("exact file size limit") {
+			RunExactFileSizeLimit(client_implementation);
+		}
+		SECTION("file size limit before HTTP") {
+			RunFileSizeLimitBeforeHTTP(client_implementation);
+		}
+		SECTION("file size limit after multipart initialization") {
+			RunFileSizeLimitAfterMultipart(client_implementation);
 		}
 		SECTION("stable single PUT failure") {
 			RunStableSinglePutFailure(client_implementation);
