@@ -240,6 +240,7 @@ struct MockS3Server::Impl {
 
 	~Impl() {
 		ReleasePartUploads();
+		ReleaseMultipartInitialization();
 		server.stop();
 		if (server_thread.joinable()) {
 			server_thread.join();
@@ -286,12 +287,35 @@ struct MockS3Server::Impl {
 		                                    });
 	}
 
+	void ReleasePartUpload(idx_t part_number) DUCKDB_EXCLUDES(upload_lock) {
+		{
+			annotated_lock_guard<annotated_mutex> lock(upload_lock);
+			released_part_numbers.insert(part_number);
+		}
+		part_upload_release.notify_all();
+	}
+
 	void ReleasePartUploads() DUCKDB_EXCLUDES(upload_lock) {
 		{
 			annotated_lock_guard<annotated_mutex> lock(upload_lock);
 			part_uploads_released = true;
 		}
 		part_upload_release.notify_all();
+	}
+
+	bool WaitForMultipartInitialization() DUCKDB_EXCLUDES(initialization_lock) {
+		annotated_unique_lock<annotated_mutex> lock(initialization_lock);
+		return initialization_started.wait_for(
+		    lock, std::chrono::seconds(5),
+		    [this]() DUCKDB_REQUIRES(initialization_lock) { return initialization_seen; });
+	}
+
+	void ReleaseMultipartInitialization() DUCKDB_EXCLUDES(initialization_lock) {
+		{
+			annotated_lock_guard<annotated_mutex> lock(initialization_lock);
+			initialization_released = true;
+		}
+		initialization_release.notify_all();
 	}
 
 	bool WaitForFullGet() DUCKDB_EXCLUDES(full_get_lock) {
@@ -497,6 +521,14 @@ struct MockS3Server::Impl {
 
 	void SendMultipartPost(const httplib::Request &request, httplib::Response &response) {
 		if (request.target.find("uploads") != string::npos) {
+			if (config.upload.block_initialization) {
+				annotated_unique_lock<annotated_mutex> lock(initialization_lock);
+				initialization_seen = true;
+				initialization_started.notify_all();
+				initialization_release.wait_for(
+				    lock, std::chrono::seconds(30),
+				    [this]() DUCKDB_REQUIRES(initialization_lock) { return initialization_released; });
+			}
 			switch (config.upload.initialization_behavior) {
 			case MockS3MultipartInitializationBehavior::SUCCESS:
 				response.status = 200;
@@ -601,8 +633,10 @@ struct MockS3Server::Impl {
 			return;
 		}
 		annotated_unique_lock<annotated_mutex> lock(upload_lock);
-		part_upload_release.wait_for(lock, std::chrono::seconds(30),
-		                             [this]() DUCKDB_REQUIRES(upload_lock) { return part_uploads_released; });
+		part_upload_release.wait_for(
+		    lock, std::chrono::seconds(30), [this, part_number]() DUCKDB_REQUIRES(upload_lock) {
+			    return part_uploads_released || released_part_numbers.find(part_number) != released_part_numbers.end();
+		    });
 	}
 
 	void FinishPartUpload() DUCKDB_EXCLUDES(upload_lock) {
@@ -903,6 +937,12 @@ struct MockS3Server::Impl {
 				SendAuthFailure(request, response);
 				return;
 			}
+			if (part_number.IsValid() &&
+			    std::find(config.upload.failed_part_numbers.begin(), config.upload.failed_part_numbers.end(),
+			              part_number.GetIndex()) != config.upload.failed_part_numbers.end()) {
+				SendS3Error400(request, response, false);
+				return;
+			}
 			if (remaining_put_failures.load() > 0) {
 				remaining_put_failures--;
 				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
@@ -993,6 +1033,7 @@ struct MockS3Server::Impl {
 	mutable annotated_mutex upload_lock;
 	map<idx_t, UploadedPart> uploaded_parts DUCKDB_GUARDED_BY(upload_lock);
 	set<idx_t> parts_seen DUCKDB_GUARDED_BY(upload_lock);
+	set<idx_t> released_part_numbers DUCKDB_GUARDED_BY(upload_lock);
 	string uploaded_object DUCKDB_GUARDED_BY(upload_lock);
 	string completion_body DUCKDB_GUARDED_BY(upload_lock);
 	idx_t active_part_uploads DUCKDB_GUARDED_BY(upload_lock) = 0;
@@ -1000,6 +1041,11 @@ struct MockS3Server::Impl {
 	bool part_uploads_released DUCKDB_GUARDED_BY(upload_lock) = false;
 	std::condition_variable part_upload_started;
 	std::condition_variable part_upload_release;
+	annotated_mutex initialization_lock;
+	std::condition_variable initialization_started;
+	std::condition_variable initialization_release;
+	bool initialization_seen DUCKDB_GUARDED_BY(initialization_lock) = false;
+	bool initialization_released DUCKDB_GUARDED_BY(initialization_lock) = false;
 	annotated_mutex range_request_lock;
 	std::condition_variable range_request_started;
 	idx_t range_requests_seen DUCKDB_GUARDED_BY(range_request_lock) = 0;
@@ -1055,8 +1101,20 @@ bool MockS3Server::WaitForPartUpload(idx_t part_number) {
 	return impl->WaitForPartUpload(part_number);
 }
 
+void MockS3Server::ReleasePartUpload(idx_t part_number) {
+	impl->ReleasePartUpload(part_number);
+}
+
 void MockS3Server::ReleasePartUploads() {
 	impl->ReleasePartUploads();
+}
+
+bool MockS3Server::WaitForMultipartInitialization() {
+	return impl->WaitForMultipartInitialization();
+}
+
+void MockS3Server::ReleaseMultipartInitialization() {
+	impl->ReleaseMultipartInitialization();
 }
 
 bool MockS3Server::WaitForFullGet() {

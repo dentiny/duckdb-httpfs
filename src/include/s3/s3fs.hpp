@@ -66,6 +66,9 @@ public:
 	void RemoveFiles(const vector<string> &filenames, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void FileSync(FileHandle &handle) override;
+	FileWriteMode GetWriteMode(FileHandle &) override {
+		return FileWriteMode::CONCURRENT_SEQUENTIAL;
+	}
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 
 	//! S3 is object storage so directories effectively always exist

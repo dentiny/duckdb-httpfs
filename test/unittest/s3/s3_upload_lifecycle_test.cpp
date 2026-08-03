@@ -7,6 +7,9 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 
+#include <atomic>
+#include <thread>
+
 namespace duckdb {
 
 namespace {
@@ -255,7 +258,7 @@ struct S3UploadLifecycleTest {
 		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size());
 		string extra = "x";
 		auto first_error = RequireError([&]() {
-			handle->Write(QueryContext(*con.context), data_ptr_cast(extra.data()), extra.size(), payload.size() + 1);
+			handle->Write(QueryContext(*con.context), data_ptr_cast(extra.data()), extra.size(), payload.size() - 1);
 		});
 		RequireStableError(*handle, first_error);
 		REQUIRE(StringUtil::Contains(first_error, "S3 writes must be sequential"));
@@ -265,6 +268,73 @@ struct S3UploadLifecycleTest {
 		auto observations = server.Observations();
 		INFO(MockS3DescribeObservations(observations));
 		REQUIRE(Count(observations, "DELETE", "uploadId", optional_idx(204)) == 1);
+		REQUIRE(Count(observations, "POST", "uploadId") == 0);
+	}
+
+	static void RunBlockedInitializationFailure(const string &client_implementation,
+	                                            MockS3MultipartInitializationBehavior behavior, bool expect_abort) {
+		MockS3ServerConfig config;
+		config.object.bucket = S3TestHelper::BUCKET;
+		config.object.key = S3TestHelper::OBJECT_KEY;
+		config.auth.refresh_target = MockS3RefreshTarget::HEAD;
+		config.upload.block_initialization = true;
+		config.upload.initialization_behavior = behavior;
+		MockS3Server server(std::move(config));
+
+		DuckDB db(nullptr);
+		Connection con(db);
+		Configure(db, con, server, client_implementation);
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		auto handle = OpenWriter(con);
+		auto payload = MultipartPayload();
+		string first_error;
+		string second_error;
+		std::atomic<bool> second_started(false);
+		std::atomic<bool> second_finished(false);
+
+		std::thread first([&]() {
+			try {
+				handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size(), 0);
+			} catch (std::exception &ex) {
+				first_error = ex.what();
+			}
+		});
+		auto initialization_started = server.WaitForMultipartInitialization();
+		string duplicate = "x";
+		std::thread second([&]() {
+			second_started.store(true);
+			try {
+				handle->Write(QueryContext(*con.context), data_ptr_cast(duplicate.data()), duplicate.size(), 0);
+			} catch (std::exception &ex) {
+				second_error = ex.what();
+			}
+			second_finished.store(true);
+		});
+		while (!second_started.load()) {
+			std::this_thread::yield();
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		auto second_waited_for_initialization = !second_finished.load();
+		auto observations_before_release = server.Observations();
+		server.ReleaseMultipartInitialization();
+		first.join();
+		second.join();
+
+		REQUIRE(initialization_started);
+		REQUIRE(second_waited_for_initialization);
+		REQUIRE(Count(observations_before_release, "DELETE", "uploadId") == 0);
+		REQUIRE_FALSE(first_error.empty());
+		REQUIRE(first_error == second_error);
+		REQUIRE(StringUtil::Contains(first_error, "S3 writes must be sequential"));
+		RequireStableError(*handle, first_error);
+		handle.reset();
+		S3TestHelper::RequireQueryOk(con, "ROLLBACK");
+
+		auto observations = server.Observations();
+		INFO(MockS3DescribeObservations(observations));
+		REQUIRE(Count(observations, "POST", "uploads") == 1);
+		REQUIRE(Count(observations, "PUT", "partNumber") == 0);
+		REQUIRE(Count(observations, "DELETE", "uploadId") == (expect_abort ? 1 : 0));
 		REQUIRE(Count(observations, "POST", "uploadId") == 0);
 	}
 
@@ -342,6 +412,14 @@ struct S3UploadLifecycleTest {
 		}
 		SECTION("local failures abort active multipart uploads") {
 			RunLocalFailureAbort(client_implementation);
+		}
+		SECTION("late initialization success is aborted after a concurrent local failure") {
+			RunBlockedInitializationFailure(client_implementation, MockS3MultipartInitializationBehavior::SUCCESS,
+			                                true);
+		}
+		SECTION("ambiguous initialization suppresses abort after a concurrent local failure") {
+			RunBlockedInitializationFailure(client_implementation,
+			                                MockS3MultipartInitializationBehavior::MALFORMED_SUCCESS, false);
 		}
 		SECTION("namespaced initialization decodes the upload ID") {
 			RunNamespacedEscapedUploadID(client_implementation);

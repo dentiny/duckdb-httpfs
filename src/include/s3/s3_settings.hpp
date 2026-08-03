@@ -24,8 +24,8 @@ struct S3UploadConfig {
 	static S3UploadConfig Create(uint64_t max_file_size, uint64_t max_parts);
 	static S3UploadConfig ReadFrom(optional_ptr<FileOpener> opener);
 
-	idx_t PartSize(idx_t completed_parts) const;
-	bool HasPartCapacity(idx_t completed_parts) const;
+	idx_t PartSize(idx_t reserved_parts) const;
+	bool HasPartCapacity(idx_t reserved_parts) const;
 };
 
 struct S3Settings {

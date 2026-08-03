@@ -117,6 +117,10 @@ struct MockS3UploadConfig {
 	string upload_id = "refresh-test-upload-id";
 	//! Hold these one-based part numbers until ReleasePartUploads is called
 	vector<idx_t> blocked_part_numbers;
+	//! Fail these one-based part numbers with a non-retryable HTTP 400
+	vector<idx_t> failed_part_numbers;
+	//! Hold multipart initialization until ReleaseMultipartInitialization is called
+	bool block_initialization = false;
 	MockS3MultipartInitializationBehavior initialization_behavior = MockS3MultipartInitializationBehavior::SUCCESS;
 	MockS3MultipartCompletionBehavior completion_behavior = MockS3MultipartCompletionBehavior::SUCCESS;
 	MockS3MultipartAbortBehavior abort_behavior = MockS3MultipartAbortBehavior::SUCCESS;
@@ -173,7 +177,10 @@ public:
 	vector<MockS3RequestObservation> Observations() const;
 	idx_t MaximumConcurrentPartUploads() const;
 	bool WaitForPartUpload(idx_t part_number);
+	void ReleasePartUpload(idx_t part_number);
 	void ReleasePartUploads();
+	bool WaitForMultipartInitialization();
+	void ReleaseMultipartInitialization();
 	bool WaitForFullGet();
 	void ReleaseFullGet();
 

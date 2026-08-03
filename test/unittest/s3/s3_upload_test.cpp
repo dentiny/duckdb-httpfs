@@ -67,6 +67,30 @@ struct S3UploadTest {
 		return result;
 	}
 
+	static bool WaitForPartStatus(MockS3Server &server, idx_t part_number, int status) {
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (std::chrono::steady_clock::now() < deadline) {
+			for (auto &observation : server.Observations()) {
+				if (observation.method == "PUT" && observation.part_number.IsValid() &&
+				    observation.part_number.GetIndex() == part_number && observation.status == status) {
+					return true;
+				}
+			}
+			std::this_thread::yield();
+		}
+		return false;
+	}
+
+	static bool HasPartStatus(MockS3Server &server, idx_t part_number, int status) {
+		for (auto &observation : server.Observations()) {
+			if (observation.method == "PUT" && observation.part_number.IsValid() &&
+			    observation.part_number.GetIndex() == part_number && observation.status == status) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	static void RequirePartSizes(const vector<MockS3RequestObservation> &observations,
 	                             const vector<idx_t> &expected_sizes, const string &upload_id = string()) {
 		auto parts = SuccessfulParts(observations);
@@ -409,6 +433,170 @@ struct S3UploadTest {
 		RequirePartSizes(observations, {payload.size()});
 	}
 
+	static void RunConcurrentAsyncWriter(const string &client_implementation) {
+		MockS3ServerConfig config;
+		config.object.bucket = S3TestHelper::BUCKET;
+		config.object.key = S3TestHelper::OBJECT_KEY;
+		config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+		config.upload.blocked_part_numbers = {1, 2};
+		MockS3Server server(std::move(config));
+
+		DuckDB db(nullptr);
+		Connection con(db);
+		Configure(db, con, server, client_implementation, false);
+		S3TestHelper::RequireQueryOk(con, "SET async_threads=2");
+
+		auto write_size = 16ULL * 1024ULL * 1024ULL + 1;
+		auto payload = CreatePayload(2 * write_size);
+		auto &fs = FileSystem::GetFileSystem(*con.context);
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		AsyncFileWriter writer(*con.context, fs, S3TestHelper::S3_PATH,
+		                       FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+		{
+			auto batch = writer.StartBatch();
+			writer.WriteData(const_data_ptr_cast(payload.data()), write_size);
+			writer.WriteData(const_data_ptr_cast(payload.data()) + write_size, write_size);
+			batch.Finish();
+		}
+
+		auto part_1_started = server.WaitForPartUpload(1);
+		auto part_2_started = server.WaitForPartUpload(2);
+		auto maximum_concurrency = server.MaximumConcurrentPartUploads();
+		server.ReleasePartUpload(2);
+		auto part_2_completed_first = WaitForPartStatus(server, 2, 200);
+		auto part_1_completed_early = HasPartStatus(server, 1, 200);
+		server.ReleasePartUpload(1);
+		writer.Close();
+		S3TestHelper::RequireQueryOk(con, "COMMIT");
+
+		auto observations = server.Observations();
+		INFO(MockS3DescribeObservations(observations));
+		REQUIRE(part_1_started);
+		REQUIRE(part_2_started);
+		REQUIRE(maximum_concurrency == 2);
+		REQUIRE(part_2_completed_first);
+		REQUIRE_FALSE(part_1_completed_early);
+		REQUIRE(server.UploadedObject() == payload);
+		REQUIRE(Count(observations, "POST", "uploads") == 1);
+		REQUIRE(Count(observations, "POST", "uploadId") == 1);
+		RequirePartSizes(observations, {write_size, write_size});
+		const string expected_completion_body =
+		    "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+		    "<Part><ETag>\"mock-part-1\"</ETag><PartNumber>1</PartNumber></Part>"
+		    "<Part><ETag>\"mock-part-2\"</ETag><PartNumber>2</PartNumber></Part>"
+		    "</CompleteMultipartUpload>";
+		REQUIRE(server.CompletionBody() == expected_completion_body);
+	}
+
+	static void RunLaterOffsetFirst(const string &client_implementation) {
+		MockS3ServerConfig config;
+		config.object.bucket = S3TestHelper::BUCKET;
+		config.object.key = S3TestHelper::OBJECT_KEY;
+		config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+		config.upload.blocked_part_numbers = {1, 2};
+		MockS3Server server(std::move(config));
+
+		DuckDB db(nullptr);
+		Connection con(db);
+		Configure(db, con, server, client_implementation);
+		auto write_size = 6ULL * 1024ULL * 1024ULL;
+		auto payload = CreatePayload(2 * write_size);
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		auto handle = OpenWriter(con);
+		std::atomic<bool> later_started(false);
+		std::atomic<bool> later_finished(false);
+		std::exception_ptr later_error;
+		std::exception_ptr earlier_error;
+		std::thread later([&]() {
+			later_started.store(true);
+			try {
+				handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()) + write_size, write_size,
+				              write_size);
+			} catch (...) {
+				later_error = std::current_exception();
+			}
+			later_finished.store(true);
+		});
+		while (!later_started.load()) {
+			std::this_thread::yield();
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		auto later_waited_for_admission = !later_finished.load() && server.Observations().empty();
+		std::thread earlier([&]() {
+			try {
+				handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), write_size, 0);
+			} catch (...) {
+				earlier_error = std::current_exception();
+			}
+		});
+
+		auto part_1_started = server.WaitForPartUpload(1);
+		auto part_2_started = server.WaitForPartUpload(2);
+		server.ReleasePartUpload(2);
+		auto part_2_completed_first = WaitForPartStatus(server, 2, 200);
+		server.ReleasePartUpload(1);
+		earlier.join();
+		later.join();
+		if (earlier_error) {
+			std::rethrow_exception(earlier_error);
+		}
+		if (later_error) {
+			std::rethrow_exception(later_error);
+		}
+		handle->Close();
+		handle.reset();
+		S3TestHelper::RequireQueryOk(con, "COMMIT");
+
+		INFO(MockS3DescribeObservations(server.Observations()));
+		REQUIRE(later_waited_for_admission);
+		REQUIRE(part_1_started);
+		REQUIRE(part_2_started);
+		REQUIRE(part_2_completed_first);
+		REQUIRE(server.UploadedObject() == payload);
+	}
+
+	static void RunConcurrentPartFailure(const string &client_implementation) {
+		MockS3ServerConfig config;
+		config.object.bucket = S3TestHelper::BUCKET;
+		config.object.key = S3TestHelper::OBJECT_KEY;
+		config.auth.refresh_target = MockS3RefreshTarget::HEAD;
+		config.upload.blocked_part_numbers = {1};
+		config.upload.failed_part_numbers = {2};
+		MockS3Server server(std::move(config));
+
+		DuckDB db(nullptr);
+		Connection con(db);
+		Configure(db, con, server, client_implementation, false);
+		S3TestHelper::RequireQueryOk(con, "SET async_threads=2");
+		auto write_size = 16ULL * 1024ULL * 1024ULL + 1;
+		auto payload = CreatePayload(2 * write_size);
+		auto &fs = FileSystem::GetFileSystem(*con.context);
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		AsyncFileWriter writer(*con.context, fs, S3TestHelper::S3_PATH,
+		                       FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+		writer.WriteData(const_data_ptr_cast(payload.data()), write_size);
+		auto part_1_started = server.WaitForPartUpload(1);
+		writer.WriteData(const_data_ptr_cast(payload.data()) + write_size, write_size);
+		auto part_2_started = server.WaitForPartUpload(2);
+		auto part_2_failed = WaitForPartStatus(server, 2, 400);
+		auto observations_before_release = server.Observations();
+		server.ReleasePartUpload(1);
+		auto first_error = RequireError([&]() { writer.Close(); });
+		auto second_error = RequireError([&]() { writer.Close(); });
+		S3TestHelper::RequireQueryOk(con, "ROLLBACK");
+
+		auto observations = server.Observations();
+		INFO(MockS3DescribeObservations(observations));
+		REQUIRE(part_1_started);
+		REQUIRE(part_2_started);
+		REQUIRE(part_2_failed);
+		REQUIRE(Count(observations_before_release, "DELETE", "uploadId") == 0);
+		REQUIRE(first_error == second_error);
+		REQUIRE(Count(observations, "DELETE", "uploadId") == 1);
+		REQUIRE(Count(observations, "POST", "uploadId") == 0);
+		REQUIRE(server.MaximumConcurrentPartUploads() == 2);
+	}
+
 	static void RunAdaptivePartSizes(const string &client_implementation) {
 		MockS3ServerConfig config;
 		config.object.bucket = S3TestHelper::BUCKET;
@@ -621,7 +809,7 @@ struct S3UploadTest {
 		REQUIRE(Count(observations, "DELETE", "uploadId") == 1);
 	}
 
-	static void RunOutOfOrderFailure(const string &client_implementation) {
+	static void RunDuplicateOffsetFailure(const string &client_implementation) {
 		MockS3ServerConfig config;
 		config.object.bucket = S3TestHelper::BUCKET;
 		config.object.key = S3TestHelper::OBJECT_KEY;
@@ -635,8 +823,9 @@ struct S3UploadTest {
 		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
 		auto handle = OpenWriter(con);
 		string payload = "out of order";
+		handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), 1);
 		auto first_error = RequireError(
-		    [&]() { handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size(), 1); });
+		    [&]() { handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size(), 0); });
 		auto second_error = RequireError([&]() { handle->Close(); });
 		REQUIRE(second_error == first_error);
 		handle.reset();
@@ -688,6 +877,15 @@ struct S3UploadTest {
 		SECTION("multi-worker async writer multipart upload") {
 			RunAsyncWriter(client_implementation, 2);
 		}
+		SECTION("multi-worker async writer overlaps ordered parts") {
+			RunConcurrentAsyncWriter(client_implementation);
+		}
+		SECTION("later offsets wait for ordered admission") {
+			RunLaterOffsetFirst(client_implementation);
+		}
+		SECTION("part failures wait for active requests before abort") {
+			RunConcurrentPartFailure(client_implementation);
+		}
 		SECTION("adaptive part sizes") {
 			RunAdaptivePartSizes(client_implementation);
 		}
@@ -709,8 +907,8 @@ struct S3UploadTest {
 		SECTION("stable part failure") {
 			RunStablePartFailure(client_implementation);
 		}
-		SECTION("out-of-order failure") {
-			RunOutOfOrderFailure(client_implementation);
+		SECTION("duplicate offset failure") {
+			RunDuplicateOffsetFailure(client_implementation);
 		}
 	}
 };

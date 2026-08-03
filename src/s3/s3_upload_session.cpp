@@ -45,15 +45,23 @@ S3UploadSession::WriteClaim::WriteClaim(WriteClaim &&other) noexcept
 }
 
 S3UploadSession::WriteClaim::~WriteClaim() {
-	Finish();
+	if (!finished) {
+		session.get().ReleaseWriteNoThrow();
+	}
 }
 
 void S3UploadSession::WriteClaim::Finish() {
 	if (finished) {
 		return;
 	}
-	session.get().ReleaseWrite();
 	finished = true;
+	session.get().ReleaseWrite();
+}
+
+void S3UploadSession::WriteClaim::Fail(ErrorData error, FailureDisposition disposition) {
+	D_ASSERT(!finished);
+	finished = true;
+	session.get().FailOperation(std::move(error), disposition);
 }
 
 S3UploadSession::S3UploadSession(S3FileSystem &s3fs_p, shared_ptr<HTTPRequestSession> request_session_p, string path_p,
@@ -65,7 +73,6 @@ S3UploadSession::S3UploadSession(S3FileSystem &s3fs_p, shared_ptr<HTTPRequestSes
 S3UploadSession::~S3UploadSession() noexcept = default;
 
 S3UploadSession::FailureSnapshot S3UploadSession::CaptureFailure() const DUCKDB_REQUIRES(state_lock) {
-	D_ASSERT(state == State::FAILED || state == State::AMBIGUOUS);
 	D_ASSERT(primary_failure.primary_error);
 	return primary_failure;
 }
@@ -79,54 +86,30 @@ void S3UploadSession::ThrowFailure(const FailureSnapshot &failure) {
 	                failure.primary_error->RawMessage() + "\n\nAdditionally, " + failure.abort_error->RawMessage());
 }
 
-unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginWrite(idx_t location, idx_t size)
-    DUCKDB_EXCLUDES(state_lock) {
-	enum class LocalFailure : uint8_t { NONE, NON_SEQUENTIAL_WRITE, FILE_SIZE_LIMIT };
-
-	const char *error_message = nullptr;
+void S3UploadSession::BeginWriteOperation() DUCKDB_EXCLUDES(state_lock) {
 	FailureSnapshot failure;
-	LocalFailure local_failure = LocalFailure::NONE;
-	idx_t expected_offset = 0;
-	unique_ptr<BufferedPart> result;
+	const char *error_message = nullptr;
 	{
-		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		if (operation != Operation::NONE) {
-			error_message = "Concurrent S3 upload operations are not supported";
-		} else if (state == State::FAILED || state == State::AMBIGUOUS) {
+		annotated_unique_lock<annotated_mutex> guard(state_lock);
+		while (primary_failure.primary_error && cleanup_state != CleanupState::COMPLETE) {
+			state_changed.wait(guard);
+		}
+		if (primary_failure.primary_error) {
 			failure = CaptureFailure();
-		} else if (state == State::FINALIZED) {
+		} else if (finalizing) {
+			error_message = "Concurrent S3 upload operations are not supported";
+		} else if (finalized) {
 			error_message = "Cannot write to a finalized S3 upload";
-		} else if (location != next_offset) {
-			operation = Operation::WRITE;
-			local_failure = LocalFailure::NON_SEQUENTIAL_WRITE;
-			expected_offset = next_offset;
-		} else if (size > config.max_file_size - next_offset) {
-			operation = Operation::WRITE;
-			local_failure = LocalFailure::FILE_SIZE_LIMIT;
 		} else {
-			operation = Operation::WRITE;
-			result = std::move(buffered_part);
+			active_operations++;
 		}
 	}
 	if (failure.primary_error) {
 		ThrowFailure(failure);
 	}
-	if (local_failure == LocalFailure::NON_SEQUENTIAL_WRITE) {
-		FailOperation(ErrorData(ExceptionType::IO,
-		                        StringUtil::Format("S3 writes must be sequential: expected offset %llu, got %llu",
-		                                           expected_offset, location)),
-		              FailureDisposition::DEFINITIVE);
-	}
-	if (local_failure == LocalFailure::FILE_SIZE_LIMIT) {
-		FailOperation(ErrorData(ExceptionType::IO,
-		                        StringUtil::Format("S3 upload exceeds the configured maximum file size of %llu bytes",
-		                                           config.max_file_size)),
-		              FailureDisposition::DEFINITIVE);
-	}
 	if (error_message) {
 		throw IOException(error_message);
 	}
-	return result;
 }
 
 unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginFinalize(bool &already_finalized)
@@ -136,15 +119,19 @@ unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginFinalize(bool &a
 	unique_ptr<BufferedPart> result;
 	already_finalized = false;
 	{
-		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		if (operation != Operation::NONE) {
-			error_message = "Concurrent S3 upload operations are not supported";
-		} else if (state == State::FAILED || state == State::AMBIGUOUS) {
+		annotated_unique_lock<annotated_mutex> guard(state_lock);
+		while (primary_failure.primary_error && cleanup_state != CleanupState::COMPLETE) {
+			state_changed.wait(guard);
+		}
+		if (primary_failure.primary_error) {
 			failure = CaptureFailure();
-		} else if (state == State::FINALIZED) {
+		} else if (finalizing || active_operations > 0) {
+			error_message = "Concurrent S3 upload operations are not supported";
+		} else if (finalized) {
 			already_finalized = true;
 		} else {
-			operation = Operation::FINALIZE;
+			finalizing = true;
+			active_operations++;
 			result = std::move(buffered_part);
 		}
 	}
@@ -157,58 +144,102 @@ unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginFinalize(bool &a
 	return result;
 }
 
-void S3UploadSession::StoreWriteResult(unique_ptr<BufferedPart> buffered_part_p, idx_t size)
-    DUCKDB_EXCLUDES(state_lock) {
-	annotated_lock_guard<annotated_mutex> guard(state_lock);
-	D_ASSERT(operation == Operation::WRITE);
-	D_ASSERT(state == State::OPEN || state == State::MULTIPART_ACTIVE);
-	D_ASSERT(!buffered_part);
-	buffered_part = std::move(buffered_part_p);
-	next_offset += size;
+void S3UploadSession::ReleaseWrite() DUCKDB_EXCLUDES(state_lock) {
+	ReleaseOperation(true);
 }
 
-void S3UploadSession::ReleaseWrite() DUCKDB_EXCLUDES(state_lock) {
-	annotated_lock_guard<annotated_mutex> guard(state_lock);
-	D_ASSERT(operation == Operation::WRITE);
-	operation = Operation::NONE;
+void S3UploadSession::ReleaseWriteNoThrow() noexcept DUCKDB_EXCLUDES(state_lock) {
+	try {
+		ReleaseOperation(false);
+	} catch (...) {
+	}
 }
 
 void S3UploadSession::FinishFinalize() DUCKDB_EXCLUDES(state_lock) {
 	annotated_lock_guard<annotated_mutex> guard(state_lock);
-	D_ASSERT(operation == Operation::FINALIZE);
-	state = State::FINALIZED;
-	operation = Operation::NONE;
+	D_ASSERT(finalizing);
+	D_ASSERT(active_operations == 1);
+	active_operations--;
+	finalizing = false;
+	finalized = true;
+	state_changed.notify_all();
 }
 
-void S3UploadSession::FailOperation(ErrorData error, FailureDisposition disposition) DUCKDB_EXCLUDES(state_lock) {
+void S3UploadSession::LatchFailureLocked(shared_ptr<const ErrorData> error, FailureDisposition disposition)
+    DUCKDB_REQUIRES(state_lock) {
+	if (!primary_failure.primary_error) {
+		primary_failure.primary_error = std::move(error);
+		failure_disposition = disposition;
+	}
+	if (disposition == FailureDisposition::AMBIGUOUS) {
+		abort_suppressed = true;
+	}
+	finalizing = false;
+	state_changed.notify_all();
+}
+
+void S3UploadSession::LatchFailure(ErrorData error, FailureDisposition disposition) DUCKDB_EXCLUDES(state_lock) {
 	auto stored_error = make_shared_ptr<const ErrorData>(std::move(error));
-	shared_ptr<const string> upload_id;
-	FailureSnapshot failure;
 	{
 		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		if (state != State::FAILED && state != State::AMBIGUOUS) {
-			D_ASSERT(!primary_failure.primary_error);
-			primary_failure.primary_error = std::move(stored_error);
-			state = disposition == FailureDisposition::DEFINITIVE ? State::FAILED : State::AMBIGUOUS;
-			if (state == State::FAILED) {
+		LatchFailureLocked(std::move(stored_error), disposition);
+	}
+}
+
+void S3UploadSession::ReleaseOperation(bool rethrow_failure) DUCKDB_EXCLUDES(state_lock) {
+	shared_ptr<const string> upload_id;
+	bool cleanup_owner = false;
+	FailureSnapshot failure;
+	{
+		annotated_unique_lock<annotated_mutex> guard(state_lock);
+		D_ASSERT(active_operations > 0);
+		active_operations--;
+		state_changed.notify_all();
+		if (!primary_failure.primary_error) {
+			return;
+		}
+
+		if (active_operations == 0 && cleanup_state == CleanupState::NONE) {
+			if (failure_disposition == FailureDisposition::DEFINITIVE && multipart_upload_id && !abort_suppressed) {
+				cleanup_state = CleanupState::IN_PROGRESS;
 				upload_id = multipart_upload_id;
+				cleanup_owner = true;
+			} else {
+				cleanup_state = CleanupState::COMPLETE;
+				state_changed.notify_all();
 			}
+		}
+		while (!cleanup_owner && cleanup_state != CleanupState::COMPLETE) {
+			state_changed.wait(guard);
+		}
+		if (!cleanup_owner) {
+			failure = CaptureFailure();
 		}
 	}
 
 	shared_ptr<const ErrorData> abort_error;
-	if (upload_id) {
+	if (cleanup_owner) {
+		D_ASSERT(upload_id);
 		abort_error = AbortMultipartUpload(*upload_id);
-	}
-	{
-		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		if (abort_error && !primary_failure.abort_error) {
-			primary_failure.abort_error = std::move(abort_error);
+		{
+			annotated_lock_guard<annotated_mutex> guard(state_lock);
+			if (abort_error && !primary_failure.abort_error) {
+				primary_failure.abort_error = std::move(abort_error);
+			}
+			cleanup_state = CleanupState::COMPLETE;
+			failure = CaptureFailure();
+			state_changed.notify_all();
 		}
-		operation = Operation::NONE;
-		failure = CaptureFailure();
 	}
-	ThrowFailure(failure);
+	if (rethrow_failure) {
+		ThrowFailure(failure);
+	}
+}
+
+void S3UploadSession::FailOperation(ErrorData error, FailureDisposition disposition) DUCKDB_EXCLUDES(state_lock) {
+	LatchFailure(std::move(error), disposition);
+	ReleaseOperation(true);
+	throw InternalException("Failed S3 operation did not rethrow its error");
 }
 
 shared_ptr<const ErrorData> S3UploadSession::AbortMultipartUpload(const string &upload_id) {
@@ -230,8 +261,7 @@ shared_ptr<const ErrorData> S3UploadSession::AbortMultipartUpload(const string &
 	}
 }
 
-unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::AllocateBufferedPart() {
-	auto capacity = CurrentPartSize();
+unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::AllocateBufferedPart(idx_t capacity) {
 	auto buffer = s3fs.get().buffer_manager.Allocate(MemoryTag::EXTENSION, capacity);
 	return make_uniq<BufferedPart>(std::move(buffer), capacity);
 }
@@ -244,33 +274,79 @@ idx_t S3UploadSession::AppendToBufferedPart(BufferedPart &buffered_part_p, const
 	return copy_size;
 }
 
-idx_t S3UploadSession::CurrentPartSize() DUCKDB_EXCLUDES(state_lock) {
-	annotated_lock_guard<annotated_mutex> guard(state_lock);
-	return config.PartSize(part_etags.size());
-}
-
-bool S3UploadSession::ShouldBufferUnbufferedSpan(idx_t size) DUCKDB_EXCLUDES(state_lock) {
-	annotated_lock_guard<annotated_mutex> guard(state_lock);
-	D_ASSERT(state == State::OPEN || state == State::MULTIPART_ACTIVE);
-	auto part_size = config.PartSize(part_etags.size());
-	return state == State::OPEN ? size <= part_size : size < part_size;
-}
-
-void S3UploadSession::WriteUnbufferedSpan(unique_ptr<BufferedPart> &buffered_part_p, const_data_ptr_t data,
-                                          idx_t size) {
-	idx_t input_offset = 0;
-	while (input_offset < size) {
-		auto remaining = size - input_offset;
-		if (ShouldBufferUnbufferedSpan(remaining)) {
-			buffered_part_p = AllocateBufferedPart();
-			auto copied = AppendToBufferedPart(*buffered_part_p, data + input_offset, remaining);
-			D_ASSERT(copied == remaining);
-			return;
-		}
-		auto direct_size = MinValue<idx_t>(remaining, S3UploadConfig::MAX_MULTIPART_PART_SIZE);
-		UploadPart(data + input_offset, direct_size);
-		input_offset += direct_size;
+void S3UploadSession::ReservePart(PreparedWrite &write, const_data_ptr_t data, idx_t size) DUCKDB_REQUIRES(state_lock) {
+	if (!config.HasPartCapacity(part_etags.size())) {
+		throw IOException("S3 upload exceeds the configured maximum of %llu multipart parts", config.max_parts);
 	}
+	auto part_number = part_etags.size() + 1;
+	part_etags.emplace_back();
+	write.parts.emplace_back(part_number, data, size);
+}
+
+void S3UploadSession::ReservePart(PreparedWrite &write, unique_ptr<BufferedPart> buffered_part_p)
+    DUCKDB_REQUIRES(state_lock) {
+	if (!config.HasPartCapacity(part_etags.size())) {
+		throw IOException("S3 upload exceeds the configured maximum of %llu multipart parts", config.max_parts);
+	}
+	auto part_number = part_etags.size() + 1;
+	part_etags.emplace_back();
+	write.parts.emplace_back(part_number, std::move(buffered_part_p));
+}
+
+S3UploadSession::PreparedWrite S3UploadSession::PrepareWrite(const_data_ptr_t data, idx_t size, idx_t location)
+    DUCKDB_EXCLUDES(state_lock) {
+	FailureSnapshot failure;
+	PreparedWrite result;
+	{
+		annotated_unique_lock<annotated_mutex> guard(state_lock);
+		while (location > next_offset && !primary_failure.primary_error) {
+			state_changed.wait(guard);
+		}
+		if (primary_failure.primary_error) {
+			failure = CaptureFailure();
+		} else if (location != next_offset) {
+			throw IOException("S3 writes must be sequential: expected offset %llu, got %llu", next_offset, location);
+		} else if (size > config.max_file_size - next_offset) {
+			throw IOException("S3 upload exceeds the configured maximum file size of %llu bytes", config.max_file_size);
+		} else {
+			result.buffered_part = std::move(buffered_part);
+			idx_t input_offset = 0;
+			if (result.buffered_part && size > 0) {
+				if (result.buffered_part->size == result.buffered_part->capacity) {
+					ReservePart(result, std::move(result.buffered_part));
+				} else {
+					input_offset = AppendToBufferedPart(*result.buffered_part, data, size);
+					if (result.buffered_part->size == result.buffered_part->capacity && input_offset < size) {
+						ReservePart(result, std::move(result.buffered_part));
+					}
+				}
+			}
+
+			while (input_offset < size) {
+				auto remaining = size - input_offset;
+				auto part_size = config.PartSize(part_etags.size());
+				auto should_buffer = part_etags.empty() ? remaining <= part_size : remaining < part_size;
+				if (should_buffer) {
+					result.buffered_part = AllocateBufferedPart(part_size);
+					auto copied = AppendToBufferedPart(*result.buffered_part, data + input_offset, remaining);
+					D_ASSERT(copied == remaining);
+					input_offset += copied;
+					break;
+				}
+				auto direct_size = MinValue<idx_t>(remaining, S3UploadConfig::MAX_MULTIPART_PART_SIZE);
+				ReservePart(result, data + input_offset, direct_size);
+				input_offset += direct_size;
+			}
+
+			buffered_part = std::move(result.buffered_part);
+			next_offset += size;
+			state_changed.notify_all();
+		}
+	}
+	if (failure.primary_error) {
+		ThrowFailure(failure);
+	}
+	return result;
 }
 
 string S3UploadSession::InitializeMultipartUpload() {
@@ -305,23 +381,78 @@ string S3UploadSession::InitializeMultipartUpload() {
 	return parsed_response.upload_id;
 }
 
-void S3UploadSession::EnsureMultipartUpload() {
+void S3UploadSession::PublishInitializationFailure(ErrorData error, FailureDisposition disposition)
+    DUCKDB_EXCLUDES(state_lock) {
+	auto stored_error = make_shared_ptr<const ErrorData>(std::move(error));
+	annotated_lock_guard<annotated_mutex> guard(state_lock);
+	D_ASSERT(initialization_state == InitializationState::IN_PROGRESS);
+	initialization_state = InitializationState::FAILED;
+	LatchFailureLocked(std::move(stored_error), disposition);
+}
+
+shared_ptr<const string> S3UploadSession::EnsureMultipartUpload() {
+	bool initialize = false;
+	FailureSnapshot failure;
 	{
-		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		if (state == State::MULTIPART_ACTIVE) {
-			return;
+		annotated_unique_lock<annotated_mutex> guard(state_lock);
+		while (initialization_state == InitializationState::IN_PROGRESS && !primary_failure.primary_error) {
+			state_changed.wait(guard);
 		}
-		D_ASSERT(state == State::OPEN);
-		D_ASSERT(operation != Operation::NONE);
+		if (primary_failure.primary_error) {
+			failure = CaptureFailure();
+		} else if (initialization_state == InitializationState::SUCCEEDED) {
+			return multipart_upload_id;
+		} else if (initialization_state == InitializationState::FAILED) {
+			failure = CaptureFailure();
+		} else {
+			D_ASSERT(initialization_state == InitializationState::NOT_STARTED);
+			initialization_state = InitializationState::IN_PROGRESS;
+			initialize = true;
+		}
+	}
+	if (failure.primary_error) {
+		ThrowFailure(failure);
+	}
+	D_ASSERT(initialize);
+
+	shared_ptr<const string> upload_id;
+	try {
+		upload_id = make_shared_ptr<const string>(InitializeMultipartUpload());
+	} catch (S3AmbiguousUploadException &ex) {
+		PublishInitializationFailure(ErrorData(ex), FailureDisposition::AMBIGUOUS);
+		throw;
+	} catch (std::exception &ex) {
+		PublishInitializationFailure(ErrorData(ex), FailureDisposition::DEFINITIVE);
+		throw;
 	}
 
-	auto upload_id = make_shared_ptr<const string>(InitializeMultipartUpload());
 	{
 		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		D_ASSERT(state == State::OPEN);
+		D_ASSERT(initialization_state == InitializationState::IN_PROGRESS);
 		D_ASSERT(!multipart_upload_id);
-		multipart_upload_id = std::move(upload_id);
-		state = State::MULTIPART_ACTIVE;
+		multipart_upload_id = upload_id;
+		initialization_state = InitializationState::SUCCEEDED;
+		state_changed.notify_all();
+		if (primary_failure.primary_error) {
+			failure = CaptureFailure();
+		}
+	}
+	if (failure.primary_error) {
+		ThrowFailure(failure);
+	}
+	return upload_id;
+}
+
+void S3UploadSession::ThrowIfFailed() DUCKDB_EXCLUDES(state_lock) {
+	FailureSnapshot failure;
+	{
+		annotated_lock_guard<annotated_mutex> guard(state_lock);
+		if (primary_failure.primary_error) {
+			failure = CaptureFailure();
+		}
+	}
+	if (failure.primary_error) {
+		ThrowFailure(failure);
 	}
 }
 
@@ -341,50 +472,30 @@ string S3UploadSession::Upload(const_data_ptr_t data, idx_t size, const string &
 	return response->headers.GetHeaderValue("ETag");
 }
 
-void S3UploadSession::UploadPart(const_data_ptr_t data, idx_t size) {
-	idx_t part_number;
-	shared_ptr<const string> upload_id;
-	{
-		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		if (!config.HasPartCapacity(part_etags.size())) {
-			throw IOException("S3 upload exceeds the configured maximum of %llu multipart parts", config.max_parts);
-		}
-		part_number = part_etags.size() + 1;
-	}
-	EnsureMultipartUpload();
-	{
-		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		D_ASSERT(state == State::MULTIPART_ACTIVE);
-		D_ASSERT(part_number == part_etags.size() + 1);
-		upload_id = multipart_upload_id;
-	}
+void S3UploadSession::UploadPart(PreparedPart &part) {
+	auto upload_id = EnsureMultipartUpload();
+	ThrowIfFailed();
 	D_ASSERT(upload_id);
-	auto query_param = "partNumber=" + to_string(part_number) + "&uploadId=" + S3Url::Encode(*upload_id, true);
-	auto etag = Upload(data, size, query_param);
-	StorePartETag(part_number, std::move(etag));
-}
-
-void S3UploadSession::UploadBufferedPart(BufferedPart &buffered_part_p) {
-	UploadPart(buffered_part_p.Ptr(), buffered_part_p.size);
+	auto query_param = "partNumber=" + to_string(part.part_number) + "&uploadId=" + S3Url::Encode(*upload_id, true);
+	auto etag = Upload(part.data, part.size, query_param);
+	StorePartETag(part.part_number, std::move(etag));
 }
 
 void S3UploadSession::StorePartETag(idx_t part_number, string etag) DUCKDB_EXCLUDES(state_lock) {
-	vector<string> etags;
+	FailureSnapshot failure;
 	{
 		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		D_ASSERT(part_number == part_etags.size() + 1);
-		etags = std::move(part_etags);
+		if (primary_failure.primary_error) {
+			failure = CaptureFailure();
+		} else {
+			D_ASSERT(part_number > 0);
+			D_ASSERT(part_number <= part_etags.size());
+			D_ASSERT(part_etags[part_number - 1].empty());
+			part_etags[part_number - 1] = std::move(etag);
+		}
 	}
-	try {
-		etags.push_back(std::move(etag));
-	} catch (...) {
-		RestorePartETags(std::move(etags));
-		throw;
-	}
-	{
-		annotated_lock_guard<annotated_mutex> guard(state_lock);
-		D_ASSERT(part_etags.empty());
-		part_etags = std::move(etags);
+	if (failure.primary_error) {
+		ThrowFailure(failure);
 	}
 }
 
@@ -397,20 +508,19 @@ void S3UploadSession::UploadEmpty() {
 	Upload(empty, 0, string());
 }
 
-S3UploadSession::MultipartSnapshot S3UploadSession::TakeMultipartSnapshot() DUCKDB_EXCLUDES(state_lock) {
+S3UploadSession::MultipartSnapshot S3UploadSession::GetMultipartSnapshot() DUCKDB_EXCLUDES(state_lock) {
 	annotated_lock_guard<annotated_mutex> guard(state_lock);
-	D_ASSERT(state == State::MULTIPART_ACTIVE);
-	return {multipart_upload_id, std::move(part_etags)};
-}
-
-void S3UploadSession::RestorePartETags(vector<string> etags) DUCKDB_EXCLUDES(state_lock) {
-	annotated_lock_guard<annotated_mutex> guard(state_lock);
-	D_ASSERT(part_etags.empty());
-	part_etags = std::move(etags);
+	D_ASSERT(initialization_state == InitializationState::SUCCEEDED);
+	for (auto &etag : part_etags) {
+		if (etag.empty()) {
+			throw IOException("S3 multipart upload is missing a completed part");
+		}
+	}
+	return {multipart_upload_id, part_etags};
 }
 
 void S3UploadSession::CompleteMultipartUpload() {
-	auto snapshot = TakeMultipartSnapshot();
+	auto snapshot = GetMultipartSnapshot();
 	D_ASSERT(snapshot.upload_id);
 	std::stringstream body;
 	body << "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">";
@@ -458,30 +568,19 @@ void S3UploadSession::CompleteMultipartUpload() {
 }
 
 S3UploadSession::WriteClaim S3UploadSession::Write(const_data_ptr_t data, idx_t size, idx_t location) {
-	auto local_buffered_part = BeginWrite(location, size);
+	BeginWriteOperation();
+	WriteClaim claim(*this);
 	try {
-		idx_t input_offset = 0;
-		if (local_buffered_part && size > 0) {
-			if (local_buffered_part->size == local_buffered_part->capacity) {
-				UploadBufferedPart(*local_buffered_part);
-				local_buffered_part.reset();
-			} else {
-				input_offset = AppendToBufferedPart(*local_buffered_part, data, size);
-				if (local_buffered_part->size == local_buffered_part->capacity && input_offset < size) {
-					UploadBufferedPart(*local_buffered_part);
-					local_buffered_part.reset();
-				}
-			}
+		auto write = PrepareWrite(data, size, location);
+		for (auto &part : write.parts) {
+			ThrowIfFailed();
+			UploadPart(part);
 		}
-		if (input_offset < size) {
-			WriteUnbufferedSpan(local_buffered_part, data + input_offset, size - input_offset);
-		}
-		StoreWriteResult(std::move(local_buffered_part), size);
-		return WriteClaim(*this);
+		return claim;
 	} catch (S3AmbiguousUploadException &ex) {
-		FailOperation(ErrorData(ex), FailureDisposition::AMBIGUOUS);
+		claim.Fail(ErrorData(ex), FailureDisposition::AMBIGUOUS);
 	} catch (std::exception &ex) {
-		FailOperation(ErrorData(ex), FailureDisposition::DEFINITIVE);
+		claim.Fail(ErrorData(ex), FailureDisposition::DEFINITIVE);
 	}
 }
 
@@ -493,23 +592,28 @@ void S3UploadSession::Finalize() {
 	}
 
 	try {
-		State current_state;
+		bool multipart_upload;
 		{
 			annotated_lock_guard<annotated_mutex> guard(state_lock);
-			current_state = state;
+			multipart_upload = !part_etags.empty();
 		}
-		if (current_state == State::OPEN) {
+		if (!multipart_upload) {
 			if (!local_buffered_part) {
 				UploadEmpty();
 			} else {
 				UploadSingle(*local_buffered_part);
 			}
 		} else {
-			D_ASSERT(current_state == State::MULTIPART_ACTIVE);
 			if (local_buffered_part) {
-				UploadBufferedPart(*local_buffered_part);
-				local_buffered_part.reset();
+				PreparedWrite final_write;
+				{
+					annotated_lock_guard<annotated_mutex> guard(state_lock);
+					ReservePart(final_write, std::move(local_buffered_part));
+				}
+				D_ASSERT(final_write.parts.size() == 1);
+				UploadPart(final_write.parts.front());
 			}
+			ThrowIfFailed();
 			CompleteMultipartUpload();
 		}
 		FinishFinalize();

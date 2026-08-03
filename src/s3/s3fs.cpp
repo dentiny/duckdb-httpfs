@@ -168,9 +168,9 @@ void S3FileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx
 	auto write_claim = s3fh.upload_session->Write(const_data_ptr_cast(buffer), write_size, location);
 	{
 		annotated_lock_guard<annotated_mutex> guard(s3fh.cursor_mutex);
-		D_ASSERT(s3fh.file_offset == location);
-		s3fh.file_offset = location + write_size;
-		s3fh.length += write_size;
+		auto write_end = location + write_size;
+		s3fh.file_offset = MaxValue(s3fh.file_offset, write_end);
+		s3fh.length = MaxValue(s3fh.length, write_end);
 	}
 	write_claim.Finish();
 

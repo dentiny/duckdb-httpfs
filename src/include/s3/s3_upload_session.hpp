@@ -8,12 +8,17 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/storage/buffer/buffer_handle.hpp"
 
+#include <condition_variable>
+
 namespace duckdb {
 
 class HTTPRequestSession;
 class S3FileSystem;
 
 class S3UploadSession {
+private:
+	enum class FailureDisposition : uint8_t { DEFINITIVE, AMBIGUOUS };
+
 public:
 	class WriteClaim {
 		friend class S3UploadSession;
@@ -28,6 +33,7 @@ public:
 
 	private:
 		explicit WriteClaim(S3UploadSession &session_p);
+		[[noreturn]] void Fail(ErrorData error, FailureDisposition disposition);
 
 	private:
 		reference<S3UploadSession> session;
@@ -43,9 +49,8 @@ public:
 	void Finalize();
 
 private:
-	enum class State : uint8_t { OPEN, MULTIPART_ACTIVE, FINALIZED, FAILED, AMBIGUOUS };
-	enum class Operation : uint8_t { NONE, WRITE, FINALIZE };
-	enum class FailureDisposition : uint8_t { DEFINITIVE, AMBIGUOUS };
+	enum class InitializationState : uint8_t { NOT_STARTED, IN_PROGRESS, SUCCEEDED, FAILED };
+	enum class CleanupState : uint8_t { NONE, IN_PROGRESS, COMPLETE };
 
 	struct FailureSnapshot {
 		shared_ptr<const ErrorData> primary_error;
@@ -70,32 +75,56 @@ private:
 		vector<string> etags;
 	};
 
+	struct PreparedPart {
+		PreparedPart(idx_t part_number_p, const_data_ptr_t data_p, idx_t size_p)
+		    : part_number(part_number_p), data(data_p), size(size_p) {
+		}
+		PreparedPart(idx_t part_number_p, unique_ptr<BufferedPart> buffered_part_p)
+		    : part_number(part_number_p), buffered_part(std::move(buffered_part_p)), data(buffered_part->Ptr()),
+		      size(buffered_part->size) {
+		}
+
+		idx_t part_number;
+		unique_ptr<BufferedPart> buffered_part;
+		const_data_ptr_t data;
+		idx_t size;
+	};
+
+	struct PreparedWrite {
+		vector<PreparedPart> parts;
+		unique_ptr<BufferedPart> buffered_part;
+	};
+
 private:
-	unique_ptr<BufferedPart> BeginWrite(idx_t location, idx_t size) DUCKDB_EXCLUDES(state_lock);
+	void BeginWriteOperation() DUCKDB_EXCLUDES(state_lock);
+	PreparedWrite PrepareWrite(const_data_ptr_t data, idx_t size, idx_t location) DUCKDB_EXCLUDES(state_lock);
 	unique_ptr<BufferedPart> BeginFinalize(bool &already_finalized) DUCKDB_EXCLUDES(state_lock);
-	void StoreWriteResult(unique_ptr<BufferedPart> buffered_part, idx_t size) DUCKDB_EXCLUDES(state_lock);
+	void ReleaseOperation(bool rethrow_failure) DUCKDB_EXCLUDES(state_lock);
 	void ReleaseWrite() DUCKDB_EXCLUDES(state_lock);
+	void ReleaseWriteNoThrow() noexcept DUCKDB_EXCLUDES(state_lock);
 	void FinishFinalize() DUCKDB_EXCLUDES(state_lock);
+	void LatchFailure(ErrorData error, FailureDisposition disposition) DUCKDB_EXCLUDES(state_lock);
+	void LatchFailureLocked(shared_ptr<const ErrorData> error, FailureDisposition disposition)
+	    DUCKDB_REQUIRES(state_lock);
 	[[noreturn]] void FailOperation(ErrorData error, FailureDisposition disposition) DUCKDB_EXCLUDES(state_lock);
 	FailureSnapshot CaptureFailure() const DUCKDB_REQUIRES(state_lock);
 	[[noreturn]] static void ThrowFailure(const FailureSnapshot &failure);
 	shared_ptr<const ErrorData> AbortMultipartUpload(const string &upload_id);
+	void ThrowIfFailed() DUCKDB_EXCLUDES(state_lock);
 
-	unique_ptr<BufferedPart> AllocateBufferedPart();
+	unique_ptr<BufferedPart> AllocateBufferedPart(idx_t capacity);
 	idx_t AppendToBufferedPart(BufferedPart &buffered_part, const_data_ptr_t data, idx_t size);
-	idx_t CurrentPartSize() DUCKDB_EXCLUDES(state_lock);
-	bool ShouldBufferUnbufferedSpan(idx_t size) DUCKDB_EXCLUDES(state_lock);
-	void WriteUnbufferedSpan(unique_ptr<BufferedPart> &buffered_part, const_data_ptr_t data, idx_t size);
-	void EnsureMultipartUpload();
+	void ReservePart(PreparedWrite &write, const_data_ptr_t data, idx_t size) DUCKDB_REQUIRES(state_lock);
+	void ReservePart(PreparedWrite &write, unique_ptr<BufferedPart> buffered_part) DUCKDB_REQUIRES(state_lock);
+	shared_ptr<const string> EnsureMultipartUpload();
+	void PublishInitializationFailure(ErrorData error, FailureDisposition disposition) DUCKDB_EXCLUDES(state_lock);
 	string InitializeMultipartUpload();
 	string Upload(const_data_ptr_t data, idx_t size, const string &query_param);
-	void UploadPart(const_data_ptr_t data, idx_t size);
-	void UploadBufferedPart(BufferedPart &buffered_part);
+	void UploadPart(PreparedPart &part);
 	void UploadSingle(BufferedPart &buffered_part);
 	void UploadEmpty();
 	void StorePartETag(idx_t part_number, string etag) DUCKDB_EXCLUDES(state_lock);
-	MultipartSnapshot TakeMultipartSnapshot() DUCKDB_EXCLUDES(state_lock);
-	void RestorePartETags(vector<string> etags) DUCKDB_EXCLUDES(state_lock);
+	MultipartSnapshot GetMultipartSnapshot() DUCKDB_EXCLUDES(state_lock);
 	void CompleteMultipartUpload();
 
 private:
@@ -106,13 +135,19 @@ private:
 	const S3UploadConfig config;
 
 	annotated_mutex state_lock;
-	State state DUCKDB_GUARDED_BY(state_lock) = State::OPEN;
-	Operation operation DUCKDB_GUARDED_BY(state_lock) = Operation::NONE;
+	std::condition_variable state_changed;
+	bool finalized DUCKDB_GUARDED_BY(state_lock) = false;
+	bool finalizing DUCKDB_GUARDED_BY(state_lock) = false;
+	idx_t active_operations DUCKDB_GUARDED_BY(state_lock) = 0;
 	idx_t next_offset DUCKDB_GUARDED_BY(state_lock) = 0;
 	unique_ptr<BufferedPart> buffered_part DUCKDB_GUARDED_BY(state_lock);
+	InitializationState initialization_state DUCKDB_GUARDED_BY(state_lock) = InitializationState::NOT_STARTED;
 	shared_ptr<const string> multipart_upload_id DUCKDB_GUARDED_BY(state_lock);
 	vector<string> part_etags DUCKDB_GUARDED_BY(state_lock);
 	FailureSnapshot primary_failure DUCKDB_GUARDED_BY(state_lock);
+	FailureDisposition failure_disposition DUCKDB_GUARDED_BY(state_lock) = FailureDisposition::DEFINITIVE;
+	bool abort_suppressed DUCKDB_GUARDED_BY(state_lock) = false;
+	CleanupState cleanup_state DUCKDB_GUARDED_BY(state_lock) = CleanupState::NONE;
 };
 
 } // namespace duckdb

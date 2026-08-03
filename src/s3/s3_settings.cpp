@@ -98,15 +98,15 @@ S3UploadConfig S3UploadConfig::ReadFrom(optional_ptr<FileOpener> opener) {
 	return Create(uploader_max_filesize, max_parts_per_file);
 }
 
-idx_t S3UploadConfig::PartSize(idx_t completed_parts) const {
+idx_t S3UploadConfig::PartSize(idx_t reserved_parts) const {
 	D_ASSERT(initial_part_size >= MIN_MULTIPART_PART_SIZE);
 	D_ASSERT(initial_part_size <= MAX_MULTIPART_PART_SIZE);
 	D_ASSERT(growth_interval > 0);
-	return S3UploadSizing::PartSize(initial_part_size, growth_interval, completed_parts);
+	return S3UploadSizing::PartSize(initial_part_size, growth_interval, reserved_parts);
 }
 
-bool S3UploadConfig::HasPartCapacity(idx_t completed_parts) const {
-	return completed_parts < max_parts;
+bool S3UploadConfig::HasPartCapacity(idx_t reserved_parts) const {
+	return reserved_parts < max_parts;
 }
 
 void S3Settings::Register(DBConfig &config) {
