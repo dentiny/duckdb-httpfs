@@ -1,6 +1,6 @@
 #include "s3/s3fs.hpp"
 
-#include "s3/s3_multi_part_upload.hpp"
+#include "s3/s3_upload_session.hpp"
 #include "s3/s3_url.hpp"
 
 #include "duckdb/common/helper.hpp"
@@ -12,8 +12,8 @@ namespace duckdb {
 
 S3FileHandle::S3FileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpenFlags flags,
                            unique_ptr<HTTPParams> http_params_p, const S3AuthParams &auth_params_p,
-                           const S3ConfigParams &config_params_p)
-    : HTTPFileHandle(fs, file, flags, std::move(http_params_p)), config_params(config_params_p) {
+                           const S3UploadConfig &upload_config)
+    : HTTPFileHandle(fs, file, flags, std::move(http_params_p)) {
 	auto captured = request_session->Capture();
 	auto request_params = captured.snapshot->CreateRequestParams();
 	request_session->TryPublish(captured.snapshot,
@@ -31,7 +31,7 @@ S3FileHandle::S3FileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpenFla
 		}
 	}
 	if (flags.OpenForWriting()) {
-		multi_part_upload = make_shared_ptr<S3MultiPartUpload>(*this);
+		upload_session = make_uniq<S3UploadSession>(fs.Cast<S3FileSystem>(), request_session, file.path, upload_config);
 	}
 }
 
@@ -73,46 +73,14 @@ void S3FileHandle::SetRegion(string region_p) {
 	S3RequestExecutor::SetSessionRegion(*request_session, region_p, previous_region);
 }
 
-S3ConfigParams S3ConfigParams::ReadFrom(optional_ptr<FileOpener> opener) {
-	uint64_t uploader_max_filesize;
-	uint64_t max_parts_per_file;
-	uint64_t max_upload_threads;
-	Value value;
-
-	if (FileOpener::TryGetCurrentSetting(opener, "s3_uploader_max_filesize", value)) {
-		uploader_max_filesize = DBConfig::ParseMemoryLimit(value.GetValue<string>());
-	} else {
-		uploader_max_filesize = S3ConfigParams::DEFAULT_MAX_FILESIZE;
-	}
-
-	if (FileOpener::TryGetCurrentSetting(opener, "s3_uploader_max_parts_per_file", value)) {
-		max_parts_per_file = value.GetValue<uint64_t>();
-	} else {
-		max_parts_per_file = S3ConfigParams::DEFAULT_MAX_PARTS_PER_FILE; // AWS Default
-	}
-
-	if (FileOpener::TryGetCurrentSetting(opener, "s3_uploader_thread_limit", value)) {
-		max_upload_threads = value.GetValue<uint64_t>();
-	} else {
-		max_upload_threads = S3ConfigParams::DEFAULT_MAX_UPLOAD_THREADS;
-	}
-
-	return {uploader_max_filesize, max_parts_per_file, max_upload_threads};
-}
-
 void S3FileHandle::Close() {
 	FinalizeUpload();
 }
 
 void S3FileHandle::FinalizeUpload() {
-	if (flags.OpenForWriting() && multi_part_upload) {
-		multi_part_upload->Finalize();
+	if (upload_session) {
+		upload_session->Finalize();
 	}
-}
-
-// Wrapper around the BufferManager::Allocate to that allows limiting the number of buffers that will be handed out
-BufferHandle S3FileSystem::Allocate(idx_t part_size, uint16_t max_threads) {
-	return buffer_manager.Allocate(MemoryTag::EXTENSION, part_size);
 }
 
 EncryptionUtil &S3FileSystem::GetEncryptionUtil() {
@@ -134,9 +102,12 @@ unique_ptr<HTTPFileHandle> S3FileSystem::CreateHandle(const OpenFileInfo &file, 
 
 	auto &http_util = HTTPFSUtil::GetHTTPUtil(opener);
 	auto params = http_util.InitializeParameters(opener, info);
+	S3UploadConfig upload_config;
+	if (flags.OpenForWriting()) {
+		upload_config = S3UploadConfig::ReadFrom(opener);
+	}
 
-	return duckdb::make_uniq<S3FileHandle>(*this, file, flags, std::move(params), auth_params,
-	                                       S3ConfigParams::ReadFrom(opener));
+	return duckdb::make_uniq<S3FileHandle>(*this, file, flags, std::move(params), auth_params, upload_config);
 }
 
 void S3FileHandle::InitializeFromCacheEntry(const HTTPMetadataCacheEntry &cache_entry) {
@@ -174,19 +145,6 @@ void S3FileHandle::Initialize(optional_ptr<FileOpener> opener) {
 		                                                   snapshot.region_redirected, snapshot.credential_generation));
 	}
 	HTTPFileHandle::Initialize(opener);
-
-	if (flags.OpenForWriting()) {
-		auto aws_minimum_part_size = 5242880; // 5 MiB https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
-		auto max_part_count = config_params.max_parts_per_file;
-		auto required_part_size = config_params.max_file_size / max_part_count;
-		auto minimum_part_size = MaxValue<idx_t>(aws_minimum_part_size, required_part_size);
-
-		// Round part size up to multiple of Storage::DEFAULT_BLOCK_SIZE
-		multi_part_upload->part_size =
-		    ((minimum_part_size + Storage::DEFAULT_BLOCK_SIZE - 1) / Storage::DEFAULT_BLOCK_SIZE) *
-		    Storage::DEFAULT_BLOCK_SIZE;
-		D_ASSERT(multi_part_upload->part_size * max_part_count >= config_params.max_file_size);
-	}
 }
 
 bool S3FileSystem::CanHandleFile(const string &fpath) {
@@ -203,39 +161,20 @@ void S3FileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx
 	if (!s3fh.flags.OpenForWriting()) {
 		throw InternalException("Write called on file not opened in write mode");
 	}
-	annotated_lock_guard<annotated_mutex> guard(s3fh.cursor_mutex);
-	int64_t bytes_written = 0;
-
-	while (bytes_written < nr_bytes) {
-		auto curr_location = location + bytes_written;
-
-		if (curr_location != s3fh.file_offset) {
-			throw InternalException("Non-sequential write not supported!");
-		}
-
-		// Find buffer for writing
-		auto part_size = s3fh.multi_part_upload->part_size;
-		auto write_buffer_idx = curr_location / part_size;
-
-		// Get write buffer, may block until buffer is available
-		auto write_buffer = s3fh.multi_part_upload->GetBuffer(write_buffer_idx);
-
-		// Writing to buffer
-		auto idx_to_write = curr_location - write_buffer->buffer_start;
-		auto bytes_to_write = MinValue<idx_t>(nr_bytes - bytes_written, part_size - idx_to_write);
-		memcpy(write_buffer->Ptr() + idx_to_write, data_ptr_cast(buffer) + bytes_written, bytes_to_write);
-		write_buffer->idx += bytes_to_write;
-
-		// Flush to HTTP if full
-		if (write_buffer->idx >= part_size) {
-			s3fh.multi_part_upload->FlushBuffer(write_buffer);
-		}
-		s3fh.file_offset += bytes_to_write;
-		s3fh.length += bytes_to_write;
-		bytes_written += bytes_to_write;
+	if (nr_bytes < 0) {
+		throw InternalException("S3 write size cannot be negative");
 	}
+	auto write_size = NumericCast<idx_t>(nr_bytes);
+	auto write_claim = s3fh.upload_session->Write(const_data_ptr_cast(buffer), write_size, location);
+	{
+		annotated_lock_guard<annotated_mutex> guard(s3fh.cursor_mutex);
+		auto write_end = location + write_size;
+		s3fh.file_offset = MaxValue(s3fh.file_offset, write_end);
+		s3fh.length = MaxValue(s3fh.length, write_end);
+	}
+	write_claim.Finish();
 
-	DUCKDB_LOG_FILE_SYSTEM_WRITE(handle, bytes_written, s3fh.file_offset - bytes_written);
+	DUCKDB_LOG_FILE_SYSTEM_WRITE(handle, write_size, location);
 }
 
 string S3FileSystem::GetName() const {

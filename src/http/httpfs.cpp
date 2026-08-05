@@ -268,7 +268,7 @@ unique_ptr<HTTPFileHandle> HTTPFileSystem::CreateHandle(const OpenFileInfo &file
 		auto secret_match = secret_manager->LookupSecret(*transaction, file.path, "bearer");
 
 		if (secret_match.HasMatch()) {
-			const auto &kv_secret = dynamic_cast<const KeyValueSecret &>(*secret_match.secret_entry->secret);
+			const auto &kv_secret = secret_match.secret_entry->secret->Cast<KeyValueSecret>();
 			auto &httpfs_params = params->Cast<HTTPFSParams>();
 			httpfs_params.bearer_token = kv_secret.TryGetValue("token", true).ToString();
 		}

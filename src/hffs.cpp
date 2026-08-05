@@ -337,7 +337,7 @@ void HuggingFaceFileSystem::SetParams(HTTPFSParams &params, const string &path, 
 		auto secret_match = secret_manager->LookupSecret(*transaction, path, "huggingface");
 
 		if (secret_match.HasMatch()) {
-			const auto &kv_secret = dynamic_cast<const KeyValueSecret &>(*secret_match.secret_entry->secret);
+			const auto &kv_secret = secret_match.secret_entry->secret->Cast<KeyValueSecret>();
 			params.bearer_token = kv_secret.TryGetValue("token", true).ToString();
 		}
 	}

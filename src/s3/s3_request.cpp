@@ -678,8 +678,8 @@ string S3RequestUtil::GetPayloadHash(EncryptionUtil &encryption_util, const_data
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, string url, string &result,
-                                                   const_data_ptr_t buffer_in, idx_t buffer_in_len,
-                                                   string http_params) {
+                                                   const_data_ptr_t buffer_in, idx_t buffer_in_len, string http_params,
+                                                   S3PostRequestMode mode) {
 	auto payload_hash = S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), buffer_in, buffer_in_len);
 	const string content_type = "application/octet-stream";
 	return S3RequestExecutor::RunSession(
@@ -687,8 +687,12 @@ unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, 
 	    [&](S3RequestData &request_data) {
 		    result.clear();
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
+		    if (mode == S3PostRequestMode::NON_REPLAYABLE) {
+			    params.retries = 0;
+		    }
 		    return RunPostRequest(request_data.http_url, request_data.headers, params, result, buffer_in, buffer_in_len,
 		                          [&](BaseRequest &request) {
+			                          request.try_request = mode == S3PostRequestMode::NON_REPLAYABLE;
 			                          return S3RequestExecutor::SendSessionRequest(session, request_data.captured,
 			                                                                       params, request);
 		                          });
@@ -705,6 +709,7 @@ unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, s
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		    return RunPutRequest(request_data.http_url, request_data.headers, params, buffer_in, buffer_in_len,
 		                         content_type, [&](BaseRequest &request) {
+			                         request.try_request = true;
 			                         return S3RequestExecutor::SendSessionRequest(session, request_data.captured,
 			                                                                      params, request);
 		                         });
@@ -765,6 +770,16 @@ unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, string 
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		    return RunDeleteRequest(request_data.http_url, request_data.headers, params, [&](BaseRequest &request) {
 			    return S3RequestExecutor::SendHandleRequest(s3_handle, request_data.captured, params, request);
+		    });
+	    });
+}
+
+unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(HTTPRequestSession &session, string s3_url, string http_params) {
+	return S3RequestExecutor::RunSession(
+	    GetEncryptionUtil(), session, s3_url, "DELETE", http_params, "", "", "", [&](S3RequestData &request_data) {
+		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
+		    return RunDeleteRequest(request_data.http_url, request_data.headers, params, [&](BaseRequest &request) {
+			    return S3RequestExecutor::SendSessionRequest(session, request_data.captured, params, request);
 		    });
 	    });
 }

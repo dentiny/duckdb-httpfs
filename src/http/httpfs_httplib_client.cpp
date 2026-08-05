@@ -148,8 +148,17 @@ public:
 			state->total_bytes_sent += info.buffer_in_len;
 		}
 		auto headers = TransformHeaders(info.headers, info.params);
-		return TransformResult(client->Put(info.path, headers, const_char_ptr_cast(info.buffer_in), info.buffer_in_len,
-		                                   info.content_type));
+		auto body_size = NumericCast<size_t>(info.buffer_in_len);
+		auto body = info.buffer_in;
+		auto content_provider = [body, body_size](size_t offset, size_t length,
+		                                          duckdb_httplib_openssl::DataSink &sink) {
+			if (offset > body_size || length > body_size - offset) {
+				return false;
+			}
+			return sink.write(const_char_ptr_cast(body + NumericCast<idx_t>(offset)), length);
+		};
+		return TransformResult(
+		    client->Put(info.path, headers, body_size, std::move(content_provider), info.content_type));
 	}
 
 	unique_ptr<HTTPResponse> Head(HeadRequestInfo &info) override {
@@ -204,8 +213,7 @@ public:
 		// First assign body, this is the body that will be uploaded
 		req.body.assign(const_char_ptr_cast(info.buffer_in), info.buffer_in_len);
 		auto transformed_req = TransformResult(client->send(req));
-		// Then, after actual re-quest, re-assign body to the response value of the POST request
-		transformed_req->body.assign(const_char_ptr_cast(info.buffer_in), info.buffer_in_len);
+		transformed_req->body = info.buffer_out;
 		return transformed_req;
 	}
 
