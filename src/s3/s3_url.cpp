@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-string S3Url::Decode(string input) {
+string S3Url::Decode(const string &input) {
 	return StringUtil::URLDecode(input, true);
 }
 
@@ -85,7 +85,7 @@ string S3Url::GetPrefix(const string &url) {
 	return prefix;
 }
 
-ParsedS3Url S3Url::Parse(string url, const S3AuthParams &params) {
+ParsedS3Url S3Url::Parse(const string &url, const S3AuthParams &params) {
 	string http_proto, prefix, host, bucket, key, path, query_param, trimmed_s3_url;
 
 	prefix = GetPrefix(url);
@@ -139,8 +139,7 @@ ParsedS3Url S3Url::Parse(string url, const S3AuthParams &params) {
 	// See https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html
 	bool use_vhost = params.url_style.empty() || params.url_style == "vhost" || params.url_style == "virtual";
 	// A bucket name containing periods (.) is not addressable vhost-style over TLS. Fallback to path style url
-	bool use_path =
-	    params.url_style == "path" || (use_vhost && params.use_ssl && bucket.find('.') != std::string::npos);
+	bool use_path = params.url_style == "path" || (use_vhost && params.use_ssl && bucket.find('.') != string::npos);
 	if (use_path) {
 		path += "/" + bucket;
 	} else if (use_vhost) {

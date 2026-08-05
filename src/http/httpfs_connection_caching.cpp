@@ -13,19 +13,21 @@ namespace duckdb {
 // HTTPClientConnectionCache
 //===--------------------------------------------------------------------===//
 
-// Per-thread starting pool index. Initialised from a hash of the thread id so
-// threads spread across pools, then updated to the last successfully-touched
-// pool so subsequent calls revisit the warm pool first.
-static thread_local size_t cache_pool_idx =
-    std::hash<thread_id> {}(ThreadUtil::GetThreadId()) & (HTTPClientConnectionCache::POOL_COUNT - 1);
+static idx_t &GetCachePoolIndex() {
+	// Threads spread across pools, then revisit the last successfully-touched pool first.
+	static thread_local idx_t cache_pool_idx =
+	    std::hash<thread_id> {}(ThreadUtil::GetThreadId()) & (HTTPClientConnectionCache::POOL_COUNT - 1);
+	return cache_pool_idx;
+}
 
 unique_ptr<HTTPClient> HTTPClientConnectionCache::Find(const string &base_url) {
 	if (base_url.empty()) {
 		return nullptr;
 	}
-	const size_t start = cache_pool_idx;
-	for (size_t i = 0; i < POOL_COUNT; i++) {
-		const size_t idx = (start + i) & (POOL_COUNT - 1);
+	auto &cache_pool_idx = GetCachePoolIndex();
+	const idx_t start = cache_pool_idx;
+	for (idx_t i = 0; i < POOL_COUNT; i++) {
+		const idx_t idx = (start + i) & (POOL_COUNT - 1);
 		auto &pool = pools[idx];
 		// block instead of skipping: a spurious miss dials a new connection (DNS + TLS),
 		// which is far more expensive than waiting for this short critical section
@@ -44,10 +46,11 @@ void HTTPClientConnectionCache::Store(unique_ptr<HTTPClient> &&client) {
 	if (!client || client->GetBaseUrl().empty()) {
 		return;
 	}
-	const size_t start = cache_pool_idx;
+	auto &cache_pool_idx = GetCachePoolIndex();
+	const idx_t start = cache_pool_idx;
 	// Pass 1: prefer an empty slot in any pool
-	for (size_t i = 0; i < POOL_COUNT; i++) {
-		const size_t idx = (start + i) & (POOL_COUNT - 1);
+	for (idx_t i = 0; i < POOL_COUNT; i++) {
+		const idx_t idx = (start + i) & (POOL_COUNT - 1);
 		auto &pool = pools[idx];
 		annotated_lock_guard<annotated_mutex> lock(pool.lock);
 		for (auto &entry : pool.entries) {
@@ -64,7 +67,7 @@ void HTTPClientConnectionCache::Store(unique_ptr<HTTPClient> &&client) {
 	unique_ptr<HTTPClient> evicted_client;
 	{
 		annotated_lock_guard<annotated_mutex> lock(pool.lock);
-		const size_t slot = engine.NextRandomInteger() % pool.entries.size();
+		const idx_t slot = engine.NextRandomInteger() % pool.entries.size();
 		evicted_client = std::move(pool.entries[slot]);
 		pool.entries[slot] = std::move(client);
 	}

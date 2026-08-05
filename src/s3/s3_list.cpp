@@ -31,8 +31,9 @@ static bool Match(vector<string>::const_iterator key, vector<string>::const_iter
 				}
 				key++;
 			}
-			if (!completed)
+			if (!completed) {
 				return true;
+			}
 			return false;
 		}
 		if (!Glob(key->data(), key->length(), pattern->data(), pattern->length())) {
@@ -61,7 +62,7 @@ private:
 	void ScanTopLevel(vector<OpenFileInfo> &s3_keys) const;
 	bool ShouldInvestigateRecursiveGlob() const;
 	void SelectGlobType(string &response, string &continuation_token) const;
-	bool ContainsDenseDirectories(const vector<OpenFileInfo> &s3_keys) const;
+	static bool ContainsDenseDirectories(const vector<OpenFileInfo> &s3_keys);
 	void SelectNextCommonPrefix() const;
 	void AppendMatchingFiles(vector<OpenFileInfo> &s3_keys) const;
 
@@ -193,7 +194,7 @@ void S3GlobResult::SelectGlobType(string &response, string &continuation_token) 
 	glob_type = GlobType::HIERARCHICAL;
 }
 
-bool S3GlobResult::ContainsDenseDirectories(const vector<OpenFileInfo> &s3_keys) const {
+bool S3GlobResult::ContainsDenseDirectories(const vector<OpenFileInfo> &s3_keys) {
 	unordered_set<string> directories;
 	for (const auto &s3_key : s3_keys) {
 		auto key_splits = StringUtil::Split(s3_key.path, "/");
@@ -347,7 +348,7 @@ string AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSess
 		    return S3RequestExecutor::SendSessionRequest(session, request_data.captured, params, get_request);
 	    },
 	    [&](const S3RequestData &request_data) { return S3RequestExecutor::TryRefreshSession(session, request_data); },
-	    [&](const S3RequestData &request_data, string correct_region) {
+	    [&](const S3RequestData &request_data, const string &correct_region) {
 		    string previous_region;
 		    if (S3RequestExecutor::SetSessionRegion(session, correct_region, previous_region)) {
 			    auto &params = request_data.http_params->Cast<HTTPFSParams>();

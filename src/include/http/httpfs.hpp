@@ -84,7 +84,7 @@ public:
 	void RecordNetworkSample(double total_seconds, idx_t bytes, bool sample_has_ttfb, double ttfb_seconds)
 	    DUCKDB_EXCLUDES(network_estimator_lock);
 	// Expose the measured network throughput estimate to the (parquet) prefetch cost model.
-	bool TryGetNetworkThroughput(NetworkThroughputEstimate &result) DUCKDB_EXCLUDES(network_estimator_lock);
+	bool GetNetworkThroughputEstimate(NetworkThroughputEstimate &result) DUCKDB_EXCLUDES(network_estimator_lock);
 
 private:
 	// Sequential read/write position
@@ -111,8 +111,7 @@ protected:
 	virtual HTTPReadConfig BuildReadConfig() const;
 	//! Perform a HEAD request to get the file info (if not yet loaded)
 	void LoadFileInfo();
-	//! TODO: make base function virtual?
-	void TryAddLogger(FileOpener &opener);
+	void InitializeLogger(FileOpener &opener);
 
 	virtual void InitializeFromCacheEntry(const HTTPMetadataCacheEntry &cache_entry);
 	virtual HTTPMetadataCacheEntry GetCacheEntry() const;
@@ -136,7 +135,7 @@ public:
 
 	//! FileSystem overrides.
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override {
-		if (path.find('*') != std::string::npos && opener) {
+		if (path.find('*') != string::npos && opener) {
 			Value setting_val;
 			if (FileOpener::TryGetCurrentSetting(opener, "allow_asterisks_in_http_paths", setting_val) &&
 			    !setting_val.GetValue<bool>()) {
@@ -166,7 +165,7 @@ public:
 		return false;
 	}
 	bool TryGetNetworkThroughput(FileHandle &handle, NetworkThroughputEstimate &result) override {
-		return handle.Cast<HTTPFileHandle>().TryGetNetworkThroughput(result);
+		return handle.Cast<HTTPFileHandle>().GetNetworkThroughputEstimate(result);
 	}
 	bool IsPipe(const string &filename, optional_ptr<FileOpener> opener) override {
 		return false;
@@ -183,7 +182,7 @@ public:
 	virtual HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url);
 
 	//! HTTP request overrides.
-	virtual unique_ptr<HTTPResponse> HeadRequest(FileHandle &handle, string url, HTTPHeaders header_map);
+	virtual unique_ptr<HTTPResponse> HeadRequest(FileHandle &handle, const string &url, HTTPHeaders header_map);
 	// Get Request with range parameter that GETs exactly buffer_out_len bytes from the url
 	virtual unique_ptr<HTTPResponse> GetRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map,
 	                                                 const HTTPReadConfig &read_config, idx_t file_offset,
@@ -191,7 +190,7 @@ public:
 	// Get Request without a range (i.e., downloads full file)
 	virtual unique_ptr<HTTPResponse> GetRequest(FileHandle &handle, string url, HTTPHeaders header_map,
 	                                            const HTTPReadConfig &read_config, CachedFileDownload &download);
-	virtual unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, string url, HTTPHeaders header_map);
+	virtual unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, const string &url, HTTPHeaders header_map);
 	//! Fully download a file, or wait for an in-progress download of the same path
 	unique_ptr<CachedFileHandle> FullDownload(HTTPFileHandle &handle, const HTTPReadConfig &read_config,
 	                                          bool &should_write_cache);
@@ -207,8 +206,9 @@ protected:
 	                                                optional_ptr<FileOpener> opener);
 
 	//! Internal read helpers.
-	bool TryRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map, const HTTPReadConfig &read_config,
-	                     idx_t file_offset, data_ptr_t buffer_out, idx_t buffer_out_len);
+	bool TryRangeRequest(FileHandle &handle, const string &url, const HTTPHeaders &header_map,
+	                     const HTTPReadConfig &read_config, idx_t file_offset, data_ptr_t buffer_out,
+	                     idx_t buffer_out_len);
 	bool ReadAt(FileHandle &handle, data_ptr_t buffer, idx_t read_size, idx_t location,
 	            const HTTPReadConfig &read_config);
 	void ReadAtWithFallback(FileHandle &handle, data_ptr_t buffer, idx_t read_size, idx_t location,
@@ -218,24 +218,28 @@ protected:
 	using HTTPSendCallback = std::function<unique_ptr<HTTPResponse>(BaseRequest &)>;
 	using HTTPErrorCallback = std::function<HTTPException(const HTTPResponse &)>;
 
-	unique_ptr<HTTPResponse> RunHeadRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-	                                        HTTPSendCallback send_request);
-	unique_ptr<HTTPResponse> RunDeleteRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-	                                          HTTPSendCallback send_request);
-	unique_ptr<HTTPResponse> RunPostRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-	                                        string &result, const_data_ptr_t buffer_in, idx_t buffer_in_len,
-	                                        HTTPSendCallback send_request);
-	unique_ptr<HTTPResponse> RunPutRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-	                                       const_data_ptr_t buffer_in, idx_t buffer_in_len, const string &content_type,
-	                                       HTTPSendCallback send_request);
-	unique_ptr<HTTPResponse> RunGetRequest(HTTPFileHandle &handle, string url, HTTPHeaders header_map,
+	static unique_ptr<HTTPResponse> RunHeadRequest(const string &url, const HTTPHeaders &header_map,
+	                                               HTTPFSParams &http_params, const HTTPSendCallback &send_request);
+	static unique_ptr<HTTPResponse> RunDeleteRequest(const string &url, const HTTPHeaders &header_map,
+	                                                 HTTPFSParams &http_params, const HTTPSendCallback &send_request);
+	static unique_ptr<HTTPResponse> RunPostRequest(const string &url, const HTTPHeaders &header_map,
+	                                               HTTPFSParams &http_params, string &result,
+	                                               const_data_ptr_t buffer_in, idx_t buffer_in_len,
+	                                               const HTTPSendCallback &send_request);
+	static unique_ptr<HTTPResponse> RunPutRequest(const string &url, const HTTPHeaders &header_map,
+	                                              HTTPFSParams &http_params, const_data_ptr_t buffer_in,
+	                                              idx_t buffer_in_len, const string &content_type,
+	                                              const HTTPSendCallback &send_request);
+	unique_ptr<HTTPResponse> RunGetRequest(HTTPFileHandle &handle, const string &url, const HTTPHeaders &header_map,
 	                                       HTTPFSParams &http_params, const HTTPReadConfig &read_config,
-	                                       CachedFileDownload &download, HTTPErrorCallback get_error,
-	                                       HTTPSendCallback send_request);
-	unique_ptr<HTTPResponse> RunGetRangeRequest(HTTPFileHandle &handle, string url, HTTPHeaders header_map,
-	                                            HTTPFSParams &http_params, const HTTPReadConfig &read_config,
-	                                            idx_t file_offset, data_ptr_t buffer_out, idx_t buffer_out_len,
-	                                            HTTPErrorCallback get_error, HTTPSendCallback send_request);
+	                                       CachedFileDownload &download, const HTTPErrorCallback &get_error,
+	                                       const HTTPSendCallback &send_request);
+	unique_ptr<HTTPResponse> RunGetRangeRequest(HTTPFileHandle &handle, const string &url,
+	                                            const HTTPHeaders &header_map, HTTPFSParams &http_params,
+	                                            const HTTPReadConfig &read_config, idx_t file_offset,
+	                                            data_ptr_t buffer_out, idx_t buffer_out_len,
+	                                            const HTTPErrorCallback &get_error,
+	                                            const HTTPSendCallback &send_request);
 
 private:
 	void ValidateResponseETag(HTTPFileHandle &handle, const HTTPReadConfig &read_config, const HTTPResponse &response);

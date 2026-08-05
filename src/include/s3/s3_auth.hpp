@@ -70,7 +70,7 @@ struct AWSEnvironmentCredentialsProvider {
 
 	DBConfig &config;
 
-	void SetExtensionOptionValue(string key, const char *env_var);
+	void SetExtensionOptionValue(const string &key, const char *env_var);
 	void SetAll();
 };
 

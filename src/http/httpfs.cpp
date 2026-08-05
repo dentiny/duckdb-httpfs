@@ -246,7 +246,7 @@ unique_ptr<HTTPFileHandle> HTTPFileSystem::CreateHandle(const OpenFileInfo &file
 			httpfs_params.bearer_token = kv_secret.TryGetValue("token", true).ToString();
 		}
 	}
-	return duckdb::make_uniq<HTTPFileHandle>(*this, file, flags, std::move(params));
+	return make_uniq<HTTPFileHandle>(*this, file, flags, std::move(params));
 }
 
 unique_ptr<FileHandle> HTTPFileSystem::OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,
@@ -297,7 +297,7 @@ void HTTPFileHandle::RecordNetworkSample(double total_seconds, idx_t bytes, bool
 	tp_sample_count = n;
 }
 
-bool HTTPFileHandle::TryGetNetworkThroughput(NetworkThroughputEstimate &result) {
+bool HTTPFileHandle::GetNetworkThroughputEstimate(NetworkThroughputEstimate &result) {
 	annotated_lock_guard<annotated_mutex> guard(network_estimator_lock);
 	if (tp_sample_count == 0 || tp_latency_seconds <= 0 || tp_bandwidth_bps <= 0) {
 		return false;
@@ -316,7 +316,7 @@ static bool RespondedWithRangeRequestNotSupported(const HTTPResponse &res) {
 	       error.RawMessage() == RangeRequestNotSupportedException::MESSAGE;
 }
 
-bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, string url, HTTPHeaders header_map,
+bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, const string &url, const HTTPHeaders &header_map,
                                      const HTTPReadConfig &read_config, idx_t file_offset, data_ptr_t buffer_out,
                                      idx_t buffer_out_len) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
@@ -405,8 +405,7 @@ void HTTPFileSystem::ReadAtWithFallback(FileHandle &handle, data_ptr_t buffer, i
 		throw HTTPException(Exception::ConstructMessage(
 		    "The size reported by HEAD for '%s' was %llu bytes, but the full GET downloaded %llu bytes. You can try "
 		    "to resolve this by enabling `SET force_download=true`",
-		    hfh.path, static_cast<unsigned long long>(head_reported_length),
-		    static_cast<unsigned long long>(downloaded_length)));
+		    hfh.path, static_cast<uint64_t>(head_reported_length), static_cast<uint64_t>(downloaded_length)));
 	}
 
 	if (!ReadAt(handle, buffer, read_size, location, read_config)) {
@@ -460,7 +459,7 @@ void HTTPFileSystem::FileSync(FileHandle &handle) {
 
 int64_t HTTPFileSystem::GetFileSize(FileHandle &handle) {
 	auto &sfh = handle.Cast<HTTPFileHandle>();
-	return sfh.length;
+	return NumericCast<int64_t>(sfh.length);
 }
 
 timestamp_t HTTPFileSystem::GetLastModifiedTime(FileHandle &handle) {
@@ -580,7 +579,7 @@ struct HTTPFileInfoParser {
 			return optional_idx();
 		}
 		auto content_range = headers.GetHeaderValue("Content-Range");
-		auto range_find = content_range.find("/");
+		auto range_find = content_range.find('/');
 		if (range_find == string::npos || content_range.size() < range_find + 1) {
 			return optional_idx();
 		}
@@ -700,7 +699,7 @@ void HTTPFileHandle::LoadFileInfo() {
 	}
 }
 
-void HTTPFileHandle::TryAddLogger(FileOpener &opener) {
+void HTTPFileHandle::InitializeLogger(FileOpener &opener) {
 	auto context = opener.TryGetClientContext();
 	if (context) {
 		logger = context->logger;
@@ -750,7 +749,7 @@ void HTTPFileHandle::InitializeRequestState(optional_ptr<FileOpener> opener) {
 	file_state = request_snapshot->Params().state->GetFileState(path);
 
 	if (opener) {
-		TryAddLogger(*opener);
+		InitializeLogger(*opener);
 	}
 }
 

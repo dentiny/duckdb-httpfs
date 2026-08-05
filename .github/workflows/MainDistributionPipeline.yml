@@ -17,7 +17,7 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       extension_name: httpfs
-      duckdb_version: 163581a5692c15e17adffa8e078848e7359e5b4f
+      duckdb_version: 043e1894425b49984c5010f253589e5d9c5fdde4
       ci_tools_version: main
 
   duckdb-stable-deploy:
@@ -27,7 +27,7 @@ jobs:
     secrets: inherit
     with:
       extension_name: httpfs
-      duckdb_version: 163581a5692c15e17adffa8e078848e7359e5b4f
+      duckdb_version: 043e1894425b49984c5010f253589e5d9c5fdde4
       ci_tools_version: main
       deploy_latest: ${{ startsWith(github.ref, 'refs/heads/v') }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}
@@ -37,10 +37,11 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
       extension_name: httpfs
-      duckdb_version: 163581a5692c15e17adffa8e078848e7359e5b4f
+      duckdb_version: 043e1894425b49984c5010f253589e5d9c5fdde4
       ci_tools_version: main
       extra_toolchains: 'python3'
-      format_checks: 'format'
+      format_checks: 'format;tidy'
+      explicit_checks: 'readability-convert-member-functions-to-static'
 
   relassert:
     name: Build relassert

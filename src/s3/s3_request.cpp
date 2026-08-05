@@ -439,9 +439,10 @@ static bool IsTransientRetryEligibleMethod(const string &method) {
 	return method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE";
 }
 
-unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, CreateDataCallback create_data,
-                                                bool transient_retry_eligible, RequestCallback request,
-                                                RefreshCallback refresh_auth_params, SetRegionCallback set_region) {
+unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, const CreateDataCallback &create_data,
+                                                bool transient_retry_eligible, const RequestCallback &request,
+                                                const RefreshCallback &refresh_auth_params,
+                                                const SetRegionCallback &set_region) {
 	// Auth refresh and region redirect are one-shot; transient timeouts follow the configured HTTP retry policy.
 	bool retried_auth_refresh = false;
 	bool retried_region = false;
@@ -459,7 +460,7 @@ unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, CreateData
 			string correct_region;
 			if (result && !retried_region &&
 			    GetRegionRedirect(*result, request_data.auth_params, correct_region).IsValid()) {
-				set_region(request_data, std::move(correct_region));
+				set_region(request_data, correct_region);
 				retried_region = true;
 				continue;
 			}
@@ -478,7 +479,7 @@ unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, CreateData
 			}
 			string correct_region;
 			if (!retried_region && GetRegionRedirect(error, request_data.auth_params, correct_region).IsValid()) {
-				set_region(request_data, std::move(correct_region));
+				set_region(request_data, correct_region);
 				retried_region = true;
 				continue;
 			}
@@ -567,7 +568,7 @@ unique_ptr<HTTPResponse> S3RequestExecutor::RunSession(EncryptionUtil &encryptio
                                                        const string &s3_url, const string &method,
                                                        const string &query_string, const string &payload_hash,
                                                        const string &content_type, const string &content_md5,
-                                                       RequestCallback request) {
+                                                       const RequestCallback &request) {
 	return S3RequestExecutor::Run(
 	    s3_url,
 	    [&]() {
@@ -576,7 +577,7 @@ unique_ptr<HTTPResponse> S3RequestExecutor::RunSession(EncryptionUtil &encryptio
 	    },
 	    IsTransientRetryEligibleMethod(method), request,
 	    [&](const S3RequestData &request_data) { return S3RequestExecutor::TryRefreshSession(session, request_data); },
-	    [&](const S3RequestData &request_data, string correct_region) {
+	    [&](const S3RequestData &request_data, const string &correct_region) {
 		    string previous_region;
 		    S3RequestExecutor::SetSessionRegion(session, correct_region, previous_region);
 	    });
@@ -584,7 +585,7 @@ unique_ptr<HTTPResponse> S3RequestExecutor::RunSession(EncryptionUtil &encryptio
 
 unique_ptr<HTTPResponse> S3RequestExecutor::RunHandle(EncryptionUtil &encryption_util, S3FileHandle &s3_handle,
                                                       const string &s3_url, const string &method,
-                                                      const string &version_id, RequestCallback request) {
+                                                      const string &version_id, const RequestCallback &request) {
 	return S3RequestExecutor::Run(
 	    s3_url,
 	    [&]() {
@@ -594,7 +595,7 @@ unique_ptr<HTTPResponse> S3RequestExecutor::RunHandle(EncryptionUtil &encryption
 	    [&](const S3RequestData &request_data) {
 		    return S3RequestExecutor::TryRefreshSession(*s3_handle.request_session, request_data);
 	    },
-	    [&](const S3RequestData &request_data, string correct_region) {
+	    [&](const S3RequestData &request_data, const string &correct_region) {
 		    string previous_region;
 		    if (S3RequestExecutor::SetSessionRegion(*s3_handle.request_session, correct_region, previous_region)) {
 			    auto &params = request_data.http_params->Cast<HTTPFSParams>();
@@ -677,9 +678,9 @@ string S3RequestUtil::GetPayloadHash(EncryptionUtil &encryption_util, const_data
 	}
 }
 
-unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, string url, string &result,
-                                                   const_data_ptr_t buffer_in, idx_t buffer_in_len, string http_params,
-                                                   S3PostRequestMode mode) {
+unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, const string &url, string &result,
+                                                   const_data_ptr_t buffer_in, idx_t buffer_in_len,
+                                                   const string &http_params, S3PostRequestMode mode) {
 	auto payload_hash = S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), buffer_in, buffer_in_len);
 	const string content_type = "application/octet-stream";
 	return S3RequestExecutor::RunSession(
@@ -699,8 +700,9 @@ unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, 
 	    });
 }
 
-unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, string url, const_data_ptr_t buffer_in,
-                                                  idx_t buffer_in_len, string http_params) {
+unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, const string &url,
+                                                  const_data_ptr_t buffer_in, idx_t buffer_in_len,
+                                                  const string &http_params) {
 	auto payload_hash = S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), buffer_in, buffer_in_len);
 	const string content_type = "application/octet-stream";
 	return S3RequestExecutor::RunSession(
@@ -716,7 +718,7 @@ unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, s
 	    });
 }
 
-unique_ptr<HTTPResponse> S3FileSystem::HeadRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
+unique_ptr<HTTPResponse> S3FileSystem::HeadRequest(FileHandle &handle, const string &s3_url, HTTPHeaders header_map) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
 	return S3RequestExecutor::RunHandle(
 	    GetEncryptionUtil(), s3_handle, s3_url, "HEAD", {}, [&](S3RequestData &request_data) {
@@ -763,7 +765,7 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, strin
 	    });
 }
 
-unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) {
+unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, const string &s3_url, HTTPHeaders header_map) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
 	return S3RequestExecutor::RunHandle(
 	    GetEncryptionUtil(), s3_handle, s3_url, "DELETE", {}, [&](S3RequestData &request_data) {
@@ -774,7 +776,8 @@ unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, string 
 	    });
 }
 
-unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(HTTPRequestSession &session, string s3_url, string http_params) {
+unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(HTTPRequestSession &session, const string &s3_url,
+                                                     const string &http_params) {
 	return S3RequestExecutor::RunSession(
 	    GetEncryptionUtil(), session, s3_url, "DELETE", http_params, "", "", "", [&](S3RequestData &request_data) {
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
@@ -816,7 +819,7 @@ optional_idx S3RequestUtil::FindTagContents(const string &response, const string
 	return next_pos;
 }
 
-string S3RequestUtil::GetBadRequestError(const S3AuthParams &s3_auth_params, string correct_region) {
+string S3RequestUtil::GetBadRequestError(const S3AuthParams &s3_auth_params, const string &correct_region) {
 	string extra_text = "\n\nBad Request - this can be caused by the S3 region being set incorrectly.";
 	if (s3_auth_params.region.empty()) {
 		extra_text += "\n* No region is provided.";

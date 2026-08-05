@@ -290,7 +290,8 @@ vector<OpenFileInfo> HuggingFaceFileSystem::Glob(const string &path, FileOpener 
 	return result;
 }
 
-unique_ptr<HTTPResponse> HuggingFaceFileSystem::HeadRequest(FileHandle &handle, string hf_url, HTTPHeaders header_map) {
+unique_ptr<HTTPResponse> HuggingFaceFileSystem::HeadRequest(FileHandle &handle, const string &hf_url,
+                                                            HTTPHeaders header_map) {
 	auto &hf_handle = handle.Cast<HFFileHandle>();
 	auto http_url = HuggingFaceFileSystem::GetFileUrl(hf_handle.parsed_url);
 	return HTTPFileSystem::HeadRequest(handle, http_url, header_map);
@@ -327,7 +328,7 @@ unique_ptr<HTTPFileHandle> HuggingFaceFileSystem::CreateHandle(const OpenFileInf
 	auto params = http_util.InitializeParameters(opener, info);
 	SetParams(params->Cast<HTTPFSParams>(), file.path, opener);
 
-	return duckdb::make_uniq<HFFileHandle>(*this, std::move(parsed_url), file, flags, std::move(params));
+	return make_uniq<HFFileHandle>(*this, std::move(parsed_url), file, flags, std::move(params));
 }
 
 void HuggingFaceFileSystem::SetParams(HTTPFSParams &params, const string &path, optional_ptr<FileOpener> opener) {
@@ -356,8 +357,8 @@ ParsedHFUrl HuggingFaceFileSystem::HFUrlParse(const string &url) {
 		throw InternalException("Not an hf url");
 	}
 
-	size_t last_delim = 5;
-	size_t curr_delim;
+	idx_t last_delim = 5;
+	idx_t curr_delim;
 
 	// Parse Repository type
 	curr_delim = url.find('/', last_delim);

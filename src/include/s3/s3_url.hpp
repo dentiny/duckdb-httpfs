@@ -18,12 +18,12 @@ struct ParsedS3Url {
 };
 
 struct S3Url {
-	static string Decode(string input);
+	static string Decode(const string &input);
 	static string Encode(const string &input, bool encode_slash = false);
 	static bool IsGCS(const string &url);
 	static string TryGetPrefix(const string &url);
 	static string GetPrefix(const string &url);
-	static ParsedS3Url Parse(string url, const S3AuthParams &params);
+	static ParsedS3Url Parse(const string &url, const S3AuthParams &params);
 	static void ReadQueryParams(const string &url_query_param, S3AuthParams &params);
 };
 

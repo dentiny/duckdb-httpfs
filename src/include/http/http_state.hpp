@@ -45,7 +45,7 @@ public:
 		}
 		Guard(const Guard &) = delete;
 		Guard &operator=(const Guard &) = delete;
-		Guard(Guard &&other)
+		Guard(Guard &&other) noexcept
 		    : state(other.state), support(other.support), enabled(other.enabled), owns_probe(other.owns_probe) {
 			other.owns_probe = false;
 		}

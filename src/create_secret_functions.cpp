@@ -326,7 +326,7 @@ unique_ptr<BaseSecret> CreateBearerTokenFunctions::CreateBearerSecretFromConfig(
 	return CreateSecretFunctionInternal(context, input, token);
 }
 
-static string TryReadTokenFile(const string &token_path, const string error_source_message,
+static string TryReadTokenFile(const string &token_path, const string &error_source_message,
                                bool fail_on_exception = true) {
 	try {
 		LocalFileSystem fs;

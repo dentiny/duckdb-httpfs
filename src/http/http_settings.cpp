@@ -54,7 +54,7 @@ static void SetHTTPConnectionCaching(ClientContext &context, SetScope, Value &pa
 #ifndef EMSCRIPTEN
 	auto &http_util = DBConfig::GetConfig(context).GetHTTPUtil();
 	if (http_util.GetName() == "HTTPFS-Curl") {
-		auto &curl_util = static_cast<HTTPFSCurlUtil &>(http_util);
+		auto &curl_util = http_util.Cast<HTTPFSCurlUtil>();
 		curl_util.connection_caching_enabled = BooleanValue::Get(parameter);
 	}
 #endif

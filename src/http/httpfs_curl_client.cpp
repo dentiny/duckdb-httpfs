@@ -17,7 +17,7 @@ namespace duckdb {
 // we statically compile in libcurl, which means the cert file location of the build machine is the
 // place curl will look. But not every distro has this file in the same location, so we search a
 // number of common locations and use the first one we find.
-static std::string certFileLocations[] = {
+static constexpr const char *CERT_FILE_LOCATIONS[] = {
     // Arch, Debian-based, Gentoo
     "/etc/ssl/certs/ca-certificates.crt",
     // RedHat 7 based
@@ -30,14 +30,14 @@ static std::string certFileLocations[] = {
     "/etc/ssl/cert.pem"};
 
 //! Grab the first path that exists, from a list of well-known locations
-static std::string SelectCURLCertPath() {
-	for (std::string &caFile : certFileLocations) {
+static string SelectCURLCertPath() {
+	for (const auto &ca_file : CERT_FILE_LOCATIONS) {
 		struct stat buf;
-		if (stat(caFile.c_str(), &buf) == 0) {
-			return caFile;
+		if (stat(ca_file, &buf) == 0) {
+			return ca_file;
 		}
 	}
-	return std::string();
+	return string();
 }
 
 static size_t RequestWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -63,16 +63,16 @@ static size_t RequestHeaderCallback(void *contents, size_t size, size_t nmemb, v
 	// If header starts with HTTP/... curl has followed a redirect and we have a new Header,
 	// so we push back a new header_collection and store headers from the redirect there.
 	if (header.rfind("HTTP/", 0) == 0) {
-		header_collection.header_collection.push_back(HTTPHeaders());
+		header_collection.header_collection.emplace_back();
 		header_collection.header_collection.back().Insert("__RESPONSE_STATUS__", header);
 	}
 
-	size_t colonPos = header.find(':');
+	idx_t colon_pos = header.find(':');
 
-	if (colonPos != std::string::npos) {
+	if (colon_pos != string::npos) {
 		// Split the string into two parts
-		std::string part1 = header.substr(0, colonPos);
-		std::string part2 = header.substr(colonPos + 1);
+		string part1 = header.substr(0, colon_pos);
+		string part2 = header.substr(colon_pos + 1);
 		if (part2.at(0) == ' ') {
 			part2.erase(0, 1);
 		}
@@ -123,7 +123,7 @@ struct RequestInfo {
 	string url = "";
 	string body = "";
 	uint16_t response_code = 0;
-	std::vector<HTTPHeaders> header_collection;
+	vector<HTTPHeaders> header_collection;
 };
 
 struct CURLGlobalState {
@@ -203,12 +203,13 @@ public:
 
 	static string NormalizePathToBeAdded(string added_path) {
 		while (added_path.size() > 2) {
-			if (StringUtil::StartsWith(added_path, "//"))
+			if (StringUtil::StartsWith(added_path, "//")) {
 				added_path = added_path.substr(1);
-			else if (StringUtil::StartsWith(added_path, "./"))
+			} else if (StringUtil::StartsWith(added_path, "./")) {
 				added_path = added_path.substr(1);
-			else
+			} else {
 				break;
+			}
 		}
 
 		return added_path;
@@ -225,7 +226,7 @@ public:
 		ClientConfigurator::Configure(*this, http_params);
 	}
 
-	~HTTPFSCurlClient() {
+	~HTTPFSCurlClient() override {
 		DestroyCurlGlobal();
 	}
 	static void AddUserAgentIfAvailable(HTTPFSParams &http_params, HTTPHeaders &header_map) {
@@ -311,7 +312,7 @@ public:
 			}
 		}
 
-		bool IsEndOfHeaders(void *contents, idx_t size) const {
+		static bool IsEndOfHeaders(void *contents, idx_t size) {
 			auto header = const_char_ptr_cast(contents);
 			return (size == 2 && header[0] == '\r' && header[1] == '\n') || (size == 1 && header[0] == '\n');
 		}
@@ -343,7 +344,7 @@ public:
 		}
 
 		bool StartResponse() {
-			long response_code;
+			long response_code; // NOLINT(google-runtime-int): required by curl_easy_getinfo
 			if (curl_easy_getinfo(*client.curl, CURLINFO_RESPONSE_CODE, &response_code) != CURLE_OK) {
 				throw IOException("Failed to read the HTTP response status");
 			}
@@ -627,17 +628,12 @@ public:
 	}
 
 private:
-	CURLRequestHeaders TransformHeadersCurl(const HTTPHeaders &header_map, const HTTPParams &params) {
+	static CURLRequestHeaders TransformHeadersCurl(const HTTPHeaders &header_map, const HTTPParams &params) {
 		auto &httpfs_params = params.Cast<HTTPFSParams>();
 
-		std::vector<std::string> headers;
-		for (auto &entry : header_map) {
-			const std::string new_header = entry.first + ": " + entry.second;
-			headers.push_back(new_header);
-		}
 		CURLRequestHeaders curl_headers;
-		for (auto &header : headers) {
-			curl_headers.Add(header);
+		for (auto &entry : header_map) {
+			curl_headers.Add(entry.first + ": " + entry.second);
 		}
 		if (!httpfs_params.pre_merged_headers) {
 			for (auto &entry : params.extra_headers) {
@@ -735,21 +731,22 @@ unique_ptr<HTTPClient> HTTPFSCurlUtil::InitializeClient(HTTPParams &http_params,
 }
 
 unordered_map<string, string> HTTPFSCurlUtil::ParseGetParameters(const string &text) {
-	unordered_map<std::string, std::string> params;
+	unordered_map<string, string> params;
 
 	auto pos = text.find('?');
-	if (pos == std::string::npos)
+	if (pos == string::npos) {
 		return params;
+	}
 
-	std::string query = text.substr(pos + 1);
+	string query = text.substr(pos + 1);
 	std::stringstream ss(query);
-	std::string item;
+	string item;
 
 	while (std::getline(ss, item, '&')) {
 		auto eq_pos = item.find('=');
-		if (eq_pos != std::string::npos) {
-			std::string key = item.substr(0, eq_pos);
-			std::string value = StringUtil::URLDecode(item.substr(eq_pos + 1));
+		if (eq_pos != string::npos) {
+			string key = item.substr(0, eq_pos);
+			string value = StringUtil::URLDecode(item.substr(eq_pos + 1));
 			params[key] = value;
 		} else {
 			params[item] = ""; // key with no value
