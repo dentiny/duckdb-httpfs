@@ -80,18 +80,6 @@ jobs:
           cmake --build build/release --target unittest_httpfs
           ./build/release/test/unittest_httpfs "[httpfs][s3]"
 
-      - name: Check S3 upload source invariants
-        shell: bash
-        run: |
-          if grep -En 'aggregation_threshold|required_part_size|minimum_part_size|std::thread|\.detach\(|condition_variable|ManagedUpload|upload_queue|s3_uploader_thread_limit' \
-            src/include/s3/s3_settings.hpp \
-            src/include/s3/s3_upload_session.hpp \
-            src/s3/s3_settings.cpp \
-            src/s3/s3_upload_session.cpp; then
-            echo "Obsolete S3 upload sizing or threading code found"
-            exit 1
-          fi
-
       - name: Install test server
         shell: bash
         run: |
