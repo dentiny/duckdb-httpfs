@@ -7,6 +7,7 @@
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/http_util.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/thread.hpp"
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/time.hpp"
@@ -78,6 +79,37 @@ private:
 		FileOpener::TryGetCurrentSetting(opener, "unsafe_disable_etag_checks", result->unsafe_disable_etag_checks,
 		                                 info);
 		FileOpener::TryGetCurrentSetting(opener, "s3_version_id_pinning", result->s3_version_id_pinning, info);
+
+		// The base set of headers for every request - a matching secret merges over these per key
+		Value extra_http_headers;
+		if (TryGetSetting("extra_http_headers", extra_http_headers)) {
+			MergeExtraHeaders(extra_http_headers);
+		}
+	}
+
+	SettingLookupResult TryGetSetting(const string &key, Value &value) {
+		if (info) {
+			return FileOpener::TryGetCurrentSetting(opener, key, value, *info);
+		}
+		return FileOpener::TryGetCurrentSetting(opener, key, value);
+	}
+
+	void MergeExtraHeaders(const Value &headers) {
+		if (headers.IsNull()) {
+			return;
+		}
+		if (headers.type().id() != LogicalTypeId::MAP) {
+			throw InvalidInputException("extra_http_headers must be a MAP(VARCHAR, VARCHAR), got \"%s\"",
+			                            headers.type().ToString());
+		}
+		for (const auto &child : MapValue::GetChildren(headers)) {
+			auto key_value = StructValue::GetChildren(child);
+			if (key_value[1].IsNull()) {
+				throw InvalidInputException("extra_http_headers value for \"%s\" must not be NULL",
+				                            key_value[0].GetValue<string>());
+			}
+			result->extra_headers[key_value[0].GetValue<string>()] = key_value[1].GetValue<string>();
+		}
 	}
 
 	void SetUserAgent() {
@@ -118,12 +150,7 @@ private:
 
 		Value extra_headers;
 		if (settings_reader.TryGetSecretKey("extra_http_headers", extra_headers)) {
-			auto children = MapValue::GetChildren(extra_headers);
-			for (const auto &child : children) {
-				auto key_value = StructValue::GetChildren(child);
-				D_ASSERT(key_value.size() == 2);
-				result->extra_headers[key_value[0].GetValue<string>()] = key_value[1].GetValue<string>();
-			}
+			MergeExtraHeaders(extra_headers);
 		}
 	}
 
