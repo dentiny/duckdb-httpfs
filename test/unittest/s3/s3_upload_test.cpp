@@ -18,8 +18,7 @@ namespace duckdb {
 namespace {
 
 struct S3UploadTest {
-	static constexpr idx_t INITIAL_PART_SIZE = S3UploadConfig::MIN_MULTIPART_PART_SIZE;
-
+public:
 	template <class CALLBACK>
 	static string RequireError(CALLBACK callback) {
 		try {
@@ -911,6 +910,9 @@ struct S3UploadTest {
 			RunDuplicateOffsetFailure(client_implementation);
 		}
 	}
+
+public:
+	static constexpr idx_t INITIAL_PART_SIZE = S3UploadConfig::MIN_MULTIPART_PART_SIZE;
 };
 
 } // namespace

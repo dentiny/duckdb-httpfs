@@ -8,8 +8,8 @@ string S3Url::Decode(const string &input) {
 	return StringUtil::URLDecode(input, true);
 }
 
-string S3Url::Encode(const string &input, bool encode_slash) {
-	return StringUtil::URLEncode(input, encode_slash);
+string S3Url::Encode(const string &input, S3URLEncodeMode mode) {
+	return StringUtil::URLEncode(input, mode == S3URLEncodeMode::QUERY_COMPONENT);
 }
 
 static void GetQueryParam(const string &key, string &param, unordered_map<string, string> &query_params) {
@@ -187,7 +187,7 @@ ParsedS3Url S3Url::Parse(const string &url, const S3AuthParams &params) {
 }
 
 string ParsedS3Url::GetHTTPUrl(const string &http_query_string) const {
-	string full_url = http_proto + host + S3Url::Encode(path);
+	string full_url = http_proto + host + S3Url::Encode(path, S3URLEncodeMode::PATH);
 
 	if (!http_query_string.empty()) {
 		full_url += "?" + http_query_string;

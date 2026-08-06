@@ -27,6 +27,7 @@ public:
 		lifecycle.destroyed++;
 	}
 
+public:
 	void Initialize(HTTPParams &params) override {
 		lifecycle.client_initializations++;
 		lifecycle.last_state = params.Cast<HTTPFSParams>().state;
@@ -53,13 +54,15 @@ public:
 		return Success();
 	}
 
-	std::function<void()> on_initialize;
-
 private:
 	static unique_ptr<HTTPResponse> Success() {
 		return make_uniq<HTTPResponse>(HTTPStatusCode::OK_200);
 	}
 
+public:
+	std::function<void()> on_initialize;
+
+private:
 	ClientLifecycle &lifecycle;
 };
 
@@ -68,6 +71,7 @@ public:
 	explicit TrackingHTTPUtil(ClientLifecycle &lifecycle_p) : lifecycle(lifecycle_p) {
 	}
 
+public:
 	unique_ptr<HTTPClient> InitializeClient(HTTPParams &params, const string &proto_host_port) override {
 		lifecycle.initialized++;
 		if (on_initialize) {
@@ -91,6 +95,7 @@ public:
 		return reuse_mode;
 	}
 
+public:
 	ClientLifecycle &lifecycle;
 	HTTPClientReuseMode reuse_mode = HTTPClientReuseMode::SESSION_LOCAL;
 	std::function<void()> on_initialize;

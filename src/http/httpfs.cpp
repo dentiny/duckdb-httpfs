@@ -26,6 +26,10 @@
 
 namespace duckdb {
 
+void RangeRequestNotSupportedException::Throw() {
+	throw HTTPException(MESSAGE);
+}
+
 HTTPUtil &HTTPFSUtil::GetHTTPUtil(optional_ptr<FileOpener> opener) {
 	if (opener) {
 		return opener->GetHTTPUtil();
@@ -34,6 +38,13 @@ HTTPUtil &HTTPFSUtil::GetHTTPUtil(optional_ptr<FileOpener> opener) {
 }
 
 struct HTTPParametersInitializer {
+private:
+	HTTPParametersInitializer(HTTPFSUtil &httpfs_util_p, optional_ptr<FileOpener> opener_p,
+	                          optional_ptr<FileOpenerInfo> info_p)
+	    : httpfs_util(httpfs_util_p), opener(opener_p), info(info_p), result(make_uniq<HTTPFSParams>(httpfs_util)) {
+	}
+
+public:
 	static unique_ptr<HTTPParams> Create(HTTPFSUtil &httpfs_util, optional_ptr<FileOpener> opener,
 	                                     optional_ptr<FileOpenerInfo> info) {
 		HTTPParametersInitializer initializer(httpfs_util, opener, info);
@@ -41,11 +52,6 @@ struct HTTPParametersInitializer {
 	}
 
 private:
-	HTTPParametersInitializer(HTTPFSUtil &httpfs_util_p, optional_ptr<FileOpener> opener_p,
-	                          optional_ptr<FileOpenerInfo> info_p)
-	    : httpfs_util(httpfs_util_p), opener(opener_p), info(info_p), result(make_uniq<HTTPFSParams>(httpfs_util)) {
-	}
-
 	unique_ptr<HTTPParams> Initialize() {
 		result->Initialize(opener);
 		result->state = HTTPState::TryGetState(opener);
@@ -157,6 +163,7 @@ private:
 		}
 	}
 
+private:
 	HTTPFSUtil &httpfs_util;
 	optional_ptr<FileOpener> opener;
 	optional_ptr<FileOpenerInfo> info;
@@ -304,6 +311,10 @@ unique_ptr<FileHandle> HTTPFileSystem::OpenFileExtended(const OpenFileInfo &file
 	DUCKDB_LOG_FILE_SYSTEM_OPEN((*handle));
 
 	return std::move(handle);
+}
+
+bool HTTPFileSystem::SupportsOpenFileExtended() const {
+	return true;
 }
 
 void HTTPFileHandle::RecordNetworkSample(double total_seconds, idx_t bytes, bool sample_has_ttfb, double ttfb_seconds) {
@@ -515,6 +526,42 @@ bool HTTPFileSystem::CanHandleFile(const string &fpath) {
 	return fpath.rfind("https://", 0) == 0 || fpath.rfind("http://", 0) == 0;
 }
 
+vector<OpenFileInfo> HTTPFileSystem::Glob(const string &path, FileOpener *opener) {
+	if (path.find('*') != string::npos && opener) {
+		Value setting_val;
+		if (FileOpener::TryGetCurrentSetting(opener, "allow_asterisks_in_http_paths", setting_val) &&
+		    !setting_val.GetValue<bool>()) {
+			throw InvalidInputException("Globs (`*`) for generic HTTP file is are not supported.\nConsider `SET "
+			                            "allow_asterisks_in_http_paths = true;` to allow this behaviour");
+		}
+	}
+	return {path}; // FIXME
+}
+
+bool HTTPFileSystem::CanSeek() {
+	return true;
+}
+
+bool HTTPFileSystem::OnDiskFile(FileHandle &) {
+	return false;
+}
+
+bool HTTPFileSystem::TryGetNetworkThroughput(FileHandle &handle, NetworkThroughputEstimate &result) {
+	return handle.Cast<HTTPFileHandle>().GetNetworkThroughputEstimate(result);
+}
+
+bool HTTPFileSystem::IsPipe(const string &, optional_ptr<FileOpener>) {
+	return false;
+}
+
+string HTTPFileSystem::GetName() const {
+	return "HTTPFileSystem";
+}
+
+string HTTPFileSystem::PathSeparator(const string &) {
+	return "/";
+}
+
 void HTTPFileSystem::Seek(FileHandle &handle, idx_t location) {
 	auto &sfh = handle.Cast<HTTPFileHandle>();
 	annotated_lock_guard<annotated_mutex> guard(sfh.cursor_mutex);
@@ -530,7 +577,7 @@ idx_t HTTPFileSystem::SeekPosition(FileHandle &handle) {
 optional_ptr<HTTPMetadataCache> HTTPFileSystem::GetGlobalCache() {
 	annotated_lock_guard<annotated_mutex> lock(global_cache_lock);
 	if (!global_metadata_cache) {
-		global_metadata_cache = make_uniq<HTTPMetadataCache>(false, true);
+		global_metadata_cache = make_uniq<HTTPMetadataCache>(HTTPMetadataCacheMode::GLOBAL);
 	}
 	return global_metadata_cache;
 }
@@ -560,7 +607,8 @@ static optional_ptr<HTTPMetadataCache> TryGetMetadataCache(optional_ptr<FileOpen
 	if (use_shared_cache) {
 		return httpfs.GetGlobalCache();
 	} else if (client_context) {
-		return client_context->registered_state->GetOrCreate<HTTPMetadataCache>("http_cache", true, true);
+		return client_context->registered_state->GetOrCreate<HTTPMetadataCache>("http_cache",
+		                                                                        HTTPMetadataCacheMode::QUERY_LOCAL);
 	}
 	return nullptr;
 }
@@ -601,25 +649,26 @@ bool HTTPFileSystem::TryParseLastModifiedTime(const string &timestamp, timestamp
 }
 
 struct HTTPFileInfoParser {
+public:
 	static optional_idx TryParseContentRange(const HTTPHeaders &headers) {
 		if (!headers.HasHeader("Content-Range")) {
-			return optional_idx();
+			return {};
 		}
 		auto content_range = headers.GetHeaderValue("Content-Range");
 		auto range_find = content_range.find('/');
 		if (range_find == string::npos || content_range.size() < range_find + 1) {
-			return optional_idx();
+			return {};
 		}
 		auto range_length = content_range.substr(range_find + 1);
 		if (range_length == "*") {
-			return optional_idx();
+			return {};
 		}
 		return TryParseLength(range_length);
 	}
 
 	static optional_idx TryParseContentLength(const HTTPHeaders &headers) {
 		if (!headers.HasHeader("Content-Length")) {
-			return optional_idx();
+			return {};
 		}
 		return TryParseLength(headers.GetHeaderValue("Content-Length"));
 	}
@@ -629,7 +678,7 @@ private:
 		try {
 			return NumericCast<idx_t>(std::stoull(input));
 		} catch (...) {
-			return optional_idx();
+			return {};
 		}
 	}
 };
@@ -847,6 +896,9 @@ shared_ptr<const HTTPRequestSnapshot> HTTPFileHandle::CreateRequestSnapshot(cons
 
 HTTPFileHandle::~HTTPFileHandle() {
 	DUCKDB_LOG_FILE_SYSTEM_CLOSE((*this));
+}
+
+void HTTPFileHandle::Close() {
 }
 
 void HTTPFSUtil::ClearCachedConnections() {

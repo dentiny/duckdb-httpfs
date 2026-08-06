@@ -43,7 +43,9 @@ extern "C" {
 class DUCKDB_EXTENSION_API AESStateSSLFactory : public duckdb::EncryptionUtil {
 public:
 	explicit AESStateSSLFactory();
+	~AESStateSSLFactory() override;
 
+public:
 	duckdb::shared_ptr<duckdb::EncryptionState>
 	CreateEncryptionState(duckdb::unique_ptr<duckdb::EncryptionStateMetadata> metadata) const override;
 	duckdb::unique_ptr<duckdb::CryptoHashState> CreateHashState(duckdb::CryptoHashFunction function) const override;
@@ -53,7 +55,5 @@ public:
 	          duckdb::const_data_ptr_t input, duckdb::idx_t input_len, duckdb::data_ptr_t output) const override;
 	bool SupportsHash(duckdb::CryptoHashFunction function) const override;
 	bool SupportsHmac(duckdb::CryptoHashFunction function) const override;
-
-	~AESStateSSLFactory() override;
 };
 }

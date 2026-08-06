@@ -172,6 +172,7 @@ public:
 	MockS3Server(const MockS3Server &) = delete;
 	MockS3Server &operator=(const MockS3Server &) = delete;
 
+public:
 	string Endpoint() const;
 	string HTTPPath() const;
 	string S3Path() const;

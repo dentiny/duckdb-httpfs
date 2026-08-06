@@ -39,6 +39,16 @@ TEST_CASE("S3 XML responses follow text and namespace semantics", "[httpfs][s3][
 		REQUIRE(response.type == S3XMLResponseType::MULTIPART_COMPLETION);
 		CHECK(response.etag == "\"etag\"");
 	}
+	SECTION("default namespaces do not apply to unprefixed attributes") {
+		const string input =
+		    "<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\" "
+		    "xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\" value=\"plain\" s3:value=\"namespaced\">"
+		    "<ETag>etag</ETag></CompleteMultipartUploadResult>";
+		S3XMLResponse response;
+		REQUIRE(S3XMLResponseParser::TryParse(input, response));
+		REQUIRE(response.type == S3XMLResponseType::MULTIPART_COMPLETION);
+		CHECK(response.etag == "etag");
+	}
 	SECTION("comments and CDATA contribute text") {
 		const string input = "<Error><!-- ignored --><Code><![CDATA[InternalError]]></Code>"
 		                     "<Message>failed<!-- ignored --> safely</Message></Error>";

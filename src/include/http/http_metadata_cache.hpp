@@ -23,20 +23,24 @@ struct HTTPMetadataCacheEntry {
 	unordered_map<string, string> properties;
 };
 
-// Simple cache with a max age for an entry to be valid
+enum class HTTPMetadataCacheMode : uint8_t { GLOBAL, QUERY_LOCAL };
+
+//! Simple cache with a max age for an entry to be valid
 class HTTPMetadataCache : public ClientContextState {
 public:
-	explicit HTTPMetadataCache(bool flush_on_query_end_p, bool) : flush_on_query_end(flush_on_query_end_p) {};
+	explicit HTTPMetadataCache(HTTPMetadataCacheMode mode_p) : mode(mode_p) {
+	}
 
+public:
 	void Insert(const string &path, HTTPMetadataCacheEntry val) DUCKDB_EXCLUDES(lock) {
 		annotated_lock_guard<annotated_mutex> guard(lock);
 		map[path] = std::move(val);
-	};
+	}
 
 	void Erase(const string &path) DUCKDB_EXCLUDES(lock) {
 		annotated_lock_guard<annotated_mutex> guard(lock);
 		map.erase(path);
-	};
+	}
 
 	bool Find(const string &path, HTTPMetadataCacheEntry &ret_val) DUCKDB_EXCLUDES(lock) {
 		annotated_lock_guard<annotated_mutex> guard(lock);
@@ -46,7 +50,7 @@ public:
 		}
 		ret_val = lookup->second;
 		return true;
-	};
+	}
 
 	void Clear() DUCKDB_EXCLUDES(lock) {
 		annotated_lock_guard<annotated_mutex> guard(lock);
@@ -55,7 +59,7 @@ public:
 
 	//! Called by the ClientContext when the current query ends
 	void QueryEnd(ClientContext &context) override {
-		if (flush_on_query_end) {
+		if (mode == HTTPMetadataCacheMode::QUERY_LOCAL) {
 			Clear();
 		}
 	}
@@ -63,7 +67,7 @@ public:
 protected:
 	annotated_mutex lock;
 	unordered_map<string, HTTPMetadataCacheEntry> map DUCKDB_GUARDED_BY(lock);
-	bool flush_on_query_end;
+	HTTPMetadataCacheMode mode;
 };
 
 } // namespace duckdb

@@ -19,15 +19,7 @@ private:
 };
 
 struct S3TestHelper {
-	static constexpr const char *STALE_KEY_ID = "STALE_KEY";
-	static constexpr const char *FRESH_KEY_ID = "FRESH_KEY";
-	static constexpr const char *STALE_SECRET = "STALE_SECRET";
-	static constexpr const char *FRESH_SECRET = "FRESH_SECRET";
-	static constexpr const char *TEST_PROVIDER = "httpfs_refresh_test";
-	static constexpr const char *BUCKET = "refresh-bucket";
-	static constexpr const char *OBJECT_KEY = "object.bin";
-	static constexpr const char *S3_PATH = "s3://refresh-bucket/object.bin";
-
+public:
 	static void LoadExtension(DuckDB &db);
 	static void RegisterRefreshProvider(DuckDB &db);
 	static void RequireQueryOk(Connection &con, const string &query);
@@ -47,6 +39,16 @@ struct S3TestHelper {
 	                                    const string &key_id, int status, const string &range = string());
 	static void WriteMultipartPayload(Connection &con);
 	static void WriteSinglePutPayload(Connection &con);
+
+public:
+	static constexpr const char *STALE_KEY_ID = "STALE_KEY";
+	static constexpr const char *FRESH_KEY_ID = "FRESH_KEY";
+	static constexpr const char *STALE_SECRET = "STALE_SECRET";
+	static constexpr const char *FRESH_SECRET = "FRESH_SECRET";
+	static constexpr const char *TEST_PROVIDER = "httpfs_refresh_test";
+	static constexpr const char *BUCKET = "refresh-bucket";
+	static constexpr const char *OBJECT_KEY = "object.bin";
+	static constexpr const char *S3_PATH = "s3://refresh-bucket/object.bin";
 };
 
 } // namespace duckdb

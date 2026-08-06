@@ -7,10 +7,10 @@
 
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include <atomic>
-#include <unordered_map>
 
 namespace duckdb {
 
@@ -24,8 +24,8 @@ struct ProviderStats {
 
 struct ProviderRegistry {
 	annotated_mutex lock;
-	std::unordered_map<string, ProviderStats> stats DUCKDB_GUARDED_BY(lock);
-	std::unordered_map<string, std::function<void()>> refresh_hooks DUCKDB_GUARDED_BY(lock);
+	unordered_map<string, ProviderStats> stats DUCKDB_GUARDED_BY(lock);
+	unordered_map<string, std::function<void()>> refresh_hooks DUCKDB_GUARDED_BY(lock);
 };
 
 static ProviderRegistry &GetProviderRegistry() {

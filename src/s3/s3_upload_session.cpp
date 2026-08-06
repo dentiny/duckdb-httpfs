@@ -136,12 +136,12 @@ unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginFinalize(bool &a
 }
 
 void S3UploadSession::ReleaseWrite() DUCKDB_EXCLUDES(state_lock) {
-	ReleaseOperation(true);
+	ReleaseOperation();
 }
 
 void S3UploadSession::ReleaseWriteNoThrow() noexcept DUCKDB_EXCLUDES(state_lock) {
 	try {
-		ReleaseOperation(false);
+		ReleaseOperation();
 	} catch (...) {
 	}
 }
@@ -177,7 +177,7 @@ void S3UploadSession::LatchFailure(ErrorData error, FailureDisposition dispositi
 	}
 }
 
-void S3UploadSession::ReleaseOperation(bool rethrow_failure) DUCKDB_EXCLUDES(state_lock) {
+void S3UploadSession::ReleaseOperation() DUCKDB_EXCLUDES(state_lock) {
 	shared_ptr<const string> upload_id;
 	bool cleanup_owner = false;
 	FailureSnapshot failure;
@@ -222,14 +222,12 @@ void S3UploadSession::ReleaseOperation(bool rethrow_failure) DUCKDB_EXCLUDES(sta
 			state_changed.notify_all();
 		}
 	}
-	if (rethrow_failure) {
-		ThrowFailure(failure);
-	}
+	ThrowFailure(failure);
 }
 
 void S3UploadSession::FailOperation(ErrorData error, FailureDisposition disposition) DUCKDB_EXCLUDES(state_lock) {
 	LatchFailure(std::move(error), disposition);
-	ReleaseOperation(true);
+	ReleaseOperation();
 	throw InternalException("Failed S3 operation did not rethrow its error");
 }
 

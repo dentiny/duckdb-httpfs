@@ -59,7 +59,8 @@ S3RequestQuery::S3RequestQuery(vector<pair<string, string>> parameters_p) : para
 	vector<pair<string, string>> encoded_parameters;
 	encoded_parameters.reserve(parameters.size());
 	for (const auto &parameter : parameters) {
-		encoded_parameters.emplace_back(S3Url::Encode(parameter.first, true), S3Url::Encode(parameter.second, true));
+		encoded_parameters.emplace_back(S3Url::Encode(parameter.first, S3URLEncodeMode::QUERY_COMPONENT),
+		                                S3Url::Encode(parameter.second, S3URLEncodeMode::QUERY_COMPONENT));
 	}
 	std::sort(encoded_parameters.begin(), encoded_parameters.end());
 	for (const auto &parameter : encoded_parameters) {
@@ -89,6 +90,7 @@ bool S3RequestQuery::HasParameter(const string &name) const {
 }
 
 struct S3HeaderBuilder {
+public:
 	S3HeaderBuilder(EncryptionUtil &encryption_util_p, string url_p, const S3RequestQuery &query_p, string host_p,
 	                string service_p, RequestType request_type_p, const S3AuthParams &auth_params_p, string date_now_p,
 	                string datetime_now_p, string payload_hash_p, string content_type_p, string content_md5_p)
@@ -102,6 +104,7 @@ struct S3HeaderBuilder {
 	                  !query_p.HasParameter("uploadId")) {
 	}
 
+public:
 	HTTPHeaders Create() {
 		headers["Host"] = host;
 		if (auth_params.secret_access_key.empty() && auth_params.access_key_id.empty()) {
@@ -173,7 +176,7 @@ private:
 	}
 
 	string BuildCanonicalRequest(const string &signed_headers) const {
-		auto result = method + "\n" + S3Url::Encode(url) + "\n" + query;
+		auto result = method + "\n" + S3Url::Encode(url, S3URLEncodeMode::PATH) + "\n" + query;
 		if (!content_md5.empty()) {
 			result += "\ncontent-md5:" + content_md5;
 		}
@@ -220,6 +223,7 @@ private:
 		return date_now + "/" + auth_params.region + "/" + service + "/aws4_request";
 	}
 
+private:
 	EncryptionUtil &encryption_util;
 	const string url;
 	const string query;
@@ -436,31 +440,31 @@ S3RequestData S3RequestExecutor::CreateHandleRequestData(EncryptionUtil &encrypt
 static optional_idx GetRegionRedirect(const HTTPResponse &response, const S3AuthParams &auth_params,
                                       string &region_out) {
 	if (response.status != HTTPStatusCode::MovedPermanently_301 && response.status != HTTPStatusCode::BadRequest_400) {
-		return optional_idx();
+		return {};
 	}
 	if (!response.HasHeader("x-amz-bucket-region")) {
-		return optional_idx();
+		return {};
 	}
 	auto response_region = response.GetHeaderValue("x-amz-bucket-region");
 	if (response_region.empty() || response_region == auth_params.region) {
-		return optional_idx();
+		return {};
 	}
 	region_out = std::move(response_region);
-	return optional_idx(0);
+	return {0};
 }
 
 static optional_idx GetRegionRedirect(const ErrorData &error, const S3AuthParams &auth_params, string &region_out) {
 	auto &extra_info = error.ExtraInfo();
 	auto entry = extra_info.find("status_code");
 	if (entry == extra_info.end() || (entry->second != "301" && entry->second != "400")) {
-		return optional_idx();
+		return {};
 	}
 	auto new_region = extra_info.find("header_x-amz-bucket-region");
 	if (new_region == extra_info.end() || new_region->second.empty() || new_region->second == auth_params.region) {
-		return optional_idx();
+		return {};
 	}
 	region_out = new_region->second;
-	return optional_idx(0);
+	return {0};
 }
 
 // Core's status-based retry can't catch this: the discriminator is only in the S3 error body.
@@ -500,7 +504,7 @@ static bool IsTransientRetryEligibleMethod(RequestType request_type) {
 }
 
 unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, const CreateDataCallback &create_data,
-                                                bool transient_retry_eligible, const RequestCallback &request,
+                                                const RequestCallback &request,
                                                 const RefreshCallback &refresh_auth_params,
                                                 const SetRegionCallback &set_region,
                                                 const FinalRequestCallback &final_request) {
@@ -525,8 +529,8 @@ unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, const Crea
 				retried_region = true;
 				continue;
 			}
-			if (transient_retry_eligible && result && transient_retries < http_params.retries &&
-			    S3RequestUtil::IsRequestTimeout(*result)) {
+			if (IsTransientRetryEligibleMethod(request_data.request_type) && result &&
+			    transient_retries < http_params.retries && S3RequestUtil::IsRequestTimeout(*result)) {
 				SleepForRetry(http_params, transient_retries, transient_wait_ms);
 				transient_retries++;
 				continue;
@@ -547,7 +551,8 @@ unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, const Crea
 				retried_region = true;
 				continue;
 			}
-			if (transient_retry_eligible && transient_retries < http_params.retries && IsS3RequestTimeoutError(error)) {
+			if (IsTransientRetryEligibleMethod(request_data.request_type) && transient_retries < http_params.retries &&
+			    IsS3RequestTimeoutError(error)) {
 				SleepForRetry(http_params, transient_retries, transient_wait_ms);
 				transient_retries++;
 				continue;
@@ -641,7 +646,7 @@ unique_ptr<HTTPResponse> S3RequestExecutor::RunSession(EncryptionUtil &encryptio
 		    return S3RequestExecutor::CreateRequestData(encryption_util, session.Capture(), s3_url, request_type,
 		                                                target, create_query, payload_hash, content_type, content_md5);
 	    },
-	    IsTransientRetryEligibleMethod(request_type), request,
+	    request,
 	    [&](const S3RequestData &request_data) { return S3RequestExecutor::TryRefreshSession(session, request_data); },
 	    [&](const S3RequestData &request_data, const string &correct_region) {
 		    string previous_region;
@@ -667,7 +672,7 @@ unique_ptr<HTTPResponse> S3RequestExecutor::RunHandle(EncryptionUtil &encryption
 		    return S3RequestExecutor::CreateHandleRequestData(encryption_util, s3_handle, s3_url, request_type,
 		                                                      version_id);
 	    },
-	    IsTransientRetryEligibleMethod(request_type), request,
+	    request,
 	    [&](const S3RequestData &request_data) {
 		    return S3RequestExecutor::TryRefreshSession(*s3_handle.request_session, request_data);
 	    },

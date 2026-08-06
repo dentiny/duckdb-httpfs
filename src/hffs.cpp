@@ -116,12 +116,15 @@ static bool Match(vector<string>::const_iterator key, vector<string>::const_iter
 }
 
 struct HFListResultParser {
+public:
 	enum class EntryType : uint8_t { FILE, DIRECTORY, UNKNOWN };
 
+public:
 	HFListResultParser(const string &input_p, vector<string> &files_p, vector<string> &directories_p)
 	    : input(input_p), files(files_p), directories(directories_p) {
 	}
 
+public:
 	static void Parse(const string &input, vector<string> &files, vector<string> &directories) {
 		HFListResultParser(input, files, directories).ParseEntries();
 	}
@@ -210,6 +213,7 @@ private:
 		}
 	}
 
+private:
 	const string &input;
 	vector<string> &files;
 	vector<string> &directories;

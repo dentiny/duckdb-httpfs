@@ -142,12 +142,12 @@ struct MockS3XMLText {
 static optional_idx GetPartNumber(const httplib::Request &request) {
 	auto part_number = GetParameter(request, "partNumber");
 	if (part_number.empty()) {
-		return optional_idx();
+		return {};
 	}
 	try {
-		return optional_idx(NumericCast<idx_t>(std::stoull(part_number)));
+		return {NumericCast<idx_t>(std::stoull(part_number))};
 	} catch (...) {
-		return optional_idx();
+		return {};
 	}
 }
 
@@ -212,11 +212,26 @@ private:
 } // namespace
 
 struct MockS3Server::Impl {
+public:
 	struct UploadedPart {
 		string etag;
 		string body;
 	};
 
+	struct ActivePartUpload {
+		ActivePartUpload(Impl &server_p, idx_t part_number) : server(server_p) {
+			server.get().BeginPartUpload(part_number);
+		}
+
+		~ActivePartUpload() {
+			server.get().FinishPartUpload();
+		}
+
+	public:
+		reference<Impl> server;
+	};
+
+public:
 	explicit Impl(MockS3ServerConfig config_p) : config(std::move(config_p)) {
 		remaining_put_failures = config.failures.transient_put_failures;
 		remaining_get_failures = config.failures.transient_get_failures;
@@ -248,6 +263,7 @@ struct MockS3Server::Impl {
 		}
 	}
 
+public:
 	string Endpoint() const {
 		return StringUtil::Format("127.0.0.1:%d", port);
 	}
@@ -659,18 +675,6 @@ struct MockS3Server::Impl {
 		active_part_uploads--;
 	}
 
-	struct ActivePartUpload {
-		ActivePartUpload(Impl &server_p, idx_t part_number) : server(server_p) {
-			server.get().BeginPartUpload(part_number);
-		}
-
-		~ActivePartUpload() {
-			server.get().FinishPartUpload();
-		}
-
-		reference<Impl> server;
-	};
-
 	void SendBulkDeleteSuccess(const httplib::Request &request, httplib::Response &response) const {
 		response.status = 200;
 		response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
@@ -1033,12 +1037,16 @@ struct MockS3Server::Impl {
 		});
 	}
 
+public:
+	//! Server configuration and lifetime
 	MockS3ServerConfig config;
-	mutable std::atomic<idx_t> transient_503_lists_sent {0};
-	mutable std::atomic<idx_t> transient_400_lists_sent {0};
 	httplib::Server server;
 	std::thread server_thread;
 	int port = 0;
+
+	//! Injected request failures
+	mutable std::atomic<idx_t> transient_503_lists_sent {0};
+	mutable std::atomic<idx_t> transient_400_lists_sent {0};
 	mutable std::atomic<idx_t> remaining_put_failures {0};
 	mutable std::atomic<idx_t> remaining_get_failures {0};
 	mutable std::atomic<idx_t> remaining_range_behavior_requests {0};
@@ -1048,8 +1056,12 @@ struct MockS3Server::Impl {
 	mutable std::atomic<idx_t> remaining_post_failures {0};
 	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
 	mutable std::atomic<idx_t> remaining_complete_post_200_errors {0};
+
+	//! Request observations
 	mutable annotated_mutex observation_lock;
 	mutable vector<MockS3RequestObservation> observations DUCKDB_GUARDED_BY(observation_lock);
+
+	//! Multipart upload state
 	mutable annotated_mutex upload_lock;
 	map<idx_t, UploadedPart> uploaded_parts DUCKDB_GUARDED_BY(upload_lock);
 	set<idx_t> parts_seen DUCKDB_GUARDED_BY(upload_lock);
@@ -1061,17 +1073,23 @@ struct MockS3Server::Impl {
 	bool part_uploads_released DUCKDB_GUARDED_BY(upload_lock) = false;
 	std::condition_variable part_upload_started;
 	std::condition_variable part_upload_release;
+
+	//! Multipart initialization coordination
 	annotated_mutex initialization_lock;
 	std::condition_variable initialization_started;
 	std::condition_variable initialization_release;
 	bool initialization_seen DUCKDB_GUARDED_BY(initialization_lock) = false;
 	bool initialization_released DUCKDB_GUARDED_BY(initialization_lock) = false;
+
+	//! Range request coordination
 	annotated_mutex range_request_lock;
 	std::condition_variable range_request_started;
 	idx_t range_requests_seen DUCKDB_GUARDED_BY(range_request_lock) = 0;
 	annotated_mutex range_release_lock;
 	std::condition_variable range_release;
 	bool release_range_completed DUCKDB_GUARDED_BY(range_release_lock) = false;
+
+	//! Full GET coordination
 	annotated_mutex full_get_lock;
 	std::condition_variable full_get_started;
 	std::condition_variable full_get_release;

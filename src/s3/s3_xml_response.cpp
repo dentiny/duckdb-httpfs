@@ -11,6 +11,8 @@ namespace duckdb {
 
 namespace {
 
+enum class S3XMLNameType : uint8_t { ELEMENT, ATTRIBUTE };
+
 struct S3XMLQualifiedName {
 	string prefix;
 	string local_name;
@@ -42,10 +44,12 @@ struct S3XMLElementFrame {
 };
 
 struct S3XMLReader {
+public:
 	explicit S3XMLReader(const string &input_p) : input(input_p) {
 		namespaces.push_back({"xml", XML_NAMESPACE});
 	}
 
+public:
 	bool Parse(S3XMLResponse &response) {
 		response = S3XMLResponse();
 		if (!ParseDocument()) {
@@ -495,7 +499,7 @@ private:
 			return false;
 		}
 		string namespace_uri;
-		if (!ResolveNamespace(element_name, true, namespace_uri) || !ValidateAttributes(attributes)) {
+		if (!ResolveNamespace(element_name, S3XMLNameType::ELEMENT, namespace_uri) || !ValidateAttributes(attributes)) {
 			namespaces.resize(namespace_count);
 			return false;
 		}
@@ -574,11 +578,11 @@ private:
 		return true;
 	}
 
-	bool ResolveNamespace(const S3XMLQualifiedName &name, bool element, string &namespace_uri) const {
+	bool ResolveNamespace(const S3XMLQualifiedName &name, S3XMLNameType name_type, string &namespace_uri) const {
 		if (name.prefix == "xmlns") {
 			return false;
 		}
-		if (name.prefix.empty() && !element) {
+		if (name.prefix.empty() && name_type == S3XMLNameType::ATTRIBUTE) {
 			namespace_uri.clear();
 			return true;
 		}
@@ -603,7 +607,7 @@ private:
 				continue;
 			}
 			string namespace_uri;
-			if (!ResolveNamespace(attribute.name, false, namespace_uri)) {
+			if (!ResolveNamespace(attribute.name, S3XMLNameType::ATTRIBUTE, namespace_uri)) {
 				return false;
 			}
 			for (const auto &existing : expanded_names) {

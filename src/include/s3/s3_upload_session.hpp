@@ -28,16 +28,19 @@ public:
 	class WriteClaim {
 		friend class S3UploadSession;
 
+	private:
+		explicit WriteClaim(S3UploadSession &session_p);
+
 	public:
 		WriteClaim(WriteClaim &&other) noexcept;
 		WriteClaim(const WriteClaim &) = delete;
 		WriteClaim &operator=(const WriteClaim &) = delete;
 		~WriteClaim();
 
+	public:
 		void Finish();
 
 	private:
-		explicit WriteClaim(S3UploadSession &session_p);
 		[[noreturn]] void Fail(ErrorData error, FailureDisposition disposition);
 
 	private:
@@ -50,6 +53,7 @@ public:
 	                S3UploadConfig config);
 	~S3UploadSession() noexcept;
 
+public:
 	WriteClaim Write(const_data_ptr_t data, idx_t size, idx_t location);
 	void Finalize();
 
@@ -66,10 +70,12 @@ private:
 		BufferedPart(BufferHandle buffer_p, idx_t capacity_p) : buffer(std::move(buffer_p)), capacity(capacity_p) {
 		}
 
+	public:
 		data_ptr_t Ptr() {
 			return buffer.GetDataMutable();
 		}
 
+	public:
 		BufferHandle buffer;
 		const idx_t capacity;
 		idx_t size = 0;
@@ -89,6 +95,7 @@ private:
 		      size(buffered_part->size) {
 		}
 
+	public:
 		idx_t part_number;
 		unique_ptr<BufferedPart> buffered_part;
 		const_data_ptr_t data;
@@ -104,7 +111,7 @@ private:
 	void BeginWriteOperation() DUCKDB_EXCLUDES(state_lock);
 	PreparedWrite PrepareWrite(const_data_ptr_t data, idx_t size, idx_t location) DUCKDB_EXCLUDES(state_lock);
 	unique_ptr<BufferedPart> BeginFinalize(bool &already_finalized) DUCKDB_EXCLUDES(state_lock);
-	void ReleaseOperation(bool rethrow_failure) DUCKDB_EXCLUDES(state_lock);
+	void ReleaseOperation() DUCKDB_EXCLUDES(state_lock);
 	void ReleaseWrite() DUCKDB_EXCLUDES(state_lock);
 	void ReleaseWriteNoThrow() noexcept DUCKDB_EXCLUDES(state_lock);
 	void FinishFinalize() DUCKDB_EXCLUDES(state_lock);

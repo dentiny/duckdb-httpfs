@@ -22,6 +22,7 @@ class HuggingFaceFileSystem : public HTTPFileSystem {
 public:
 	~HuggingFaceFileSystem() override;
 
+public:
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override;
 
 	unique_ptr<HTTPResponse> HeadRequest(FileHandle &handle, const string &hf_url, HTTPHeaders header_map) override;

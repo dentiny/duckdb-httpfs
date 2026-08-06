@@ -138,6 +138,7 @@ static void SetRangeRequestNotSupported(HTTPResponse &response) {
 }
 
 struct HTTPRangeRequestContext {
+public:
 	HTTPRangeRequestContext(HTTPFileHandle &handle_p, const HTTPReadConfig &read_config_p, string url_p,
 	                        string range_expression_p, data_ptr_t buffer_out_p, idx_t buffer_out_len_p,
 	                        RangeRequestState::Guard range_request_p,
@@ -149,6 +150,7 @@ struct HTTPRangeRequestContext {
 	      validate_response(std::move(validate_response_p)) {
 	}
 
+public:
 	bool HandleResponse(const HTTPResponse &response) {
 		if (response.status == HTTPStatusCode::PreconditionFailed_412 &&
 		    read_config.condition.type == HTTPReadConditionType::ETAG) {
@@ -241,6 +243,7 @@ private:
 		handle.RecordNetworkSample(total_seconds, bytes, request.have_time_to_fst_byte, request.time_to_fst_byte_sec);
 	}
 
+private:
 	HTTPFileHandle &handle;
 	const HTTPReadConfig &read_config;
 	const string url;

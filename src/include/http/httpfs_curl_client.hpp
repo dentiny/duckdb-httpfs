@@ -12,6 +12,9 @@ struct FileOpenerInfo;
 class HTTPState;
 
 class CURLURLHandle {
+private:
+	explicit CURLURLHandle(CURLU *handle_p);
+
 public:
 	CURLURLHandle();
 	CURLURLHandle(const CURLURLHandle &other);
@@ -19,13 +22,12 @@ public:
 
 	CURLURLHandle &operator=(const CURLURLHandle &) = delete;
 
+public:
 	CURLU *Get() {
 		return handle;
 	}
 
 private:
-	explicit CURLURLHandle(CURLU *handle_p);
-
 	CURLU *handle;
 };
 
@@ -60,18 +62,18 @@ public:
 	}
 	CURLRequestHeaders(const CURLRequestHeaders &) = delete;
 	CURLRequestHeaders &operator=(const CURLRequestHeaders &) = delete;
-
 	~CURLRequestHeaders() {
 		if (headers) {
 			curl_slist_free_all(headers);
 		}
 		headers = nullptr;
 	}
+
+public:
 	explicit operator bool() const {
 		return headers != nullptr;
 	}
 
-public:
 	void Add(const string &header) {
 		headers = curl_slist_append(headers, header.c_str());
 	}
