@@ -30,6 +30,24 @@ public:
 		return reader.TryGetSecretKey(secret_key, value_out);
 	}
 
+	template <class TYPE>
+	SettingLookupResult TryGetSecretKeysOrSetting(const string &secret_key, const string &legacy_secret_key,
+	                                              const string &setting_name, TYPE &result) {
+		Value temp_result;
+		auto setting_scope = reader.TryGetSecretKey(secret_key, temp_result);
+		if (!setting_scope) {
+			setting_scope = reader.TryGetSecretKey(legacy_secret_key, temp_result);
+		}
+		if (!setting_scope) {
+			setting_scope = reader.TryGetSecretKeyOrSetting(secret_key, setting_name, temp_result);
+		}
+		if (!temp_result.IsNull() && !(setting_scope && setting_scope.GetScope() == SettingScope::GLOBAL &&
+		                               !use_env_variables_for_secret_settings)) {
+			result = temp_result.GetValue<TYPE>();
+		}
+		return setting_scope;
+	}
+
 private:
 	bool use_env_variables_for_secret_settings;
 	KeyValueSecretReader reader;
@@ -52,6 +70,7 @@ struct S3AuthParams {
 	static S3AuthParams ReadFrom(optional_ptr<FileOpener> opener, FileOpenerInfo &info);
 	static S3AuthParams ReadFrom(S3KeyValueReader &secret_reader, const string &file_path);
 	void SetRegion(string region_p);
+	bool operator==(const S3AuthParams &other) const;
 };
 
 struct AWSEnvironmentCredentialsProvider {

@@ -36,8 +36,9 @@ struct S3Provider {
 	                                 KeyValueSecret &secret);
 
 	static void ReadAuthParams(S3KeyValueReader &secret_reader, const string &file_path, S3AuthParams &result);
-	static void InitializeEndpoint(S3AuthParams &auth_params);
+	static void InitializeAuthParams(S3AuthParams &auth_params);
 	static S3AuthType GetAuthType(const S3AuthParams &auth_params);
+	static string GetBadRequestError(const S3AuthParams &auth_params, const string &correct_region = "");
 	static string GetAuthError(const S3AuthParams &auth_params);
 };
 

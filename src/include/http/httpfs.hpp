@@ -179,7 +179,8 @@ public:
 	static void Verify();
 
 	optional_ptr<HTTPMetadataCache> GetGlobalCache();
-	virtual HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url);
+	virtual HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, RequestType request_type,
+	                                   const string &url);
 
 	//! HTTP request overrides.
 	virtual unique_ptr<HTTPResponse> HeadRequest(FileHandle &handle, const string &url, HTTPHeaders header_map);

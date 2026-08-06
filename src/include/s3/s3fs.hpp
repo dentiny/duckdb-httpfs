@@ -85,14 +85,18 @@ public:
 	                                         data_ptr_t buffer_out, idx_t buffer_out_len) override;
 	unique_ptr<HTTPResponse> PostRequest(HTTPRequestSession &session, const string &s3_url, string &buffer_out,
 	                                     const_data_ptr_t buffer_in, idx_t buffer_in_len,
-	                                     const string &http_params = "",
-	                                     S3PostRequestMode mode = S3PostRequestMode::REPLAYABLE);
+	                                     const S3RequestQuery &query = S3RequestQuery(),
+	                                     S3PostRequestMode mode = S3PostRequestMode::REPLAYABLE,
+	                                     optional_ptr<S3RequestContext> request_context = nullptr);
 	unique_ptr<HTTPResponse> PutRequest(HTTPRequestSession &session, const string &s3_url, const_data_ptr_t buffer_in,
-	                                    idx_t buffer_in_len, const string &http_params = "");
+	                                    idx_t buffer_in_len, const S3RequestQuery &query = S3RequestQuery(),
+	                                    optional_ptr<S3RequestContext> request_context = nullptr);
 	unique_ptr<HTTPResponse> DeleteRequest(HTTPRequestSession &session, const string &s3_url,
-	                                       const string &http_params);
+	                                       const S3RequestQuery &query,
+	                                       optional_ptr<S3RequestContext> request_context = nullptr);
 	unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, const string &s3_url, HTTPHeaders header_map) override;
-	HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) override;
+	HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, RequestType request_type,
+	                           const string &url) override;
 
 	EncryptionUtil &GetEncryptionUtil();
 
@@ -113,6 +117,7 @@ protected:
 
 private:
 	unique_ptr<HTTPResponse> RunS3BulkDeleteRequest(HTTPRequestSession &session, const string &secret_lookup_url,
-	                                                const string &body, string &result);
+	                                                const string &body, string &result,
+	                                                optional_ptr<S3RequestContext> request_context = nullptr);
 };
 } // namespace duckdb

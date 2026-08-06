@@ -28,6 +28,7 @@ class FileOpener;
 struct FileOpenerInfo;
 class HTTPState;
 class HTTPFSUtil;
+class HTTPException;
 
 enum class HTTPClientReuseMode : uint8_t { SESSION_LOCAL, SHARED, NONE };
 
@@ -92,8 +93,11 @@ public:
 	virtual void ClearCachedConnections();
 	virtual HTTPClientReuseMode GetClientReuseMode() const;
 
-	static unordered_map<string, string> ParseGetParameters(const string &text);
 	static HTTPUtil &GetHTTPUtil(optional_ptr<FileOpener> opener);
+	static const char *GetRequestMethod(RequestType request_type);
+	static HTTPException GetHTTPStatusError(const HTTPResponse &response, RequestType request_type,
+	                                        const string &operation, const string &display_url,
+	                                        const string &details = "");
 
 	string GetName() const override;
 };
@@ -107,8 +111,6 @@ public:
 	void ClearCachedConnections() override;
 	HTTPClientReuseMode GetClientReuseMode() const override;
 	unique_ptr<HTTPResponse> SendRequest(BaseRequest &request, unique_ptr<HTTPClient> &client) override;
-
-	static unordered_map<string, string> ParseGetParameters(const string &text);
 
 	string GetName() const override;
 

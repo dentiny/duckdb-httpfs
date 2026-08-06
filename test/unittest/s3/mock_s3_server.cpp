@@ -226,6 +226,7 @@ struct MockS3Server::Impl {
 		remaining_delete_failures = config.failures.transient_delete_failures;
 		remaining_post_failures = config.failures.transient_post_failures;
 		remaining_complete_post_failures = config.failures.transient_complete_post_failures;
+		remaining_complete_post_200_errors = config.failures.transient_complete_post_200_errors;
 		if (config.range.behavior == MockS3RangeBehavior::SHORT_SUCCESS && config.range.behavior_requests > 0) {
 			server.set_keep_alive_max_count(1);
 		}
@@ -486,6 +487,15 @@ struct MockS3Server::Impl {
 			                     "<Error><Code>InvalidRequest</Code><Message>malformed request</Message></Error>",
 			                     "application/xml");
 		}
+		Record(request, response.status);
+	}
+
+	void SendComplete200Error(const httplib::Request &request, httplib::Response &response) const {
+		response.status = 200;
+		response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+		                     "<Error><Code>InternalError</Code>"
+		                     "<Message>We encountered an internal error. Please try again.</Message></Error>",
+		                     "application/xml");
 		Record(request, response.status);
 	}
 
@@ -970,6 +980,11 @@ struct MockS3Server::Impl {
 				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
 				return;
 			}
+			if (request.target.find("uploadId") != string::npos && remaining_complete_post_200_errors.load() > 0) {
+				remaining_complete_post_200_errors--;
+				SendComplete200Error(request, response);
+				return;
+			}
 			SendMultipartPost(request, response);
 		});
 
@@ -1032,6 +1047,7 @@ struct MockS3Server::Impl {
 	mutable std::atomic<idx_t> remaining_delete_failures {0};
 	mutable std::atomic<idx_t> remaining_post_failures {0};
 	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
+	mutable std::atomic<idx_t> remaining_complete_post_200_errors {0};
 	mutable annotated_mutex observation_lock;
 	mutable vector<MockS3RequestObservation> observations DUCKDB_GUARDED_BY(observation_lock);
 	mutable annotated_mutex upload_lock;

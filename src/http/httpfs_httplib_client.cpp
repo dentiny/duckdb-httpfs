@@ -268,15 +268,4 @@ unique_ptr<HTTPClient> HTTPFSUtil::InitializeClient(HTTPParams &http_params, con
 	return std::move(client);
 }
 
-unordered_map<string, string> HTTPFSUtil::ParseGetParameters(const string &text) {
-	duckdb_httplib_openssl::Params query_params;
-	duckdb_httplib_openssl::detail::parse_query_text(text, query_params);
-
-	unordered_map<string, string> result;
-	for (auto &entry : query_params) {
-		result.emplace(entry.first, entry.second);
-	}
-	return result;
-}
-
 } // namespace duckdb

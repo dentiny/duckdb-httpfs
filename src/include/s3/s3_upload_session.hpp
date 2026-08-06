@@ -13,7 +13,12 @@
 namespace duckdb {
 
 class HTTPRequestSession;
+class HTTPException;
 class S3FileSystem;
+struct HTTPResponse;
+struct S3RequestContext;
+struct S3RequestQuery;
+enum class RequestType : uint8_t;
 
 class S3UploadSession {
 private:
@@ -119,19 +124,21 @@ private:
 	shared_ptr<const string> EnsureMultipartUpload();
 	void PublishInitializationFailure(ErrorData error, FailureDisposition disposition) DUCKDB_EXCLUDES(state_lock);
 	string InitializeMultipartUpload();
-	string Upload(const_data_ptr_t data, idx_t size, const string &query_param);
+	string Upload(const_data_ptr_t data, idx_t size, const S3RequestQuery &query);
 	void UploadPart(PreparedPart &part);
 	void UploadSingle(BufferedPart &buffered_part);
 	void UploadEmpty();
 	void StorePartETag(idx_t part_number, string etag) DUCKDB_EXCLUDES(state_lock);
 	MultipartSnapshot GetMultipartSnapshot() DUCKDB_EXCLUDES(state_lock);
 	void CompleteMultipartUpload();
+	string GetDisplayPath() const;
+	static HTTPException GetStatusError(const HTTPResponse &response, const S3RequestContext &request_context,
+	                                    const string &operation);
 
 private:
 	reference<S3FileSystem> s3fs;
 	shared_ptr<HTTPRequestSession> request_session;
 	const string path;
-	const string display_path;
 	const S3UploadConfig config;
 
 	annotated_mutex state_lock;

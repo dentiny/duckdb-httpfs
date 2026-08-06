@@ -16,10 +16,13 @@ namespace {
 
 struct S3UploadLifecycleTest {
 	template <class CALLBACK>
-	static string RequireError(CALLBACK callback) {
+	static string RequireError(CALLBACK callback, optional_ptr<ErrorData> error_data = nullptr) {
 		try {
 			callback();
 		} catch (std::exception &ex) {
+			if (error_data) {
+				*error_data = ErrorData(ex);
+			}
 			return ex.what();
 		}
 		FAIL("Expected operation to throw");
@@ -78,13 +81,18 @@ struct S3UploadLifecycleTest {
 		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
 		auto handle = OpenWriter(con);
 		auto payload = MultipartPayload();
+		ErrorData primary_error;
 		auto first_error = RequireError(
-		    [&]() { handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size()); });
+		    [&]() { handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size()); },
+		    primary_error);
 		RequireStableError(*handle, first_error);
 		REQUIRE(StringUtil::Contains(first_error, "Additionally"));
 		REQUIRE(StringUtil::Contains(first_error, "Failed to abort S3 multipart upload"));
 		REQUIRE_FALSE(StringUtil::Contains(first_error, upload_id));
 		REQUIRE_FALSE(StringUtil::Contains(first_error, "?uploadId"));
+		REQUIRE(primary_error.Type() == ExceptionType::HTTP);
+		REQUIRE(primary_error.ExtraInfo().at("status_code") == "400");
+		REQUIRE(StringUtil::Contains(primary_error.ExtraInfo().at("response_body"), "<Error>"));
 		handle.reset();
 		S3TestHelper::RequireQueryOk(con, "ROLLBACK");
 

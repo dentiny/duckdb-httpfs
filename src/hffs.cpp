@@ -62,7 +62,7 @@ string HuggingFaceFileSystem::ListHFRequest(ParsedHFUrl &url, HTTPFSParams &http
 	    url.endpoint + fragment_next_page_url, header_map, http_params,
 	    [&](const HTTPResponse &response) {
 		    if (static_cast<int>(response.status) >= 400) {
-			    throw HTTPException(response, "HTTP GET error on '%s' (HTTP %d)", next_page_url, response.status);
+			    throw HTTPFSUtil::GetHTTPStatusError(response, RequestType::GET_REQUEST, "listing", next_page_url);
 		    }
 		    if (response.HasHeader("Link")) {
 			    link_header_result = response.GetHeaderValue("Link");
@@ -74,8 +74,11 @@ string HuggingFaceFileSystem::ListHFRequest(ParsedHFUrl &url, HTTPFSParams &http
 		    return true;
 	    });
 	auto res = http_params.http_util.Request(get_request);
+	if (res->HasRequestError()) {
+		throw IOException(res->GetRequestError() + " error for HTTP GET to '" + next_page_url + "'");
+	}
 	if (res->status != HTTPStatusCode::OK_200) {
-		throw IOException(res->GetError() + " error for HTTP GET to '" + next_page_url + "'");
+		throw HTTPFSUtil::GetHTTPStatusError(*res, RequestType::GET_REQUEST, "listing", next_page_url);
 	}
 
 	if (!link_header_result.empty()) {
