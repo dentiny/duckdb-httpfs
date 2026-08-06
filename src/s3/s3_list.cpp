@@ -280,16 +280,11 @@ struct S3ListRequest {
 		result.captured = captured;
 		result.auth_params = std::move(auth_params);
 		result.http_params = snapshot.CreateRequestParams();
-		result.source_url = path;
 		auto request_path = parsed_url.path.substr(0, parsed_url.path.length() - parsed_url.key.length());
 		result.http_url = parsed_url.http_proto + parsed_url.host + S3Url::Encode(request_path) + "?" + encoded_params;
-		if (S3Url::IsGCS(path) && !result.auth_params.oauth2_bearer_token.empty()) {
-			result.headers["Authorization"] = "Bearer " + result.auth_params.oauth2_bearer_token;
-			result.headers["Host"] = parsed_url.host;
-		} else {
-			result.headers = S3RequestUtil::CreateHeader(encryption_util, request_path, encoded_params, parsed_url.host,
-			                                             "s3", "GET", result.auth_params);
-		}
+		parsed_url.path = std::move(request_path);
+		result.headers =
+		    S3RequestUtil::CreateHeaders(encryption_util, parsed_url, encoded_params, "GET", result.auth_params);
 		snapshot.AddConfiguredHeaders(result.headers);
 		return result;
 	}

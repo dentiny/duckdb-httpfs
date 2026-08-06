@@ -165,14 +165,35 @@ private:
 	HTTPHeaders headers;
 };
 
-HTTPHeaders S3RequestUtil::CreateHeader(EncryptionUtil &encryption_util, string url, string query, string host,
-                                        string service, string method, const S3AuthParams &auth_params, string date_now,
-                                        string datetime_now, string payload_hash, string content_type,
-                                        string content_md5) {
-	return S3HeaderBuilder(encryption_util, std::move(url), std::move(query), std::move(host), std::move(service),
-	                       std::move(method), auth_params, std::move(date_now), std::move(datetime_now),
-	                       std::move(payload_hash), std::move(content_type), std::move(content_md5))
-	    .Create();
+HTTPHeaders S3RequestUtil::CreateHeaders(EncryptionUtil &encryption_util, const ParsedS3Url &parsed_url, string query,
+                                         string method, const S3AuthParams &auth_params, string date_now,
+                                         string datetime_now, string payload_hash, string content_type,
+                                         string content_md5) {
+	switch (S3Provider::GetAuthType(auth_params)) {
+	case S3AuthType::ANONYMOUS: {
+		HTTPHeaders headers;
+		headers["Host"] = parsed_url.host;
+		return headers;
+	}
+	case S3AuthType::SIGV4:
+		return S3HeaderBuilder(encryption_util, parsed_url.path, std::move(query), parsed_url.host, "s3",
+		                       std::move(method), auth_params, std::move(date_now), std::move(datetime_now),
+		                       std::move(payload_hash), std::move(content_type), std::move(content_md5))
+		    .Create();
+	case S3AuthType::BEARER: {
+		HTTPHeaders headers;
+		headers["Authorization"] = "Bearer " + auth_params.oauth2_bearer_token;
+		headers["Host"] = parsed_url.host;
+		if (!content_type.empty()) {
+			headers["Content-Type"] = content_type;
+		}
+		if (!content_md5.empty()) {
+			headers["Content-MD5"] = content_md5;
+		}
+		return headers;
+	}
+	}
+	throw InternalException("Unknown S3 authentication type");
 }
 
 static bool IsAuthRefreshErrorBody(const string &body) {
@@ -207,10 +228,10 @@ static bool IsAuthRefreshStatus(const HTTPResponse &response) {
 }
 
 static bool S3AuthParamsMatch(const S3AuthParams &left, const S3AuthParams &right) {
-	return left.region == right.region && left.access_key_id == right.access_key_id &&
-	       left.secret_access_key == right.secret_access_key && left.session_token == right.session_token &&
-	       left.endpoint == right.endpoint && left.kms_key_id == right.kms_key_id &&
-	       left.url_style == right.url_style && left.use_ssl == right.use_ssl &&
+	return left.provider_type == right.provider_type && left.region == right.region &&
+	       left.access_key_id == right.access_key_id && left.secret_access_key == right.secret_access_key &&
+	       left.session_token == right.session_token && left.endpoint == right.endpoint &&
+	       left.kms_key_id == right.kms_key_id && left.url_style == right.url_style && left.use_ssl == right.use_ssl &&
 	       left.s3_url_compatibility_mode == right.s3_url_compatibility_mode &&
 	       left.requester_pays == right.requester_pays && left.oauth2_bearer_token == right.oauth2_bearer_token;
 }
@@ -267,7 +288,7 @@ S3RefreshableHTTPParams S3RequestExecutor::ReadRefreshableHTTPParams(optional_pt
 static bool TryRefreshS3SecretForPath(ClientContext &context, const string &path) {
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 	bool refreshed_secret = false;
-	for (const string type : {"s3", "r2", "gcs", "aws"}) {
+	for (const auto type : S3Provider::SecretTypes()) {
 		auto res = context.db->GetSecretManager().LookupSecret(transaction, path, type);
 		if (res.HasMatch()) {
 			refreshed_secret |= CreateS3SecretFunctions::TryRefreshS3Secret(context, *res.secret_entry);
@@ -342,21 +363,11 @@ S3RequestData S3RequestExecutor::CreateRequestData(EncryptionUtil &encryption_ut
 	result.captured = captured;
 	result.auth_params = snapshot.auth_params;
 	result.http_params = snapshot.CreateRequestParams();
-	result.source_url = s3_url;
 	auto parsed_s3_url = S3Url::Parse(s3_url, result.auth_params);
 
 	result.http_url = parsed_s3_url.GetHTTPUrl(result.auth_params, query_string);
-	if (S3Url::IsGCS(s3_url) && !result.auth_params.oauth2_bearer_token.empty()) {
-		result.headers["Authorization"] = "Bearer " + result.auth_params.oauth2_bearer_token;
-		result.headers["Host"] = parsed_s3_url.host;
-		if (!content_type.empty()) {
-			result.headers["Content-Type"] = content_type;
-		}
-	} else {
-		result.headers =
-		    S3RequestUtil::CreateHeader(encryption_util, parsed_s3_url.path, query_string, parsed_s3_url.host, "s3",
-		                                method, result.auth_params, "", "", payload_hash, content_type, content_md5);
-	}
+	result.headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_s3_url, query_string, method,
+	                                              result.auth_params, "", "", payload_hash, content_type, content_md5);
 	snapshot.AddConfiguredHeaders(result.headers);
 	return result;
 }
@@ -648,12 +659,6 @@ unique_ptr<HTTPResponse> S3RequestExecutor::SendHandleRequest(S3FileHandle &s3_h
 }
 
 HTTPException S3RequestUtil::GetRequestError(const S3RequestData &request_data, const HTTPResponse &response) {
-	if (S3Url::IsGCS(request_data.source_url) && response.status == HTTPStatusCode::Forbidden_403) {
-		string extra_text = S3RequestUtil::GetGCSAuthError(request_data.auth_params);
-		auto status_message = HTTPFSUtil::GetStatusMessage(response.status);
-		return HTTPException(response, "HTTP error on '%s' (HTTP %d %s)%s", request_data.http_url, response.status,
-		                     status_message, extra_text);
-	}
 	return S3RequestUtil::GetError(request_data.auth_params, response, request_data.http_url);
 }
 
@@ -832,34 +837,6 @@ string S3RequestUtil::GetBadRequestError(const S3AuthParams &s3_auth_params, con
 	return extra_text;
 }
 
-string S3RequestUtil::GetAuthError(const S3AuthParams &s3_auth_params) {
-	string extra_text = "\n\nAuthentication Failure - this is usually caused by invalid or missing credentials.";
-	if (s3_auth_params.secret_access_key.empty() && s3_auth_params.access_key_id.empty()) {
-		extra_text += "\n* No credentials are provided.";
-	} else {
-		extra_text += "\n* Credentials are provided, but they did not work.";
-	}
-	extra_text += "\n* See https://duckdb.org/docs/stable/extensions/httpfs/s3api.html";
-	return extra_text;
-}
-
-string S3RequestUtil::GetGCSAuthError(const S3AuthParams &s3_auth_params) {
-	string extra_text = "\n\nAuthentication Failure - GCS authentication failed.";
-	if (s3_auth_params.oauth2_bearer_token.empty() && s3_auth_params.secret_access_key.empty() &&
-	    s3_auth_params.access_key_id.empty()) {
-		extra_text += "\n* No credentials provided.";
-		extra_text += "\n* For OAuth2: CREATE SECRET (TYPE GCS, bearer_token 'your-token')";
-		extra_text += "\n* For HMAC: CREATE SECRET (TYPE GCS, key_id 'key', secret 'secret')";
-	} else if (!s3_auth_params.oauth2_bearer_token.empty()) {
-		extra_text += "\n* Bearer token was provided but authentication failed.";
-		extra_text += "\n* Ensure your OAuth2 token is valid and not expired.";
-	} else {
-		extra_text += "\n* HMAC credentials were provided but authentication failed.";
-		extra_text += "\n* Ensure your HMAC key_id and secret are correct.";
-	}
-	return extra_text;
-}
-
 string S3RequestUtil::ParseError(const string &error) {
 	// S3 errors look like this:
 	//<Error>
@@ -908,7 +885,7 @@ HTTPException S3RequestUtil::GetError(const S3AuthParams &s3_auth_params, const 
 		extra_text += S3RequestUtil::GetBadRequestError(s3_auth_params);
 	}
 	if (response.status == HTTPStatusCode::Forbidden_403) {
-		extra_text += S3RequestUtil::GetAuthError(s3_auth_params);
+		extra_text += S3Provider::GetAuthError(s3_auth_params);
 	}
 	auto status_message = HTTPFSUtil::GetStatusMessage(response.status);
 	return HTTPException(response, "HTTP GET error reading '%s' in region '%s' (HTTP %d %s)%s", url,
@@ -919,14 +896,6 @@ HTTPException S3FileSystem::GetHTTPError(FileHandle &handle, const HTTPResponse 
 	auto &s3_handle = handle.Cast<S3FileHandle>();
 	auto captured = s3_handle.request_session->Capture();
 	auto auth_params = captured.snapshot->Cast<S3RequestSnapshot>().auth_params;
-
-	// Use GCS-specific error for GCS URLs
-	if (S3Url::IsGCS(url) && response.status == HTTPStatusCode::Forbidden_403) {
-		string extra_text = S3RequestUtil::GetGCSAuthError(auth_params);
-		auto status_message = HTTPFSUtil::GetStatusMessage(response.status);
-		throw HTTPException(response, "HTTP error on '%s' (HTTP %d %s)%s", url, response.status, status_message,
-		                    extra_text);
-	}
 
 	return S3RequestUtil::GetError(auth_params, response, url);
 }

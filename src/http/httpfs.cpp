@@ -1,4 +1,5 @@
 #include "http/httpfs.hpp"
+#include "s3/s3_provider.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/logging/log_manager.hpp"
 
@@ -121,15 +122,17 @@ private:
 
 	unique_ptr<KeyValueSecretReader> CreateSettingsReader() {
 		if (info && !S3Url::TryGetPrefix(info->file_path).empty()) {
-			const char *s3_secret_types[] = {"s3", "r2", "gcs", "aws", "http"};
-			idx_t secret_type_count = 5;
+			auto provider_secret_types = S3Provider::SecretTypes();
+			vector<const char *> s3_secret_types(provider_secret_types.begin(), provider_secret_types.end());
+			s3_secret_types.push_back("http");
+			idx_t secret_type_count = s3_secret_types.size();
 			Value merge_http_secret_into_s3_request;
 			FileOpener::TryGetCurrentSetting(opener, "merge_http_secret_into_s3_request",
 			                                 merge_http_secret_into_s3_request);
 			if (!merge_http_secret_into_s3_request.IsNull() && !merge_http_secret_into_s3_request.GetValue<bool>()) {
-				secret_type_count = 4;
+				secret_type_count = provider_secret_types.size();
 			}
-			return make_uniq<KeyValueSecretReader>(*opener, info, s3_secret_types, secret_type_count);
+			return make_uniq<KeyValueSecretReader>(*opener, info, s3_secret_types.data(), secret_type_count);
 		}
 		return make_uniq<KeyValueSecretReader>(*opener, info, "http");
 	}

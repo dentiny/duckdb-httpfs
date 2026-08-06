@@ -3,6 +3,7 @@ target_sources(
   PRIVATE s3_auth.cpp
           s3_delete.cpp
           s3_list.cpp
+          s3_provider.cpp
           s3_request.cpp
           s3_settings.cpp
           s3_upload_session.cpp
