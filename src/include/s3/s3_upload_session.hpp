@@ -126,12 +126,12 @@ private:
 	void StorePartETag(idx_t part_number, string etag) DUCKDB_EXCLUDES(state_lock);
 	MultipartSnapshot GetMultipartSnapshot() DUCKDB_EXCLUDES(state_lock);
 	void CompleteMultipartUpload();
+	string GetDisplayPath() const;
 
 private:
 	reference<S3FileSystem> s3fs;
 	shared_ptr<HTTPRequestSession> request_session;
 	const string path;
-	const string display_path;
 	const S3UploadConfig config;
 
 	annotated_mutex state_lock;

@@ -96,9 +96,7 @@ unique_ptr<HTTPFileHandle> S3FileSystem::CreateHandle(const OpenFileInfo &file, 
 	FileOpenerInfo info = {file.path};
 	S3AuthParams auth_params = S3AuthParams::ReadFrom(opener, info);
 
-	// Scan the query string for any s3 authentication parameters
-	auto parsed_s3_url = S3Url::Parse(file.path, auth_params);
-	S3Url::ReadQueryParams(parsed_s3_url.query_param, auth_params);
+	S3Url::Resolve(file.path, auth_params);
 
 	auto &http_util = HTTPFSUtil::GetHTTPUtil(opener);
 	auto params = http_util.InitializeParameters(opener, info);

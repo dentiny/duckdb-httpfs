@@ -98,7 +98,7 @@ S3GlobResult::S3GlobResult(S3FileSystem &fs_p, const string &glob_pattern_p, opt
 		return;
 	}
 
-	parsed_s3_url = S3Url::Parse(glob_pattern, s3_auth_params);
+	parsed_s3_url = S3Url::Resolve(glob_pattern, s3_auth_params);
 	auto parsed_glob_url = parsed_s3_url.trimmed_s3_url;
 
 	// AWS matches on prefix, not glob pattern, so we take a substring until the first wildcard char for the aws calls
@@ -111,7 +111,6 @@ S3GlobResult::S3GlobResult(S3FileSystem &fs_p, const string &glob_pattern_p, opt
 
 	shared_path = parsed_glob_url.substr(0, first_wildcard_pos);
 
-	S3Url::ReadQueryParams(parsed_s3_url.query_param, s3_auth_params);
 	request_session = S3RequestExecutor::CreateSession(opener, glob_pattern, s3_auth_params);
 }
 

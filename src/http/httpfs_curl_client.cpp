@@ -730,32 +730,6 @@ unique_ptr<HTTPClient> HTTPFSCurlUtil::InitializeClient(HTTPParams &http_params,
 	return std::move(client);
 }
 
-unordered_map<string, string> HTTPFSCurlUtil::ParseGetParameters(const string &text) {
-	unordered_map<string, string> params;
-
-	auto pos = text.find('?');
-	if (pos == string::npos) {
-		return params;
-	}
-
-	string query = text.substr(pos + 1);
-	std::stringstream ss(query);
-	string item;
-
-	while (std::getline(ss, item, '&')) {
-		auto eq_pos = item.find('=');
-		if (eq_pos != string::npos) {
-			string key = item.substr(0, eq_pos);
-			string value = StringUtil::URLDecode(item.substr(eq_pos + 1));
-			params[key] = value;
-		} else {
-			params[item] = ""; // key with no value
-		}
-	}
-
-	return params;
-}
-
 string HTTPFSCurlUtil::GetName() const {
 	return "HTTPFS-Curl";
 }

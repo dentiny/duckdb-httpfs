@@ -7,6 +7,14 @@
 
 namespace duckdb {
 
+static const array<S3ProviderMatch, 6> &ProviderMatches() {
+	static const array<S3ProviderMatch, 6> provider_matches = {
+	    S3ProviderMatch {S3ProviderType::S3, "s3://"},  S3ProviderMatch {S3ProviderType::S3, "s3a://"},
+	    S3ProviderMatch {S3ProviderType::S3, "s3n://"}, S3ProviderMatch {S3ProviderType::GCS, "gcs://"},
+	    S3ProviderMatch {S3ProviderType::GCS, "gs://"}, S3ProviderMatch {S3ProviderType::R2, "r2://"}};
+	return provider_matches;
+}
+
 const array<const char *, 4> &S3Provider::SecretTypes() {
 	static const array<const char *, 4> secret_types = {"s3", "r2", "gcs", "aws"};
 	return secret_types;
@@ -20,12 +28,8 @@ const array<const char *, 12> &S3Provider::CredentialMaterialKeys() {
 }
 
 optional<S3ProviderMatch> S3Provider::TryMatchUrl(const string &url) {
-	static const array<S3ProviderMatch, 6> provider_matches = {
-	    S3ProviderMatch {S3ProviderType::S3, "s3://"},  S3ProviderMatch {S3ProviderType::S3, "s3a://"},
-	    S3ProviderMatch {S3ProviderType::S3, "s3n://"}, S3ProviderMatch {S3ProviderType::GCS, "gcs://"},
-	    S3ProviderMatch {S3ProviderType::GCS, "gs://"}, S3ProviderMatch {S3ProviderType::R2, "r2://"}};
 	auto lower_url = StringUtil::Lower(url);
-	for (const auto &provider_match : provider_matches) {
+	for (const auto &provider_match : ProviderMatches()) {
 		if (StringUtil::StartsWith(lower_url, provider_match.prefix)) {
 			return provider_match;
 		}
@@ -36,7 +40,11 @@ optional<S3ProviderMatch> S3Provider::TryMatchUrl(const string &url) {
 S3ProviderMatch S3Provider::MatchUrl(const string &url) {
 	auto provider_match = TryMatchUrl(url);
 	if (!provider_match) {
-		throw IOException("URL needs to start with s3://, gcs:// or r2://");
+		vector<string> prefixes;
+		for (const auto &entry : ProviderMatches()) {
+			prefixes.push_back(entry.prefix);
+		}
+		throw IOException("URL needs to start with %s", StringUtil::Join(prefixes, ", "));
 	}
 	return *provider_match;
 }
@@ -98,8 +106,8 @@ void S3Provider::ReadAuthParams(S3KeyValueReader &secret_reader, const string &f
 	secret_reader.TryGetSecretKeyOrSetting("session_token", "s3_session_token", result.session_token);
 	secret_reader.TryGetSecretKeyOrSetting("use_ssl", "s3_use_ssl", result.use_ssl);
 	secret_reader.TryGetSecretKeyOrSetting("kms_key_id", "s3_kms_key_id", result.kms_key_id);
-	secret_reader.TryGetSecretKeyOrSetting("s3_url_compatibility_mode", "s3_url_compatibility_mode",
-	                                       result.s3_url_compatibility_mode);
+	secret_reader.TryGetSecretKeysOrSetting("url_compatibility_mode", "s3_url_compatibility_mode",
+	                                        "s3_url_compatibility_mode", result.s3_url_compatibility_mode);
 	secret_reader.TryGetSecretKeyOrSetting("requester_pays", "s3_requester_pays", result.requester_pays);
 
 	auto endpoint_result = secret_reader.TryGetSecretKeyOrSetting("endpoint", "s3_endpoint", result.endpoint);
@@ -113,7 +121,7 @@ void S3Provider::ReadAuthParams(S3KeyValueReader &secret_reader, const string &f
 		}
 		secret_reader.TryGetSecretKey("bearer_token", result.oauth2_bearer_token);
 	}
-	InitializeEndpoint(result);
+	InitializeAuthParams(result);
 }
 
 static bool EndpointIsAWS(const string &endpoint) {
@@ -123,7 +131,17 @@ static bool EndpointIsAWS(const string &endpoint) {
 	return StringUtil::StartsWith(endpoint, "s3.") && StringUtil::EndsWith(endpoint, ".amazonaws.com");
 }
 
-void S3Provider::InitializeEndpoint(S3AuthParams &auth_params) {
+void S3Provider::InitializeAuthParams(S3AuthParams &auth_params) {
+	if (auth_params.provider_type == S3ProviderType::GCS) {
+		if (auth_params.endpoint.empty()) {
+			auth_params.endpoint = "storage.googleapis.com";
+		}
+		if (auth_params.url_style.empty()) {
+			auth_params.url_style = "path";
+		}
+	} else if (auth_params.provider_type == S3ProviderType::R2 && auth_params.endpoint.empty()) {
+		throw IOException("R2 requires an endpoint; provide account_id in the secret or s3_endpoint in the URL");
+	}
 	if (!EndpointIsAWS(auth_params.endpoint)) {
 		return;
 	}

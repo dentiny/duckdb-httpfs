@@ -1,6 +1,5 @@
 #include "s3/s3_url.hpp"
 
-#include "http/httpfs_client.hpp"
 #include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
@@ -21,12 +20,38 @@ static void GetQueryParam(const string &key, string &param, unordered_map<string
 	}
 }
 
+unordered_map<string, string> S3Url::ParseQueryParameters(const string &url_query_param) {
+	unordered_map<string, string> result;
+	idx_t offset = 0;
+	while (offset <= url_query_param.size()) {
+		auto separator = url_query_param.find('&', offset);
+		auto parameter_end = separator == string::npos ? url_query_param.size() : separator;
+		auto equals = url_query_param.find('=', offset);
+		if (equals == string::npos || equals > parameter_end) {
+			equals = parameter_end;
+		}
+		if (equals > offset) {
+			auto key = Decode(url_query_param.substr(offset, equals - offset));
+			auto value_offset = equals == parameter_end ? parameter_end : equals + 1;
+			auto value = Decode(url_query_param.substr(value_offset, parameter_end - value_offset));
+			if (!result.emplace(key, std::move(value)).second) {
+				throw IOException("Duplicate S3 URL query parameter '%s'", key);
+			}
+		}
+		if (separator == string::npos) {
+			break;
+		}
+		offset = separator + 1;
+	}
+	return result;
+}
+
 void S3Url::ReadQueryParams(const string &url_query_param, S3AuthParams &params) {
 	if (url_query_param.empty()) {
 		return;
 	}
 
-	auto query_params = HTTPFSUtil::ParseGetParameters(url_query_param);
+	auto query_params = ParseQueryParameters(url_query_param);
 
 	GetQueryParam("s3_region", params.region, query_params);
 	GetQueryParam("s3_access_key_id", params.access_key_id, query_params);
@@ -61,6 +86,21 @@ void S3Url::ReadQueryParams(const string &url_query_param, S3AuthParams &params)
 		                  "'s3_secret_access_key', 's3_session_token',\n's3_endpoint', 's3_url_style', 's3_use_ssl', "
 		                  "'s3_requester_pays'");
 	}
+}
+
+ParsedS3Url S3Url::Resolve(const string &url, S3AuthParams &params) {
+	auto parsed_url = Parse(url, params);
+	ReadQueryParams(parsed_url.query_param, params);
+	S3Provider::InitializeAuthParams(params);
+	return Parse(url, params);
+}
+
+string S3Url::GetDisplayUrl(const string &url, const S3AuthParams &params) {
+	if (params.s3_url_compatibility_mode) {
+		return url;
+	}
+	auto query_position = url.find('?');
+	return query_position == string::npos ? url : url.substr(0, query_position);
 }
 
 string S3Url::TryGetPrefix(const string &url) {
@@ -146,7 +186,7 @@ ParsedS3Url S3Url::Parse(const string &url, const S3AuthParams &params) {
 	return {http_proto, prefix, host, bucket, key, path, query_param, trimmed_s3_url};
 }
 
-string ParsedS3Url::GetHTTPUrl(S3AuthParams &auth_params, const string &http_query_string) {
+string ParsedS3Url::GetHTTPUrl(const string &http_query_string) const {
 	string full_url = http_proto + host + S3Url::Encode(path);
 
 	if (!http_query_string.empty()) {

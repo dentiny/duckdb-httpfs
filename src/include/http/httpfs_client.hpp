@@ -92,7 +92,6 @@ public:
 	virtual void ClearCachedConnections();
 	virtual HTTPClientReuseMode GetClientReuseMode() const;
 
-	static unordered_map<string, string> ParseGetParameters(const string &text);
 	static HTTPUtil &GetHTTPUtil(optional_ptr<FileOpener> opener);
 
 	string GetName() const override;
@@ -107,8 +106,6 @@ public:
 	void ClearCachedConnections() override;
 	HTTPClientReuseMode GetClientReuseMode() const override;
 	unique_ptr<HTTPResponse> SendRequest(BaseRequest &request, unique_ptr<HTTPClient> &client) override;
-
-	static unordered_map<string, string> ParseGetParameters(const string &text);
 
 	string GetName() const override;
 

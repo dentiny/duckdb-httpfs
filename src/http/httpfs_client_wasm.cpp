@@ -7,10 +7,4 @@ unique_ptr<HTTPClient> HTTPFSUtil::InitializeClient(HTTPParams &http_params, con
 	throw InternalException("HTTPFSUtil::InitializeClient is not expected to be called");
 }
 
-unordered_map<string, string> HTTPFSUtil::ParseGetParameters(const string &text) {
-	unordered_map<string, string> result;
-	// TODO: HTTPFSUtil::ParseGetParameters is currently not implemented
-	return result;
-}
-
 } // namespace duckdb

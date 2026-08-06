@@ -264,8 +264,7 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 	for (auto &path : paths) {
 		FileOpenerInfo info = {path};
 		S3AuthParams auth_params = S3AuthParams::ReadFrom(opener, info);
-		auto parsed_url = S3Url::Parse(path, auth_params);
-		S3Url::ReadQueryParams(parsed_url.query_param, auth_params);
+		auto parsed_url = S3Url::Resolve(path, auth_params);
 
 		auto bucket_path = GetS3BucketPath(parsed_url);
 		S3DeleteBatchUrlInfo url_info = {parsed_url.prefix, parsed_url.http_proto, parsed_url.host, bucket_path,

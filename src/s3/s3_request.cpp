@@ -272,8 +272,7 @@ static bool S3RefreshableHTTPParamsMatch(const S3RefreshableHTTPParams &left, co
 static S3AuthParams ReadS3AuthParams(optional_ptr<FileOpener> opener, const string &path) {
 	FileOpenerInfo info = {path};
 	auto auth_params = S3AuthParams::ReadFrom(opener, info);
-	auto parsed_url = S3Url::Parse(path, auth_params);
-	S3Url::ReadQueryParams(parsed_url.query_param, auth_params);
+	S3Url::Resolve(path, auth_params);
 	return auth_params;
 }
 
@@ -365,7 +364,7 @@ S3RequestData S3RequestExecutor::CreateRequestData(EncryptionUtil &encryption_ut
 	result.http_params = snapshot.CreateRequestParams();
 	auto parsed_s3_url = S3Url::Parse(s3_url, result.auth_params);
 
-	result.http_url = parsed_s3_url.GetHTTPUrl(result.auth_params, query_string);
+	result.http_url = parsed_s3_url.GetHTTPUrl(query_string);
 	result.headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_s3_url, query_string, method,
 	                                              result.auth_params, "", "", payload_hash, content_type, content_md5);
 	snapshot.AddConfiguredHeaders(result.headers);

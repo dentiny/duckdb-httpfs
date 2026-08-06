@@ -8,12 +8,15 @@
 #include "crypto.hpp"
 #include "s3/s3_provider.hpp"
 #include "s3/s3_request.hpp"
+#include "s3/s3_url.hpp"
 #include "s3/s3fs.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_file_opener.hpp"
+#include "duckdb/main/secret/secret.hpp"
 
 #include <array>
 #include <new>
@@ -269,6 +272,12 @@ static void RunGCSListAuthErrorScenario(const string &client_implementation) {
 	REQUIRE(result->GetError().find("Authentication Failure - GCS authentication failed") != string::npos);
 }
 
+static S3AuthParams ReadSecretAuthParams(Connection &con, KeyValueSecret &secret) {
+	ClientContextFileOpener opener(*con.context);
+	S3KeyValueReader secret_reader {KeyValueSecretReader(secret, opener)};
+	return S3AuthParams::ReadFrom(secret_reader, "s3://bucket/key");
+}
+
 } // namespace
 
 TEST_CASE("S3 provider policy resolves URL aliases and default scopes", "[httpfs][s3][provider]") {
@@ -287,6 +296,121 @@ TEST_CASE("S3 provider policy resolves URL aliases and default scopes", "[httpfs
 	REQUIRE(S3Provider::DefaultSecretScope("gcs") == vector<string> {"gcs://", "gs://"});
 	REQUIRE(S3Provider::DefaultSecretScope("r2") == vector<string> {"r2://"});
 	REQUIRE(S3Provider::DefaultSecretScope("aws") == vector<string> {""});
+	try {
+		S3Provider::MatchUrl("https://bucket/key");
+		FAIL("Unsupported URL should fail");
+	} catch (std::exception &ex) {
+		auto error = string(ex.what());
+		REQUIRE(error.find("s3a://") != string::npos);
+		REQUIRE(error.find("s3n://") != string::npos);
+		REQUIRE(error.find("gs://") != string::npos);
+	}
+}
+
+TEST_CASE("S3 URL query settings are resolved independently of the HTTP client", "[httpfs][s3][url]") {
+	SECTION("query credentials initialize the AWS region and endpoint") {
+		S3AuthParams auth_params;
+		auth_params.endpoint = "s3.amazonaws.com";
+		auto parsed_url = S3Url::Resolve(
+		    "s3://bucket/key?s3_access_key_id=hello+world&s3_secret_access_key=secret%2Bvalue", auth_params);
+		REQUIRE(auth_params.access_key_id == "hello world");
+		REQUIRE(auth_params.secret_access_key == "secret+value");
+		REQUIRE(auth_params.region == "us-east-1");
+		REQUIRE(auth_params.endpoint == "s3.us-east-1.amazonaws.com");
+		REQUIRE(parsed_url.host == "bucket.s3.us-east-1.amazonaws.com");
+	}
+
+	SECTION("routing overrides are reflected in the parsed URL") {
+		S3AuthParams auth_params;
+		auth_params.region = "us-west-2";
+		auth_params.endpoint = "s3.us-west-2.amazonaws.com";
+		auto parsed_url = S3Url::Resolve("s3://bucket/key?s3_region=eu-west-1&s3_endpoint=s3.amazonaws.com&"
+		                                 "s3_use_ssl=false&s3_url_style=path",
+		                                 auth_params);
+		REQUIRE(auth_params.region == "eu-west-1");
+		REQUIRE(auth_params.endpoint == "s3.eu-west-1.amazonaws.com");
+		REQUIRE(parsed_url.http_proto == "http://");
+		REQUIRE(parsed_url.host == "s3.eu-west-1.amazonaws.com");
+		REQUIRE(parsed_url.path == "/bucket/key");
+	}
+
+	SECTION("empty GCS routing overrides restore provider defaults") {
+		S3AuthParams auth_params;
+		auth_params.provider_type = S3ProviderType::GCS;
+		auth_params.endpoint = "storage.googleapis.com";
+		auth_params.url_style = "path";
+		auto parsed_url = S3Url::Resolve("gcs://bucket/key?s3_endpoint=&s3_url_style=", auth_params);
+		REQUIRE(auth_params.endpoint == "storage.googleapis.com");
+		REQUIRE(auth_params.url_style == "path");
+		REQUIRE(parsed_url.host == "storage.googleapis.com");
+		REQUIRE(parsed_url.path == "/bucket/key");
+	}
+
+	SECTION("empty R2 endpoints fail instead of routing to AWS") {
+		S3AuthParams auth_params;
+		auth_params.provider_type = S3ProviderType::R2;
+		auth_params.endpoint = "account.r2.cloudflarestorage.com";
+		auth_params.url_style = "path";
+		REQUIRE_THROWS(S3Url::Resolve("r2://bucket/key?s3_endpoint=", auth_params));
+	}
+
+	SECTION("empty values are accepted") {
+		S3AuthParams auth_params;
+		auth_params.endpoint = "s3.amazonaws.com";
+		S3Url::Resolve("s3://bucket/key?s3_access_key_id&s3_secret_access_key=", auth_params);
+		REQUIRE(auth_params.access_key_id.empty());
+		REQUIRE(auth_params.secret_access_key.empty());
+	}
+
+	SECTION("duplicate decoded keys are rejected") {
+		S3AuthParams auth_params;
+		auth_params.endpoint = "s3.amazonaws.com";
+		REQUIRE_THROWS(S3Url::Resolve("s3://bucket/key?s3_region=one&s3%5Fregion=two", auth_params));
+	}
+
+	SECTION("query keys remain case-sensitive") {
+		S3AuthParams auth_params;
+		auth_params.endpoint = "s3.amazonaws.com";
+		REQUIRE_THROWS(S3Url::Resolve("s3://bucket/key?S3_region=one", auth_params));
+	}
+
+	SECTION("display URLs redact parameters unless compatibility mode treats them as key bytes") {
+		S3AuthParams auth_params;
+		REQUIRE(S3Url::GetDisplayUrl("s3://bucket/key?s3_secret_access_key=secret", auth_params) == "s3://bucket/key");
+		auth_params.s3_url_compatibility_mode = true;
+		REQUIRE(S3Url::GetDisplayUrl("s3://bucket/key?literal", auth_params) == "s3://bucket/key?literal");
+	}
+}
+
+TEST_CASE("S3 URL compatibility mode reads canonical and legacy secret keys", "[httpfs][s3][secret]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	S3TestHelper::LoadExtension(db);
+
+	SECTION("canonical key") {
+		KeyValueSecret secret({"s3://"}, Identifier("s3"), Identifier("config"), Identifier("canonical"));
+		secret.secret_map["url_compatibility_mode"] = Value(true);
+		REQUIRE(ReadSecretAuthParams(con, secret).s3_url_compatibility_mode);
+	}
+
+	SECTION("canonical key takes precedence") {
+		KeyValueSecret secret({"s3://"}, Identifier("s3"), Identifier("config"), Identifier("precedence"));
+		secret.secret_map["url_compatibility_mode"] = Value(false);
+		secret.secret_map["s3_url_compatibility_mode"] = Value(true);
+		REQUIRE_FALSE(ReadSecretAuthParams(con, secret).s3_url_compatibility_mode);
+	}
+
+	SECTION("legacy key") {
+		KeyValueSecret secret({"s3://"}, Identifier("s3"), Identifier("config"), Identifier("legacy"));
+		secret.secret_map["s3_url_compatibility_mode"] = Value(true);
+		REQUIRE(ReadSecretAuthParams(con, secret).s3_url_compatibility_mode);
+	}
+
+	SECTION("global setting fallback") {
+		S3TestHelper::RequireQueryOk(con, "SET s3_url_compatibility_mode=true");
+		KeyValueSecret secret({"s3://"}, Identifier("s3"), Identifier("config"), Identifier("setting"));
+		REQUIRE(ReadSecretAuthParams(con, secret).s3_url_compatibility_mode);
+	}
 }
 
 TEST_CASE("S3 provider policy selects request authentication", "[httpfs][s3][provider][signing]") {

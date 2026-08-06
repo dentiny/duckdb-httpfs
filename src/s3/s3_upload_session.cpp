@@ -22,13 +22,6 @@ public:
 	}
 };
 
-struct S3UploadErrorUtil {
-	static string RedactPath(const string &path) {
-		auto query_position = path.find('?');
-		return query_position == string::npos ? path : path.substr(0, query_position);
-	}
-};
-
 static bool IsSuccessfulStatus(HTTPStatusCode status) {
 	auto status_code = static_cast<int>(status);
 	return status_code >= 200 && status_code < 300;
@@ -66,8 +59,7 @@ void S3UploadSession::WriteClaim::Fail(ErrorData error, FailureDisposition dispo
 
 S3UploadSession::S3UploadSession(S3FileSystem &s3fs_p, shared_ptr<HTTPRequestSession> request_session_p, string path_p,
                                  S3UploadConfig config_p)
-    : s3fs(s3fs_p), request_session(std::move(request_session_p)), path(std::move(path_p)),
-      display_path(S3UploadErrorUtil::RedactPath(path)), config(config_p) {
+    : s3fs(s3fs_p), request_session(std::move(request_session_p)), path(std::move(path_p)), config(config_p) {
 }
 
 S3UploadSession::~S3UploadSession() noexcept = default;
@@ -250,13 +242,15 @@ shared_ptr<const ErrorData> S3UploadSession::AbortMultipartUpload(const string &
 			return nullptr;
 		}
 		auto message =
-		    StringUtil::Format("Failed to abort S3 multipart upload for \"%s\": HTTP %d%s", display_path,
+		    StringUtil::Format("Failed to abort S3 multipart upload for \"%s\": HTTP %d%s", GetDisplayPath(),
 		                       static_cast<int>(response->status), S3RequestUtil::ParseError(response->body));
 		return make_shared_ptr<const ErrorData>(ExceptionType::HTTP, std::move(message));
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
-		auto message = StringUtil::Format(
-		    "Failed to abort S3 multipart upload for \"%s\": the cleanup request could not be completed", display_path);
+		auto message =
+		    StringUtil::Format("Failed to abort S3 multipart upload for \"%s\": the cleanup request could not "
+		                       "be completed",
+		                       GetDisplayPath());
 		return make_shared_ptr<const ErrorData>(error.Type(), std::move(message));
 	}
 }
@@ -357,11 +351,11 @@ string S3UploadSession::InitializeMultipartUpload() {
 		throw S3AmbiguousUploadException(StringUtil::Format(
 		    "S3 multipart upload initialization for \"%s\" has an unknown outcome because the response was not "
 		    "received; the request was not retried and cannot be aborted without an upload ID",
-		    display_path));
+		    GetDisplayPath()));
 	}
 	if (!IsSuccessfulStatus(response->status)) {
 		throw HTTPException(StringUtil::Format("S3 multipart upload initialization for \"%s\" failed with HTTP %d%s",
-		                                       display_path, static_cast<int>(response->status),
+		                                       GetDisplayPath(), static_cast<int>(response->status),
 		                                       S3RequestUtil::ParseError(response->body)));
 	}
 
@@ -370,13 +364,13 @@ string S3UploadSession::InitializeMultipartUpload() {
 		throw S3AmbiguousUploadException(StringUtil::Format(
 		    "S3 multipart upload initialization for \"%s\" returned malformed XML; the request was not retried and "
 		    "cannot be aborted without an upload ID",
-		    display_path));
+		    GetDisplayPath()));
 	}
 	if (parsed_response.type != S3XMLResponseType::MULTIPART_INITIALIZATION) {
 		throw S3AmbiguousUploadException(StringUtil::Format(
 		    "S3 multipart upload initialization for \"%s\" returned an unrecognized response; the request was not "
 		    "retried and cannot be aborted without an upload ID",
-		    display_path));
+		    GetDisplayPath()));
 	}
 	return parsed_response.upload_id;
 }
@@ -459,10 +453,10 @@ void S3UploadSession::ThrowIfFailed() DUCKDB_EXCLUDES(state_lock) {
 string S3UploadSession::Upload(const_data_ptr_t data, idx_t size, const string &query_param) {
 	auto response = s3fs.get().PutRequest(*request_session, path, data, size, query_param);
 	if (response->HasRequestError()) {
-		throw IOException("S3 upload request for \"%s\" could not be completed", display_path);
+		throw IOException("S3 upload request for \"%s\" could not be completed", GetDisplayPath());
 	}
 	if (response->status != HTTPStatusCode::OK_200) {
-		throw HTTPException(*response, "Unable to connect to URL %s: %s (HTTP code %d)%s", display_path,
+		throw HTTPException(*response, "Unable to connect to URL %s: %s (HTTP code %d)%s", GetDisplayPath(),
 		                    response->GetError(), static_cast<int>(response->status),
 		                    S3RequestUtil::ParseError(response->body));
 	}
@@ -539,11 +533,11 @@ void S3UploadSession::CompleteMultipartUpload() {
 		throw S3AmbiguousUploadException(StringUtil::Format(
 		    "S3 multipart upload completion for \"%s\" has an unknown outcome because the response was not received; "
 		    "the request was not retried or aborted",
-		    display_path));
+		    GetDisplayPath()));
 	}
 	if (!IsSuccessfulStatus(response->status)) {
 		throw HTTPException(StringUtil::Format("S3 multipart upload completion for \"%s\" failed with HTTP %d%s",
-		                                       display_path, static_cast<int>(response->status),
+		                                       GetDisplayPath(), static_cast<int>(response->status),
 		                                       S3RequestUtil::ParseError(response->body)));
 	}
 
@@ -551,11 +545,11 @@ void S3UploadSession::CompleteMultipartUpload() {
 	if (!S3XMLResponseParser::TryParse(result, parsed_response)) {
 		throw S3AmbiguousUploadException(StringUtil::Format(
 		    "S3 multipart upload completion for \"%s\" returned malformed XML; the request was not retried or aborted",
-		    display_path));
+		    GetDisplayPath()));
 	}
 	if (parsed_response.type == S3XMLResponseType::ERROR) {
 		throw HTTPException(StringUtil::Format(
-		    "S3 multipart upload completion for \"%s\" failed: %s%s%s", display_path,
+		    "S3 multipart upload completion for \"%s\" failed: %s%s%s", GetDisplayPath(),
 		    parsed_response.error_code.empty() ? "S3 returned an embedded error" : parsed_response.error_code,
 		    parsed_response.error_message.empty() ? "" : ": ", parsed_response.error_message));
 	}
@@ -563,8 +557,14 @@ void S3UploadSession::CompleteMultipartUpload() {
 		throw S3AmbiguousUploadException(StringUtil::Format(
 		    "S3 multipart upload completion for \"%s\" returned an unrecognized response; the request was not retried "
 		    "or aborted",
-		    display_path));
+		    GetDisplayPath()));
 	}
+}
+
+string S3UploadSession::GetDisplayPath() const {
+	auto captured = request_session->Capture();
+	auto &snapshot = captured.snapshot->Cast<S3RequestSnapshot>();
+	return S3Url::GetDisplayUrl(path, snapshot.auth_params);
 }
 
 S3UploadSession::WriteClaim S3UploadSession::Write(const_data_ptr_t data, idx_t size, idx_t location) {
