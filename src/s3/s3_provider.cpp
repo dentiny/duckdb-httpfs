@@ -165,6 +165,22 @@ S3AuthType S3Provider::GetAuthType(const S3AuthParams &auth_params) {
 	return S3AuthType::SIGV4;
 }
 
+string S3Provider::GetBadRequestError(const S3AuthParams &auth_params, const string &correct_region) {
+	if (auth_params.provider_type != S3ProviderType::S3) {
+		return string();
+	}
+	string extra_text = "\n\nBad Request - this can be caused by the S3 region being set incorrectly.";
+	if (auth_params.region.empty()) {
+		extra_text += "\n* No region is provided.";
+	} else {
+		extra_text += "\n* Provided region is: \"" + auth_params.region + "\"";
+	}
+	if (!correct_region.empty()) {
+		extra_text += "\n* Correct region is: \"" + correct_region + "\"";
+	}
+	return extra_text;
+}
+
 string S3Provider::GetAuthError(const S3AuthParams &auth_params) {
 	if (auth_params.provider_type == S3ProviderType::GCS) {
 		string extra_text = "\n\nAuthentication Failure - GCS authentication failed.";
@@ -179,6 +195,16 @@ string S3Provider::GetAuthError(const S3AuthParams &auth_params) {
 		} else {
 			extra_text += "\n* HMAC credentials were provided but authentication failed.";
 			extra_text += "\n* Ensure your HMAC key_id and secret are correct.";
+		}
+		return extra_text;
+	}
+	if (auth_params.provider_type == S3ProviderType::R2) {
+		string extra_text = "\n\nAuthentication Failure - R2 authentication failed.";
+		if (auth_params.secret_access_key.empty() && auth_params.access_key_id.empty()) {
+			extra_text += "\n* No credentials are provided.";
+			extra_text += "\n* Create an R2 secret with account_id, key_id, and secret.";
+		} else {
+			extra_text += "\n* Credentials were provided, but they did not work.";
 		}
 		return extra_text;
 	}

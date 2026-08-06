@@ -16,15 +16,23 @@ namespace duckdb {
 void S3FileSystem::RemoveFile(const string &path, optional_ptr<FileOpener> opener) {
 	auto handle = OpenFile(path, FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS, opener);
 	if (!handle) {
-		throw IOException({{"errno", "404"}}, "Could not remove file \"%s\": %s", path,
-		                  string("No such file or directory"));
+		FileOpenerInfo info = {path};
+		auto auth_params = S3AuthParams::ReadFrom(opener, info);
+		S3Url::Resolve(path, auth_params);
+		throw IOException({{"errno", "404"}}, "Could not remove file \"%s\": %s",
+		                  S3Url::GetDisplayUrl(path, auth_params), string("No such file or directory"));
 	}
 
 	auto &s3fh = handle->Cast<S3FileHandle>();
 	auto res = DeleteRequest(*handle, s3fh.path, {});
+	if (res->HasRequestError()) {
+		auto captured = s3fh.request_session->Capture();
+		auto &snapshot = captured.snapshot->Cast<S3RequestSnapshot>();
+		throw IOException("S3 delete request for \"%s\" could not be completed: %s",
+		                  S3Url::GetDisplayUrl(path, snapshot.auth_params), res->GetRequestError());
+	}
 	if (res->status != HTTPStatusCode::OK_200 && res->status != HTTPStatusCode::NoContent_204) {
-		throw IOException({{"errno", to_string(static_cast<int>(res->status))}}, "Could not remove file \"%s\": %s",
-		                  path, res->GetError());
+		throw GetHTTPError(*handle, *res, RequestType::DELETE_REQUEST, path);
 	}
 }
 
@@ -202,7 +210,8 @@ static string GetS3DeleteContentMD5(const string &body) {
 
 unique_ptr<HTTPResponse> S3FileSystem::RunS3BulkDeleteRequest(HTTPRequestSession &session,
                                                               const string &secret_lookup_url, const string &body,
-                                                              string &result) {
+                                                              string &result,
+                                                              optional_ptr<S3RequestContext> request_context) {
 	auto payload_hash =
 	    S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), const_data_ptr_cast(body.data()), body.length());
 	auto content_md5 = GetS3DeleteContentMD5(body);
@@ -220,7 +229,8 @@ unique_ptr<HTTPResponse> S3FileSystem::RunS3BulkDeleteRequest(HTTPRequestSession
 			                          return S3RequestExecutor::SendSessionRequest(session, request_data.captured,
 			                                                                       params, request);
 		                          });
-	    });
+	    },
+	    {}, request_context);
 }
 
 void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpener> opener) {
@@ -266,11 +276,17 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 			idx_t batch_end = MinValue<idx_t>(batch_start + MAX_KEYS_PER_REQUEST, keys.size());
 			auto body = CreateS3DeleteBody(keys, batch_start, batch_end);
 			string result;
-			auto res = RunS3BulkDeleteRequest(*delete_session, secret_lookup_paths[batch_start], body, result);
+			S3RequestContext request_context;
+			auto res = RunS3BulkDeleteRequest(*delete_session, secret_lookup_paths[batch_start], body, result,
+			                                  request_context);
 
+			if (res->HasRequestError()) {
+				throw IOException("S3 bulk delete request for \"%s\" could not be completed: %s",
+				                  request_context.display_url, res->GetRequestError());
+			}
 			if (res->status != HTTPStatusCode::OK_200) {
-				throw IOException("Failed to remove files: HTTP %d (%s)\n%s", static_cast<int>(res->status),
-				                  res->GetError(), result);
+				throw S3RequestUtil::GetError(request_context.auth_params, *res, request_context.request_type,
+				                              "bulk-deleting from", request_context.display_url);
 			}
 
 			idx_t cur_pos = 0;

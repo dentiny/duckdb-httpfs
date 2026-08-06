@@ -63,6 +63,12 @@ struct S3RequestSnapshot : public HTTPRequestSnapshot {
 	idx_t credential_generation;
 };
 
+struct S3RequestContext {
+	RequestType request_type = RequestType::GET_REQUEST;
+	S3AuthParams auth_params;
+	string display_url;
+};
+
 struct S3RequestData {
 	RequestType request_type = RequestType::GET_REQUEST;
 	S3AuthParams auth_params;
@@ -83,9 +89,9 @@ struct S3RequestUtil {
 
 	static optional_idx TryFindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
 	static optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
-	static string GetBadRequestError(const S3AuthParams &auth_params, const string &correct_region = "");
 	static string ParseError(const string &error);
-	static HTTPException GetError(const S3AuthParams &auth_params, const HTTPResponse &response, const string &url);
+	static HTTPException GetError(const S3AuthParams &auth_params, const HTTPResponse &response,
+	                              RequestType request_type, const string &operation, const string &display_url);
 	static HTTPException GetRequestError(const S3RequestData &request_data, const HTTPResponse &response);
 };
 
@@ -99,7 +105,8 @@ struct S3RequestExecutor {
 	                                           const CreateQueryCallback &create_query, const string &payload_hash,
 	                                           const string &content_type, const string &content_md5,
 	                                           const RequestCallback &request,
-	                                           const RegionRedirectCallback &region_redirect = {});
+	                                           const RegionRedirectCallback &region_redirect = {},
+	                                           optional_ptr<S3RequestContext> request_context = nullptr);
 	static unique_ptr<HTTPResponse> RunHandle(EncryptionUtil &encryption_util, S3FileHandle &handle,
 	                                          const string &s3_url, RequestType request_type, const string &version_id,
 	                                          const RequestCallback &request);
@@ -118,13 +125,14 @@ struct S3RequestExecutor {
 
 private:
 	using CreateDataCallback = std::function<S3RequestData()>;
+	using FinalRequestCallback = std::function<void(const S3RequestData &)>;
 	using RefreshCallback = std::function<bool(const S3RequestData &)>;
 	using SetRegionCallback = std::function<void(const S3RequestData &, const string &)>;
 
 	static unique_ptr<HTTPResponse> Run(const string &s3_url, const CreateDataCallback &create_data,
 	                                    bool transient_retry_eligible, const RequestCallback &request,
-	                                    const RefreshCallback &refresh_auth_params,
-	                                    const SetRegionCallback &set_region);
+	                                    const RefreshCallback &refresh_auth_params, const SetRegionCallback &set_region,
+	                                    const FinalRequestCallback &final_request);
 	static bool TryRefreshSession(HTTPRequestSession &session, const S3RequestData &request_data);
 	static S3RequestData CreateRequestData(EncryptionUtil &encryption_util, const CapturedHTTPRequestSnapshot &captured,
 	                                       const string &s3_url, RequestType request_type, S3RequestTarget target,

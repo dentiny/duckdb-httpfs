@@ -1,6 +1,10 @@
 #include "catch.hpp"
 
 #include "hffs.hpp"
+#include "http/httpfs_client.hpp"
+#include "s3/mock_s3_server.hpp"
+
+#include "duckdb/common/error_data.hpp"
 
 namespace duckdb {
 
@@ -35,6 +39,30 @@ TEST_CASE("Hugging Face list results reject incomplete entries", "[httpfs][hffs]
 	vector<string> directories;
 
 	REQUIRE_THROWS_AS(HuggingFaceFileSystem::ParseListResult(input, files, directories), IOException);
+}
+
+TEST_CASE("Hugging Face list status errors preserve HTTP metadata", "[httpfs][hffs][error]") {
+	struct TestHuggingFaceFileSystem : public HuggingFaceFileSystem {
+		using HuggingFaceFileSystem::ListHFRequest;
+	};
+
+	MockS3Server server {MockS3ServerConfig()};
+	HTTPFSUtil http_util;
+	auto params = http_util.InitializeParameters(nullptr, nullptr);
+	auto &httpfs_params = params->Cast<HTTPFSParams>();
+	ParsedHFUrl url;
+	url.endpoint = server.Endpoint();
+	string next_page_url = url.endpoint + "/missing-hugging-face-page";
+
+	try {
+		TestHuggingFaceFileSystem::ListHFRequest(url, httpfs_params, next_page_url, nullptr);
+		FAIL("Expected the missing page to fail");
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		CHECK(error.Type() == ExceptionType::HTTP);
+		CHECK(error.ExtraInfo().at("status_code") == "404");
+		CHECK(StringUtil::Contains(error.RawMessage(), "HTTP GET error listing"));
+	}
 }
 
 } // namespace duckdb

@@ -371,8 +371,7 @@ bool HTTPFileSystem::TryRangeRequest(FileHandle &handle, const string &url, cons
 			return true;
 		}
 
-		throw HTTPException(*res, "Request returned HTTP %d for HTTP %s to '%s'", static_cast<int>(res->status),
-		                    EnumUtil::ToString(RequestType::GET_REQUEST), url);
+		throw GetHTTPError(handle, *res, RequestType::GET_REQUEST, url);
 	}
 	throw IOException("Unknown error for HTTP %s to '%s'", EnumUtil::ToString(RequestType::GET_REQUEST), url);
 }
@@ -584,9 +583,7 @@ unique_ptr<CachedFileHandle> HTTPFileSystem::FullDownload(HTTPFileHandle &hfh, c
 		auto full_download_result = GetRequest(hfh, hfh.path, {}, read_config, *download);
 		ThrowIfReadConditionFailed(hfh, read_config, *full_download_result);
 		if (full_download_result->status != HTTPStatusCode::OK_200) {
-			throw HTTPException(*full_download_result, "Full download failed to to URL \"%s\": %d (%s)",
-			                    full_download_result->url, static_cast<int>(full_download_result->status),
-			                    full_download_result->GetError());
+			throw GetHTTPError(hfh, *full_download_result, RequestType::GET_REQUEST, hfh.path);
 		}
 		return download->Finalize();
 	}
@@ -672,7 +669,7 @@ unique_ptr<HTTPResponse> HTTPFileHandle::RequestFileInfo(HTTPFileSystem &hfs) {
 	    response->status != HTTPStatusCode::MovedPermanently_301) {
 		return RetryFileInfoWithRange(hfs);
 	}
-	throw hfs.GetHTTPError(*this, *response, path);
+	throw hfs.GetHTTPError(*this, *response, RequestType::HEAD_REQUEST, path);
 }
 
 unique_ptr<HTTPResponse> HTTPFileHandle::RetryFileInfoWithRange(HTTPFileSystem &hfs) {
@@ -686,7 +683,7 @@ unique_ptr<HTTPResponse> HTTPFileHandle::RetryFileInfoWithRange(HTTPFileSystem &
 		force_full_download = true;
 		return response;
 	}
-	throw hfs.GetHTTPError(*this, *response, path);
+	throw hfs.GetHTTPError(*this, *response, RequestType::GET_REQUEST, path);
 }
 
 void HTTPFileHandle::ApplyFileInfo(const HTTPResponse &response) {

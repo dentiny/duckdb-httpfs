@@ -265,16 +265,15 @@ bool S3FileSystem::ListFilesExtended(const string &directory, const std::functio
 }
 
 struct S3ListRequest {
-	static string Finish(HTTPRequestSession &session, const string &path, unique_ptr<HTTPResponse> response) {
-		if (response->HasRequestError()) {
-			throw IOException("%s error for HTTP GET to '%s'", response->GetRequestError(), path);
-		}
-		if (static_cast<int>(response->status) >= 400) {
-			auto captured = session.Capture();
-			auto &snapshot = captured.snapshot->Cast<S3RequestSnapshot>();
-			auto trimmed_path = path;
-			StringUtil::RTrim(trimmed_path, "/");
-			throw S3RequestUtil::GetError(snapshot.auth_params, *response, trimmed_path);
+	static string Finish(const S3RequestContext &request_context, unique_ptr<HTTPResponse> response) {
+		if (response->HasRequestError() || response->status != HTTPStatusCode::OK_200) {
+			auto display_url = request_context.display_url;
+			StringUtil::RTrim(display_url, "/");
+			if (response->HasRequestError()) {
+				throw IOException("%s error for HTTP GET to '%s'", response->GetRequestError(), display_url);
+			}
+			throw S3RequestUtil::GetError(request_context.auth_params, *response, request_context.request_type,
+			                              "listing", display_url);
 		}
 		return std::move(response->body);
 	}
@@ -300,6 +299,7 @@ struct S3ListRequest {
 
 string AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSession &session, const string &path,
                                 const string &continuation_token, bool use_delimiter, optional_idx max_keys) {
+	S3RequestContext request_context;
 	auto response = S3RequestExecutor::RunSession(
 	    encryption_util, session, path, RequestType::GET_REQUEST, S3RequestTarget::BUCKET,
 	    [&](const ParsedS3Url &parsed_url) {
@@ -317,9 +317,10 @@ string AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSess
 		        params.logger,
 		        "Ran S3 glob \"%s\" from incorrect region \"%s\" - retrying with updated region \"%s\".\n"
 		        "Consider setting the S3 region to this explicitly to avoid extra round-trips.",
-		        path, previous_region, correct_region);
-	    });
-	return S3ListRequest::Finish(session, path, std::move(response));
+		        request_data.display_url, previous_region, correct_region);
+	    },
+	    request_context);
+	return S3ListRequest::Finish(request_context, std::move(response));
 }
 
 void AWSListObjectV2::ParseFileList(string &aws_response, vector<OpenFileInfo> &result) {

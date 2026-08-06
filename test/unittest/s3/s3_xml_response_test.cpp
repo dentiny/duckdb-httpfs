@@ -111,4 +111,28 @@ TEST_CASE("S3 XML success responses require the expected contract", "[httpfs][s3
 	}
 }
 
+TEST_CASE("S3 XML errors are extracted without guessing malformed bodies", "[httpfs][s3][xml]") {
+	SECTION("all supported details are decoded") {
+		S3XMLError error;
+		REQUIRE(S3XMLResponseParser::TryParseError(
+		    "<Error><Code>InvalidAccessKeyId</Code><Message>bad &amp; expired</Message>"
+		    "<AWSAccessKeyId>redacted-id</AWSAccessKeyId></Error>",
+		    error));
+		CHECK(error.code == "InvalidAccessKeyId");
+		CHECK(error.message == "bad & expired");
+		CHECK(error.access_key_id == "redacted-id");
+	}
+	SECTION("code-only errors remain classifiable") {
+		S3XMLError error;
+		REQUIRE(S3XMLResponseParser::TryParseError("<Error><Code>RequestTimeout</Code></Error>", error));
+		CHECK(error.code == "RequestTimeout");
+		CHECK(error.message.empty());
+	}
+	SECTION("malformed and unrelated XML are not errors") {
+		S3XMLError error;
+		CHECK_FALSE(S3XMLResponseParser::TryParseError("<Error><Code>RequestTimeout", error));
+		CHECK_FALSE(S3XMLResponseParser::TryParseError("<Unexpected/>", error));
+	}
+}
+
 } // namespace duckdb

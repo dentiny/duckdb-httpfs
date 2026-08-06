@@ -12,10 +12,18 @@ struct S3XMLResponse {
 	string etag;
 	string error_code;
 	string error_message;
+	string error_access_key_id;
+};
+
+struct S3XMLError {
+	string code;
+	string message;
+	string access_key_id;
 };
 
 struct S3XMLResponseParser {
 	static bool TryParse(const string &input, S3XMLResponse &response);
+	static bool TryParseError(const string &input, S3XMLError &error);
 };
 
 } // namespace duckdb

@@ -1,6 +1,7 @@
 #include "s3/s3_request.hpp"
 
 #include "s3/s3fs.hpp"
+#include "s3/s3_xml_response.hpp"
 #include "create_secret_functions.hpp"
 #include "hash_functions.hpp"
 #include "http/http_state.hpp"
@@ -87,30 +88,12 @@ bool S3RequestQuery::HasParameter(const string &name) const {
 	return false;
 }
 
-static const char *S3RequestMethod(RequestType request_type) {
-	switch (request_type) {
-	case RequestType::GET_REQUEST:
-		return "GET";
-	case RequestType::PUT_REQUEST:
-		return "PUT";
-	case RequestType::HEAD_REQUEST:
-		return "HEAD";
-	case RequestType::DELETE_REQUEST:
-		return "DELETE";
-	case RequestType::POST_REQUEST:
-		return "POST";
-	case RequestType::OPTIONS_REQUEST:
-		return "OPTIONS";
-	}
-	throw InternalException("Unsupported S3 request type");
-}
-
 struct S3HeaderBuilder {
 	S3HeaderBuilder(EncryptionUtil &encryption_util_p, string url_p, const S3RequestQuery &query_p, string host_p,
 	                string service_p, RequestType request_type_p, const S3AuthParams &auth_params_p, string date_now_p,
 	                string datetime_now_p, string payload_hash_p, string content_type_p, string content_md5_p)
 	    : encryption_util(encryption_util_p), url(std::move(url_p)), query(query_p.CanonicalQuery()),
-	      host(std::move(host_p)), service(std::move(service_p)), method(S3RequestMethod(request_type_p)),
+	      host(std::move(host_p)), service(std::move(service_p)), method(HTTPFSUtil::GetRequestMethod(request_type_p)),
 	      auth_params(auth_params_p), date_now(std::move(date_now_p)), datetime_now(std::move(datetime_now_p)),
 	      payload_hash(std::move(payload_hash_p)), content_type(std::move(content_type_p)),
 	      content_md5(std::move(content_md5_p)),
@@ -285,11 +268,29 @@ HTTPHeaders S3RequestUtil::CreateHeaders(EncryptionUtil &encryption_util, const 
 }
 
 static bool IsAuthRefreshErrorBody(const string &body) {
-	string code;
-	if (!S3RequestUtil::TryFindTagContents(body, "Code", 0, code).IsValid()) {
+	S3XMLError error;
+	if (!S3XMLResponseParser::TryParseError(body, error)) {
 		return false;
 	}
-	return code == "ExpiredToken" || code == "InvalidToken" || code == "TokenRefreshRequired";
+	return error.code == "ExpiredToken" || error.code == "InvalidToken" || error.code == "TokenRefreshRequired";
+}
+
+static const char *S3RequestOperation(RequestType request_type) {
+	switch (request_type) {
+	case RequestType::GET_REQUEST:
+		return "reading";
+	case RequestType::HEAD_REQUEST:
+		return "checking";
+	case RequestType::PUT_REQUEST:
+		return "uploading to";
+	case RequestType::DELETE_REQUEST:
+		return "deleting";
+	case RequestType::POST_REQUEST:
+		return "sending a request to";
+	case RequestType::OPTIONS_REQUEST:
+		return "checking options for";
+	}
+	throw InternalException("Unsupported S3 request type");
 }
 
 static bool IsAuthRefreshStatus(const ErrorData &error) {
@@ -467,8 +468,8 @@ bool S3RequestUtil::IsRequestTimeout(const HTTPResponse &response) {
 	if (response.status != HTTPStatusCode::BadRequest_400 || response.body.empty()) {
 		return false;
 	}
-	string code;
-	return S3RequestUtil::TryFindTagContents(response.body, "Code", 0, code).IsValid() && code == "RequestTimeout";
+	S3XMLError error;
+	return S3XMLResponseParser::TryParseError(response.body, error) && error.code == "RequestTimeout";
 }
 
 static bool IsS3RequestTimeoutError(const ErrorData &error) {
@@ -478,8 +479,8 @@ static bool IsS3RequestTimeoutError(const ErrorData &error) {
 	if (status_entry == extra_info.end() || status_entry->second != "400" || body_entry == extra_info.end()) {
 		return false;
 	}
-	string code;
-	return S3RequestUtil::TryFindTagContents(body_entry->second, "Code", 0, code).IsValid() && code == "RequestTimeout";
+	S3XMLError s3_error;
+	return S3XMLResponseParser::TryParseError(body_entry->second, s3_error) && s3_error.code == "RequestTimeout";
 }
 
 static void SleepForS3RequestTimeoutRetry(const HTTPFSParams &http_params, idx_t transient_retries, double &wait_ms) {
@@ -501,7 +502,8 @@ static bool IsTransientRetryEligibleMethod(RequestType request_type) {
 unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, const CreateDataCallback &create_data,
                                                 bool transient_retry_eligible, const RequestCallback &request,
                                                 const RefreshCallback &refresh_auth_params,
-                                                const SetRegionCallback &set_region) {
+                                                const SetRegionCallback &set_region,
+                                                const FinalRequestCallback &final_request) {
 	// Auth refresh and region redirect are one-shot; transient timeouts follow the configured HTTP retry policy.
 	bool retried_auth_refresh = false;
 	bool retried_region = false;
@@ -528,6 +530,9 @@ unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, const Crea
 				SleepForS3RequestTimeoutRetry(http_params, transient_retries, transient_wait_ms);
 				transient_retries++;
 				continue;
+			}
+			if (final_request) {
+				final_request(request_data);
 			}
 			return result;
 		} catch (std::exception &ex) {
@@ -628,7 +633,8 @@ unique_ptr<HTTPResponse> S3RequestExecutor::RunSession(EncryptionUtil &encryptio
                                                        S3RequestTarget target, const CreateQueryCallback &create_query,
                                                        const string &payload_hash, const string &content_type,
                                                        const string &content_md5, const RequestCallback &request,
-                                                       const RegionRedirectCallback &region_redirect) {
+                                                       const RegionRedirectCallback &region_redirect,
+                                                       optional_ptr<S3RequestContext> request_context) {
 	return S3RequestExecutor::Run(
 	    s3_url,
 	    [&]() {
@@ -641,6 +647,13 @@ unique_ptr<HTTPResponse> S3RequestExecutor::RunSession(EncryptionUtil &encryptio
 		    string previous_region;
 		    if (S3RequestExecutor::SetSessionRegion(session, correct_region, previous_region) && region_redirect) {
 			    region_redirect(request_data, previous_region, correct_region);
+		    }
+	    },
+	    [&](const S3RequestData &request_data) {
+		    if (request_context) {
+			    request_context->request_type = request_data.request_type;
+			    request_context->auth_params = request_data.auth_params;
+			    request_context->display_url = request_data.display_url;
 		    }
 	    });
 }
@@ -666,9 +679,10 @@ unique_ptr<HTTPResponse> S3RequestExecutor::RunHandle(EncryptionUtil &encryption
 			        params.logger,
 			        "Read S3 file \"%s\" from incorrect region \"%s\" - retrying with updated region \"%s\".\n"
 			        "Consider setting the S3 region to this explicitly to avoid extra round-trips.",
-			        s3_url, previous_region, correct_region);
+			        request_data.display_url, previous_region, correct_region);
 		    }
-	    });
+	    },
+	    {});
 }
 
 unique_ptr<HTTPResponse> S3RequestExecutor::SendSessionRequest(HTTPRequestSession &session,
@@ -711,7 +725,8 @@ unique_ptr<HTTPResponse> S3RequestExecutor::SendHandleRequest(S3FileHandle &s3_h
 }
 
 HTTPException S3RequestUtil::GetRequestError(const S3RequestData &request_data, const HTTPResponse &response) {
-	return S3RequestUtil::GetError(request_data.auth_params, response, request_data.http_url);
+	return S3RequestUtil::GetError(request_data.auth_params, response, request_data.request_type,
+	                               S3RequestOperation(request_data.request_type), request_data.display_url);
 }
 
 S3RequestSnapshot::S3RequestSnapshot(const HTTPFSParams &http_params, const S3AuthParams &auth_params_p,
@@ -737,7 +752,8 @@ string S3RequestUtil::GetPayloadHash(EncryptionUtil &encryption_util, const_data
 
 unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, const string &url, string &result,
                                                    const_data_ptr_t buffer_in, idx_t buffer_in_len,
-                                                   const S3RequestQuery &query, S3PostRequestMode mode) {
+                                                   const S3RequestQuery &query, S3PostRequestMode mode,
+                                                   optional_ptr<S3RequestContext> request_context) {
 	auto payload_hash = S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), buffer_in, buffer_in_len);
 	const string content_type = "application/octet-stream";
 	return S3RequestExecutor::RunSession(
@@ -755,12 +771,14 @@ unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, 
 			                          return S3RequestExecutor::SendSessionRequest(session, request_data.captured,
 			                                                                       params, request);
 		                          });
-	    });
+	    },
+	    {}, request_context);
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, const string &url,
                                                   const_data_ptr_t buffer_in, idx_t buffer_in_len,
-                                                  const S3RequestQuery &query) {
+                                                  const S3RequestQuery &query,
+                                                  optional_ptr<S3RequestContext> request_context) {
 	auto payload_hash = S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), buffer_in, buffer_in_len);
 	const string content_type = "application/octet-stream";
 	return S3RequestExecutor::RunSession(
@@ -774,7 +792,8 @@ unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, c
 			                         return S3RequestExecutor::SendSessionRequest(session, request_data.captured,
 			                                                                      params, request);
 		                         });
-	    });
+	    },
+	    {}, request_context);
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::HeadRequest(FileHandle &handle, const string &s3_url, HTTPHeaders header_map) {
@@ -836,7 +855,8 @@ unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, const s
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(HTTPRequestSession &session, const string &s3_url,
-                                                     const S3RequestQuery &query) {
+                                                     const S3RequestQuery &query,
+                                                     optional_ptr<S3RequestContext> request_context) {
 	return S3RequestExecutor::RunSession(
 	    GetEncryptionUtil(), session, s3_url, RequestType::DELETE_REQUEST, S3RequestTarget::OBJECT,
 	    [&](const ParsedS3Url &) { return query; }, "", "", "",
@@ -845,7 +865,8 @@ unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(HTTPRequestSession &session
 		    return RunDeleteRequest(request_data.http_url, request_data.headers, params, [&](BaseRequest &request) {
 			    return S3RequestExecutor::SendSessionRequest(session, request_data.captured, params, request);
 		    });
-	    });
+	    },
+	    {}, request_context);
 }
 
 optional_idx S3RequestUtil::TryFindTagContents(const string &response, const string &tag, idx_t cur_pos,
@@ -880,80 +901,40 @@ optional_idx S3RequestUtil::FindTagContents(const string &response, const string
 	return next_pos;
 }
 
-string S3RequestUtil::GetBadRequestError(const S3AuthParams &s3_auth_params, const string &correct_region) {
-	string extra_text = "\n\nBad Request - this can be caused by the S3 region being set incorrectly.";
-	if (s3_auth_params.region.empty()) {
-		extra_text += "\n* No region is provided.";
-	} else {
-		extra_text += "\n* Provided region is: \"" + s3_auth_params.region + "\"";
-	}
-	if (!correct_region.empty()) {
-		extra_text += "\n* Correct region is: \"" + correct_region + "\"";
-	}
-	return extra_text;
-}
-
 string S3RequestUtil::ParseError(const string &error) {
-	// S3 errors look like this:
-	//<Error>
-	//  <Code>NoSuchKey</Code>
-	//  <Message>The resource you requested does not exist</Message>
-	//  <Resource>/mybucket/myfoto.jpg</Resource>
-	//  <RequestId>4442587FB7D0A2F9</RequestId>
-	//</Error>
-	if (error.empty()) {
+	S3XMLError parsed_error;
+	if (!S3XMLResponseParser::TryParseError(error, parsed_error) || parsed_error.code.empty()) {
 		return string();
 	}
-	// find <Error> tag
-	string error_xml;
-	idx_t err_pos = 0;
-	auto next_pos = S3RequestUtil::TryFindTagContents(error, "Error", err_pos, error_xml);
-	if (!next_pos.IsValid()) {
-		return string();
+	string result = "\n\n" + parsed_error.code;
+	if (!parsed_error.message.empty()) {
+		result += ": " + parsed_error.message;
 	}
-	// find <Code> and <Message>
-	string error_code, error_message, extra_error_data;
-	idx_t cur_pos = 0;
-	next_pos = S3RequestUtil::TryFindTagContents(error_xml, "Code", cur_pos, error_code);
-	if (!next_pos.IsValid()) {
-		return string();
+	if (parsed_error.code == "InvalidAccessKeyId" && !parsed_error.access_key_id.empty()) {
+		result += "\nInvalid Access Key: \"" + parsed_error.access_key_id + "\"";
 	}
-	cur_pos = 0;
-	next_pos = S3RequestUtil::TryFindTagContents(error_xml, "Message", cur_pos, error_message);
-	if (!next_pos.IsValid()) {
-		return string();
-	}
-	// depending on Code, find other info
-	if (error_code == "InvalidAccessKeyId") {
-		cur_pos = 0;
-		next_pos = S3RequestUtil::TryFindTagContents(error_xml, "AWSAccessKeyId", cur_pos, extra_error_data);
-		if (next_pos.IsValid()) {
-			extra_error_data = "\nInvalid Access Key: \"" + extra_error_data + "\"";
-		}
-	}
-	return StringUtil::Format("\n\n%s: %s%s", error_code, error_message, extra_error_data);
+	return result;
 }
 
 HTTPException S3RequestUtil::GetError(const S3AuthParams &s3_auth_params, const HTTPResponse &response,
-                                      const string &url) {
+                                      RequestType request_type, const string &operation, const string &display_url) {
 	string extra_text = S3RequestUtil::ParseError(response.body);
 	if (response.status == HTTPStatusCode::BadRequest_400) {
-		extra_text += S3RequestUtil::GetBadRequestError(s3_auth_params);
+		extra_text += S3Provider::GetBadRequestError(s3_auth_params);
 	}
-	if (response.status == HTTPStatusCode::Forbidden_403) {
+	if (response.status == HTTPStatusCode::Unauthorized_401 || response.status == HTTPStatusCode::Forbidden_403) {
 		extra_text += S3Provider::GetAuthError(s3_auth_params);
 	}
-	auto status_message = HTTPFSUtil::GetStatusMessage(response.status);
-	return HTTPException(response, "HTTP GET error reading '%s' in region '%s' (HTTP %d %s)%s", url,
-	                     s3_auth_params.region, response.status, status_message, extra_text);
+	return HTTPFSUtil::GetHTTPStatusError(response, request_type, operation, display_url, extra_text);
 }
 
-HTTPException S3FileSystem::GetHTTPError(FileHandle &handle, const HTTPResponse &response, const string &url) {
+HTTPException S3FileSystem::GetHTTPError(FileHandle &handle, const HTTPResponse &response, RequestType request_type,
+                                         const string &url) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
 	auto captured = s3_handle.request_session->Capture();
 	auto auth_params = captured.snapshot->Cast<S3RequestSnapshot>().auth_params;
-
-	return S3RequestUtil::GetError(auth_params, response, url);
+	return S3RequestUtil::GetError(auth_params, response, request_type, S3RequestOperation(request_type),
+	                               S3Url::GetDisplayUrl(url, auth_params));
 }
 
 shared_ptr<HTTPRequestSession> S3RequestExecutor::CreateSession(optional_ptr<FileOpener> opener, const string &path,

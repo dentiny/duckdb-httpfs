@@ -305,15 +305,39 @@ unique_ptr<HTTPResponse> HTTPFileSystem::DeleteRequest(FileHandle &handle, const
 	});
 }
 
-HTTPException HTTPFileSystem::GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) {
-	auto status_message = HTTPFSUtil::GetStatusMessage(response.status);
-	string error = "HTTP GET error on '" + url + "' (HTTP " + to_string(static_cast<int>(response.status)) + " " +
-	               status_message + ")";
-	if (response.status == HTTPStatusCode::RangeNotSatisfiable_416) {
-		error += " This could mean the file was changed. Try disabling the duckdb http metadata cache "
-		         "if enabled, and confirm the server supports range requests.";
+const char *HTTPFSUtil::GetRequestMethod(RequestType request_type) {
+	switch (request_type) {
+	case RequestType::GET_REQUEST:
+		return "GET";
+	case RequestType::PUT_REQUEST:
+		return "PUT";
+	case RequestType::HEAD_REQUEST:
+		return "HEAD";
+	case RequestType::DELETE_REQUEST:
+		return "DELETE";
+	case RequestType::POST_REQUEST:
+		return "POST";
+	case RequestType::OPTIONS_REQUEST:
+		return "OPTIONS";
 	}
-	return HTTPException(response, error);
+	throw InternalException("Unsupported HTTP request type");
+}
+
+HTTPException HTTPFSUtil::GetHTTPStatusError(const HTTPResponse &response, RequestType request_type,
+                                             const string &operation, const string &display_url,
+                                             const string &details) {
+	return HTTPException(response, "HTTP %s error %s '%s' (HTTP %d %s)%s", GetRequestMethod(request_type), operation,
+	                     display_url, response.status, GetStatusMessage(response.status), details);
+}
+
+HTTPException HTTPFileSystem::GetHTTPError(FileHandle &, const HTTPResponse &response, RequestType request_type,
+                                           const string &url) {
+	string details;
+	if (response.status == HTTPStatusCode::RangeNotSatisfiable_416) {
+		details = " This could mean the file was changed. Try disabling the duckdb http metadata cache "
+		          "if enabled, and confirm the server supports range requests.";
+	}
+	return HTTPFSUtil::GetHTTPStatusError(response, request_type, "on", url, details);
 }
 
 void HTTPFileSystem::ValidateResponseETag(HTTPFileHandle &hfh, const HTTPReadConfig &read_config,
@@ -354,7 +378,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRequest(FileHandle &handle, string u
 	auto request_params = captured.snapshot->CreateRequestParams();
 	return RunGetRequest(
 	    hfh, url, header_map, *request_params, read_config, download,
-	    [&](const HTTPResponse &response) { return GetHTTPError(handle, response, url); },
+	    [&](const HTTPResponse &response) { return GetHTTPError(handle, response, RequestType::GET_REQUEST, url); },
 	    [&](BaseRequest &request) {
 		    return SendSessionRequest(*hfh.request_session, captured, *request_params, request);
 	    });
@@ -369,7 +393,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::GetRangeRequest(FileHandle &handle, str
 	auto request_params = captured.snapshot->CreateRequestParams();
 	return RunGetRangeRequest(
 	    hfh, url, header_map, *request_params, read_config, file_offset, buffer_out, buffer_out_len,
-	    [&](const HTTPResponse &response) { return GetHTTPError(handle, response, url); },
+	    [&](const HTTPResponse &response) { return GetHTTPError(handle, response, RequestType::GET_REQUEST, url); },
 	    [&](BaseRequest &request) {
 		    return SendSessionRequest(*hfh.request_session, captured, *request_params, request);
 	    });

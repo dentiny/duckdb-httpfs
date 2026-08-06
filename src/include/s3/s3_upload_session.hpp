@@ -13,8 +13,12 @@
 namespace duckdb {
 
 class HTTPRequestSession;
+class HTTPException;
 class S3FileSystem;
+struct HTTPResponse;
+struct S3RequestContext;
 struct S3RequestQuery;
+enum class RequestType : uint8_t;
 
 class S3UploadSession {
 private:
@@ -128,6 +132,8 @@ private:
 	MultipartSnapshot GetMultipartSnapshot() DUCKDB_EXCLUDES(state_lock);
 	void CompleteMultipartUpload();
 	string GetDisplayPath() const;
+	static HTTPException GetStatusError(const HTTPResponse &response, const S3RequestContext &request_context,
+	                                    const string &operation);
 
 private:
 	reference<S3FileSystem> s3fs;

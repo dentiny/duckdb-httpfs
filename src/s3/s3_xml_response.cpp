@@ -638,6 +638,9 @@ private:
 		if (!TryGetChildText("Message", response.error_message)) {
 			response.error_message.clear();
 		}
+		if (!TryGetChildText("AWSAccessKeyId", response.error_access_key_id)) {
+			response.error_access_key_id.clear();
+		}
 	}
 
 private:
@@ -656,6 +659,18 @@ private:
 
 bool S3XMLResponseParser::TryParse(const string &input, S3XMLResponse &response) {
 	return S3XMLReader(input).Parse(response);
+}
+
+bool S3XMLResponseParser::TryParseError(const string &input, S3XMLError &error) {
+	error = S3XMLError();
+	S3XMLResponse response;
+	if (!TryParse(input, response) || response.type != S3XMLResponseType::ERROR) {
+		return false;
+	}
+	error.code = std::move(response.error_code);
+	error.message = std::move(response.error_message);
+	error.access_key_id = std::move(response.error_access_key_id);
+	return true;
 }
 
 } // namespace duckdb

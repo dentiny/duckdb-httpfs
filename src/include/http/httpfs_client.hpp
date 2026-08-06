@@ -28,6 +28,7 @@ class FileOpener;
 struct FileOpenerInfo;
 class HTTPState;
 class HTTPFSUtil;
+class HTTPException;
 
 enum class HTTPClientReuseMode : uint8_t { SESSION_LOCAL, SHARED, NONE };
 
@@ -93,6 +94,10 @@ public:
 	virtual HTTPClientReuseMode GetClientReuseMode() const;
 
 	static HTTPUtil &GetHTTPUtil(optional_ptr<FileOpener> opener);
+	static const char *GetRequestMethod(RequestType request_type);
+	static HTTPException GetHTTPStatusError(const HTTPResponse &response, RequestType request_type,
+	                                        const string &operation, const string &display_url,
+	                                        const string &details = "");
 
 	string GetName() const override;
 };

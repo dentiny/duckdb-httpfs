@@ -12,6 +12,7 @@
 #include "s3/s3fs.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -514,6 +515,110 @@ TEST_CASE("S3 provider policy selects request authentication", "[httpfs][s3][pro
 		REQUIRE(headers.GetHeaderValue("Content-MD5") == "content-md5");
 		REQUIRE_FALSE(headers.HasHeader("x-amz-date"));
 	}
+}
+
+TEST_CASE("S3 HTTP errors preserve metadata and provider-specific context", "[httpfs][s3][error]") {
+	HTTPResponse response(HTTPStatusCode::Forbidden_403);
+	response.reason = "Forbidden by test";
+	response.body = "<Error><Code>InvalidAccessKeyId</Code><Message>bad credentials</Message>"
+	                "<AWSAccessKeyId>test-key</AWSAccessKeyId></Error>";
+	response.headers.Insert("x-test-request-id", "request-42");
+
+	S3AuthParams auth_params;
+	auth_params.provider_type = S3ProviderType::S3;
+	auth_params.region = "eu-west-1";
+	auto display_url = S3Url::GetDisplayUrl("s3://bucket/key?s3_secret_access_key=hidden", auth_params);
+	auto error =
+	    ErrorData(S3RequestUtil::GetError(auth_params, response, RequestType::GET_REQUEST, "reading", display_url));
+
+	CHECK(error.Type() == ExceptionType::HTTP);
+	CHECK(error.ExtraInfo().at("status_code") == "403");
+	CHECK(error.ExtraInfo().at("reason") == response.reason);
+	CHECK(error.ExtraInfo().at("response_body") == response.body);
+	CHECK(error.ExtraInfo().at("header_x-test-request-id") == "request-42");
+	CHECK(StringUtil::Contains(error.RawMessage(), "HTTP GET error reading 's3://bucket/key'"));
+	CHECK(StringUtil::Contains(error.RawMessage(), "InvalidAccessKeyId: bad credentials"));
+	CHECK(StringUtil::Contains(error.RawMessage(), "Invalid Access Key: \"test-key\""));
+	CHECK(StringUtil::Contains(error.RawMessage(), "Authentication Failure"));
+	CHECK_FALSE(StringUtil::Contains(error.RawMessage(), "hidden"));
+}
+
+TEST_CASE("S3 HTTP diagnostics stay within their provider", "[httpfs][s3][provider][error]") {
+	HTTPResponse bad_request(HTTPStatusCode::BadRequest_400);
+	bad_request.reason = "Bad Request";
+	bad_request.body = "not XML";
+
+	for (const auto provider_type : {S3ProviderType::S3, S3ProviderType::GCS, S3ProviderType::R2}) {
+		S3AuthParams auth_params;
+		auth_params.provider_type = provider_type;
+		auth_params.region = "test-region";
+		auto error = ErrorData(S3RequestUtil::GetError(auth_params, bad_request, RequestType::POST_REQUEST, "listing",
+		                                               "provider://bucket"));
+		CHECK(StringUtil::Contains(error.RawMessage(), "Bad Request - this can be caused by the S3 region") ==
+		      (provider_type == S3ProviderType::S3));
+		CHECK_FALSE(StringUtil::Contains(error.RawMessage(), "not XML"));
+	}
+
+	HTTPResponse unauthorized(HTTPStatusCode::Unauthorized_401);
+	unauthorized.reason = "Unauthorized";
+	for (const auto entry : {pair<S3ProviderType, string> {S3ProviderType::S3, "invalid or missing credentials"},
+	                         pair<S3ProviderType, string> {S3ProviderType::GCS, "GCS authentication failed"},
+	                         pair<S3ProviderType, string> {S3ProviderType::R2, "R2 authentication failed"}}) {
+		S3AuthParams auth_params;
+		auth_params.provider_type = entry.first;
+		auto error = ErrorData(S3RequestUtil::GetError(auth_params, unauthorized, RequestType::HEAD_REQUEST, "checking",
+		                                               "provider://bucket/key"));
+		CHECK(StringUtil::Contains(error.RawMessage(), entry.second));
+	}
+}
+
+TEST_CASE("S3 error classification requires valid XML but accepts code-only errors", "[httpfs][s3][error]") {
+	HTTPResponse response(HTTPStatusCode::BadRequest_400);
+	response.body = "<Error><Code>RequestTimeout</Code></Error>";
+	CHECK(S3RequestUtil::IsRequestTimeout(response));
+	CHECK(S3RequestUtil::ParseError(response.body) == "\n\nRequestTimeout");
+
+	response.body = "<Error><Code>RequestTimeout";
+	CHECK_FALSE(S3RequestUtil::IsRequestTimeout(response));
+	CHECK(S3RequestUtil::ParseError(response.body).empty());
+}
+
+TEST_CASE("S3 request error context belongs to the final attempt", "[httpfs][s3][error][request-session]") {
+	HTTPFSUtil http_util;
+	HTTPFSParams http_params(http_util);
+	S3AuthParams auth_params;
+	auth_params.provider_type = S3ProviderType::S3;
+	auth_params.region = "request-region";
+	auth_params.endpoint = "s3.request-region.amazonaws.com";
+	auto snapshot = make_shared_ptr<S3RequestSnapshot>(http_params, auth_params, "s3://bucket/key",
+	                                                   weak_ptr<ClientContext>(), false);
+	HTTPRequestSession session(snapshot);
+	::AESStateSSLFactory encryption_util;
+	S3RequestContext request_context;
+
+	auto response = S3RequestExecutor::RunSession(
+	    encryption_util, session, "s3://bucket/key?s3_secret_access_key=hidden", RequestType::GET_REQUEST,
+	    S3RequestTarget::OBJECT, [](const ParsedS3Url &) { return S3RequestQuery(); }, "", "", "",
+	    [&](S3RequestData &request_data) {
+		    CHECK(request_data.auth_params.region == "request-region");
+		    string previous_region;
+		    REQUIRE(S3RequestExecutor::SetSessionRegion(session, "published-region", previous_region));
+		    auto result = make_uniq<HTTPResponse>(HTTPStatusCode::BadRequest_400);
+		    result->reason = "Bad Request";
+		    result->body = "<Error><Code>InvalidRequest</Code></Error>";
+		    return result;
+	    },
+	    {}, request_context);
+
+	REQUIRE(response);
+	CHECK(session.Capture().snapshot->Cast<S3RequestSnapshot>().auth_params.region == "published-region");
+	CHECK(request_context.auth_params.region == "request-region");
+	CHECK(request_context.display_url == "s3://bucket/key");
+	auto error = ErrorData(S3RequestUtil::GetError(request_context.auth_params, *response, request_context.request_type,
+	                                               "reading", request_context.display_url));
+	CHECK(StringUtil::Contains(error.RawMessage(), "Provided region is: \"request-region\""));
+	CHECK_FALSE(StringUtil::Contains(error.RawMessage(), "published-region"));
+	CHECK_FALSE(StringUtil::Contains(error.RawMessage(), "hidden"));
 }
 
 TEST_CASE("S3 request signing remains deterministic", "[httpfs][s3][signing]") {
