@@ -10,6 +10,9 @@
 
 namespace duckdb {
 
+S3FileSystem::S3FileSystem(BufferManager &buffer_manager_p) : buffer_manager(buffer_manager_p) {
+}
+
 S3FileHandle::S3FileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpenFlags flags,
                            unique_ptr<HTTPParams> http_params_p, const S3AuthParams &auth_params_p,
                            const S3UploadConfig &upload_config)
@@ -147,6 +150,26 @@ void S3FileHandle::Initialize(optional_ptr<FileOpener> opener) {
 
 bool S3FileSystem::CanHandleFile(const string &fpath) {
 	return !S3Url::TryGetPrefix(fpath).empty();
+}
+
+bool S3FileSystem::OnDiskFile(FileHandle &) {
+	return false;
+}
+
+FileWriteMode S3FileSystem::GetWriteMode(FileHandle &) {
+	return FileWriteMode::CONCURRENT_SEQUENTIAL;
+}
+
+bool S3FileSystem::DirectoryExists(const string &, optional_ptr<FileOpener>) {
+	return true;
+}
+
+bool S3FileSystem::SupportsListFilesExtended() const {
+	return true;
+}
+
+bool S3FileSystem::SupportsGlobExtended() const {
+	return true;
 }
 
 void S3FileSystem::FileSync(FileHandle &handle) {

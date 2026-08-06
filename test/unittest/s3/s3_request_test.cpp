@@ -12,6 +12,7 @@
 #include "s3/s3fs.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/common/array.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -19,7 +20,6 @@
 #include "duckdb/main/client_context_file_opener.hpp"
 #include "duckdb/main/secret/secret.hpp"
 
-#include <array>
 #include <new>
 
 namespace duckdb {
@@ -561,9 +561,9 @@ TEST_CASE("S3 HTTP diagnostics stay within their provider", "[httpfs][s3][provid
 
 	HTTPResponse unauthorized(HTTPStatusCode::Unauthorized_401);
 	unauthorized.reason = "Unauthorized";
-	for (const auto entry : {pair<S3ProviderType, string> {S3ProviderType::S3, "invalid or missing credentials"},
-	                         pair<S3ProviderType, string> {S3ProviderType::GCS, "GCS authentication failed"},
-	                         pair<S3ProviderType, string> {S3ProviderType::R2, "R2 authentication failed"}}) {
+	for (const auto &entry : {pair<S3ProviderType, string> {S3ProviderType::S3, "invalid or missing credentials"},
+	                          pair<S3ProviderType, string> {S3ProviderType::GCS, "GCS authentication failed"},
+	                          pair<S3ProviderType, string> {S3ProviderType::R2, "R2 authentication failed"}}) {
 		S3AuthParams auth_params;
 		auth_params.provider_type = entry.first;
 		auto error = ErrorData(S3RequestUtil::GetError(auth_params, unauthorized, RequestType::HEAD_REQUEST, "checking",
@@ -668,6 +668,11 @@ TEST_CASE("S3 request signing includes optional headers", "[httpfs][s3][signing]
 }
 
 TEST_CASE("S3 request queries share canonical and wire encoding", "[httpfs][s3][query][signing]") {
+	SECTION("path and query components encode slashes according to their wire context") {
+		REQUIRE(S3Url::Encode("a/b c", S3URLEncodeMode::PATH) == "a/b%20c");
+		REQUIRE(S3Url::Encode("a/b c", S3URLEncodeMode::QUERY_COMPONENT) == "a%2Fb%20c");
+	}
+
 	SECTION("raw parameters are encoded and sorted once") {
 		S3RequestQuery query {{"z", "a b"}, {"empty", ""}, {"slash", "a/b"}, {"amp", "x&y"}, {"a", "1"}};
 		const string expected = "a=1&amp=x%26y&empty=&slash=a%2Fb&z=a%20b";
@@ -731,7 +736,7 @@ TEST_CASE("HTTPFS streams full GETs without Content-Length", "[httpfs][s3][strea
 }
 
 TEST_CASE("HTTPFS initializes and clones parameters without a configured proxy", "[httpfs][s3][params]") {
-	alignas(HTTPFSParams) std::array<uint8_t, sizeof(HTTPFSParams)> storage;
+	alignas(HTTPFSParams) array<uint8_t, sizeof(HTTPFSParams)> storage;
 	storage.fill(0xA5);
 
 	HTTPFSUtil http_util;

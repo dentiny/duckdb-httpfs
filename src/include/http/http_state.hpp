@@ -55,6 +55,7 @@ public:
 			}
 		}
 
+	public:
 		RangeRequestSupport Support() const {
 			return support;
 		}
@@ -81,6 +82,7 @@ public:
 		bool owns_probe;
 	};
 
+public:
 	Guard BeginRequest(bool enabled = true) {
 		return Guard(*this, enabled);
 	}
@@ -100,6 +102,7 @@ private:
 		}
 	}
 
+private:
 	annotated_mutex state_mutex;
 	std::condition_variable probe_complete DUCKDB_GUARDED_BY(state_mutex);
 	bool probing DUCKDB_GUARDED_BY(state_mutex) = false;
@@ -117,24 +120,22 @@ public:
 	void Invalidate();
 
 private:
-	//! Protects the download state and cached data
+	//! Download state and cached data
 	mutable annotated_mutex lock;
-	//! Notifies handles waiting for an in-progress download
 	mutable std::condition_variable download_complete DUCKDB_GUARDED_BY(lock);
-	//! Published immutable file data
 	shared_ptr<class CachedFileData> cached_data DUCKDB_GUARDED_BY(lock);
-	//! Whether a download is currently populating the cache
 	bool downloading DUCKDB_GUARDED_BY(lock) = false;
 };
 
 //! Immutable data published after a full download completes
 class CachedFileData {
+	friend class CachedFileHandle;
+
 public:
 	CachedFileData(AllocatedData data_p, idx_t size_p) : data(std::move(data_p)), size(size_p) {
 	}
 
 private:
-	friend class CachedFileHandle;
 	AllocatedData data;
 	idx_t size;
 };
@@ -144,6 +145,7 @@ class CachedFileHandle {
 public:
 	explicit CachedFileHandle(shared_ptr<CachedFileData> file_p);
 
+public:
 	const char *GetData() const;
 	//! Return the size of the initialized file
 	idx_t GetSize() const;
@@ -156,9 +158,13 @@ private:
 class CachedFileDownload {
 	friend class CachedFile;
 
+private:
+	CachedFileDownload(shared_ptr<CachedFile> file_p, Allocator &allocator_p);
+
 public:
 	~CachedFileDownload();
 
+public:
 	//! Reserve capacity without changing the number of downloaded bytes
 	void Reserve(idx_t capacity);
 	//! Append downloaded bytes, growing the allocation as needed
@@ -169,10 +175,10 @@ public:
 	unique_ptr<CachedFileHandle> Finalize();
 
 private:
-	CachedFileDownload(shared_ptr<CachedFile> file_p, Allocator &allocator_p);
 	void ReserveInternal(idx_t capacity);
 	void Abort();
 
+private:
 	shared_ptr<CachedFile> file;
 	Allocator &allocator;
 	AllocatedData data;
@@ -187,6 +193,7 @@ public:
 	HTTPFileState() : cached_file(make_shared_ptr<CachedFile>()) {
 	}
 
+public:
 	unique_ptr<CachedFileHandle> TryGetCachedFileHandle() {
 		return cached_file->TryGetHandle();
 	}
@@ -226,6 +233,14 @@ public:
 		       total_bytes_received == 0 && total_bytes_sent == 0;
 	}
 
+	//! Called by the ClientContext when the current query ends
+	void QueryEnd(ClientContext &context) override {
+		Reset();
+	}
+	void WriteProfilingInformation(std::ostream &ss) override;
+	bool RunCredentialRefresh(const std::function<bool()> &callback) DUCKDB_EXCLUDES(credential_refresh_mutex);
+
+public:
 	atomic<idx_t> head_count {0};
 	atomic<idx_t> get_count {0};
 	atomic<idx_t> put_count {0};
@@ -234,16 +249,10 @@ public:
 	atomic<idx_t> total_bytes_received {0};
 	atomic<idx_t> total_bytes_sent {0};
 
-	//! Called by the ClientContext when the current query ends
-	void QueryEnd(ClientContext &context) override {
-		Reset();
-	}
-	void WriteProfilingInformation(std::ostream &ss) override;
-	bool RunCredentialRefresh(const std::function<bool()> &callback) DUCKDB_EXCLUDES(credential_refresh_mutex);
-
 private:
 	//! Serializes credential provider refreshes after auth failures.
 	annotated_mutex credential_refresh_mutex;
+
 	//! Protects the per-path state map
 	annotated_mutex file_states_mutex;
 	//! Per-path state shared by all file handles in this query

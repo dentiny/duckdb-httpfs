@@ -137,7 +137,7 @@ static CURLGlobalState &GetCURLGlobalState() {
 }
 
 class HTTPFSCurlClient : public HTTPClient {
-public:
+private:
 	struct ClientConfigurator {
 		static void Configure(HTTPFSCurlClient &client, HTTPFSParams &params) {
 			client.state = params.state;
@@ -201,40 +201,6 @@ public:
 		}
 	};
 
-	static string NormalizePathToBeAdded(string added_path) {
-		while (added_path.size() > 2) {
-			if (StringUtil::StartsWith(added_path, "//")) {
-				added_path = added_path.substr(1);
-			} else if (StringUtil::StartsWith(added_path, "./")) {
-				added_path = added_path.substr(1);
-			} else {
-				break;
-			}
-		}
-
-		return added_path;
-	}
-	HTTPFSCurlClient(HTTPFSParams &http_params, const string &proto_host_port) : HTTPClient(proto_host_port) {
-		string normalized_path = NormalizePathToBeAdded(proto_host_port);
-		curl_url_set(curl_base_url.Get(), CURLUPART_URL, normalized_path.c_str(), 0);
-		stored_bearer_token = "";
-		stored_cert_file_path = "";
-		Initialize(http_params);
-	}
-	void Initialize(HTTPParams &http_p) override {
-		auto &http_params = http_p.Cast<HTTPFSParams>();
-		ClientConfigurator::Configure(*this, http_params);
-	}
-
-	~HTTPFSCurlClient() override {
-		DestroyCurlGlobal();
-	}
-	static void AddUserAgentIfAvailable(HTTPFSParams &http_params, HTTPHeaders &header_map) {
-		if (!http_params.user_agent.empty()) {
-			header_map.Insert("User-Agent", http_params.user_agent);
-		}
-	}
-
 	class GetTransferState {
 	public:
 		GetTransferState(HTTPFSCurlClient &client_p, GetRequestInfo &request_p)
@@ -252,6 +218,7 @@ public:
 			curl_easy_setopt(*client.curl, CURLOPT_WRITEDATA, &client.request_info->body);
 		}
 
+	public:
 		unique_ptr<HTTPResponse> Finish(CURLcode result) {
 			curl_easy_getinfo(*client.curl, CURLINFO_RESPONSE_CODE, &client.request_info->response_code);
 			const bool include_body = !stream_content || client.request_info->response_code >= 400;
@@ -391,6 +358,42 @@ public:
 		bool response_handler_called = false;
 		bool stopped = false;
 	};
+
+public:
+	HTTPFSCurlClient(HTTPFSParams &http_params, const string &proto_host_port) : HTTPClient(proto_host_port) {
+		string normalized_path = NormalizePathToBeAdded(proto_host_port);
+		curl_url_set(curl_base_url.Get(), CURLUPART_URL, normalized_path.c_str(), 0);
+		stored_bearer_token = "";
+		stored_cert_file_path = "";
+		Initialize(http_params);
+	}
+	~HTTPFSCurlClient() override {
+		DestroyCurlGlobal();
+	}
+
+public:
+	static string NormalizePathToBeAdded(string added_path) {
+		while (added_path.size() > 2) {
+			if (StringUtil::StartsWith(added_path, "//")) {
+				added_path = added_path.substr(1);
+			} else if (StringUtil::StartsWith(added_path, "./")) {
+				added_path = added_path.substr(1);
+			} else {
+				break;
+			}
+		}
+
+		return added_path;
+	}
+	void Initialize(HTTPParams &http_p) override {
+		auto &http_params = http_p.Cast<HTTPFSParams>();
+		ClientConfigurator::Configure(*this, http_params);
+	}
+	static void AddUserAgentIfAvailable(HTTPFSParams &http_params, HTTPHeaders &header_map) {
+		if (!http_params.user_agent.empty()) {
+			header_map.Insert("User-Agent", http_params.user_agent);
+		}
+	}
 
 	unique_ptr<HTTPResponse> Get(GetRequestInfo &info) override {
 		AddUserAgentIfAvailable(info.params.Cast<HTTPFSParams>(), info.headers);
@@ -677,14 +680,6 @@ private:
 		return response;
 	}
 
-private:
-	unique_ptr<CURLHandle> curl;
-	optional_ptr<HTTPState> state;
-	unique_ptr<RequestInfo> request_info;
-	CURLURLHandle curl_base_url;
-	string stored_bearer_token;
-	string stored_cert_file_path;
-
 	static void InitCurlGlobal() {
 		auto &state = GetCURLGlobalState();
 		annotated_lock_guard<annotated_mutex> lock(state.lock);
@@ -705,6 +700,14 @@ private:
 		// 	curl_global_cleanup();
 		// }
 	}
+
+private:
+	unique_ptr<CURLHandle> curl;
+	optional_ptr<HTTPState> state;
+	unique_ptr<RequestInfo> request_info;
+	CURLURLHandle curl_base_url;
+	string stored_bearer_token;
+	string stored_cert_file_path;
 };
 
 unique_ptr<HTTPClient> HTTPFSCurlUtil::InitializeClient(HTTPParams &http_params, const string &proto_host_port) {

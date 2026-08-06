@@ -64,6 +64,7 @@ public:
 		EVP_MD_CTX_free(context);
 	}
 
+public:
 	void Hash(duckdb::const_data_ptr_t input, duckdb::idx_t input_len, duckdb::data_ptr_t output) override {
 		unsigned int output_size = 0;
 		if (!EVP_DigestInit_ex(context, nullptr, nullptr)) {

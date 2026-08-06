@@ -6,63 +6,14 @@
 namespace duckdb {
 
 class HTTPFSClient : public HTTPClient {
-public:
-	HTTPFSClient(HTTPFSParams &http_params, const string &proto_host_port) : HTTPClient(proto_host_port) {
-		client = make_uniq<duckdb_httplib_openssl::Client>(proto_host_port);
-		Initialize(http_params);
-	}
-	void Initialize(HTTPParams &http_p) override {
-		auto &http_params = http_p.Cast<HTTPFSParams>();
-		client->set_follow_location(http_params.follow_location);
-		client->set_keep_alive(http_params.keep_alive);
-		if (!http_params.ca_cert_file.empty()) {
-			client->set_ca_cert_path(http_params.ca_cert_file.c_str());
-		} else {
-			client->set_ca_cert_path("");
-		}
-		const bool verify_ssl =
-		    http_params.override_verify_ssl ? http_params.verify_ssl : http_params.enable_server_cert_verification;
-		client->enable_server_certificate_verification(verify_ssl);
-		client->set_write_timeout(NumericCast<time_t>(http_params.timeout),
-		                          NumericCast<time_t>(http_params.timeout_usec));
-		client->set_read_timeout(NumericCast<time_t>(http_params.timeout),
-		                         NumericCast<time_t>(http_params.timeout_usec));
-		client->set_connection_timeout(NumericCast<time_t>(http_params.timeout),
-		                               NumericCast<time_t>(http_params.timeout_usec));
-		client->set_decompress(false);
-		if (!http_params.bearer_token.empty()) {
-			client->set_bearer_token_auth(http_params.bearer_token.c_str());
-		} else {
-			client->set_bearer_token_auth("");
-		}
-
-		if (!http_params.http_proxy.empty()) {
-			client->set_proxy(http_params.http_proxy, NumericCast<int>(http_params.http_proxy_port));
-
-			if (!http_params.http_proxy_username.empty()) {
-				client->set_proxy_basic_auth(http_params.http_proxy_username, http_params.http_proxy_password);
-			} else {
-				client->set_proxy_basic_auth("", "");
-			}
-		} else {
-			client->set_proxy("", -1);
-			client->set_proxy_basic_auth("", "");
-		}
-		state = http_params.state;
-	}
-
-	static void AddUserAgentIfAvailable(HTTPFSParams &http_params, HTTPHeaders &header_map) {
-		if (!http_params.user_agent.empty()) {
-			header_map.Insert("User-Agent", http_params.user_agent);
-		}
-	}
-
+private:
 	class GetTransferState {
 	public:
 		GetTransferState(HTTPFSClient &client_p, GetRequestInfo &request_p)
 		    : client(client_p), request(request_p), request_monotonic_start(TimePoint::Tick()) {
 		}
 
+	public:
 		bool HandleResponse(const duckdb_httplib_openssl::Response &response) {
 			auto http_response = client.TransformResponse(response);
 			if (static_cast<int>(http_response->status) >= 400) {
@@ -115,6 +66,7 @@ public:
 			request.time_to_fst_byte_sec = elapsed_nanos > 0 ? static_cast<double>(elapsed_nanos) / 1e9 : 0;
 		}
 
+	private:
 		HTTPFSClient &client;
 		GetRequestInfo &request;
 		const TimePoint request_monotonic_start;
@@ -123,6 +75,59 @@ public:
 		unique_ptr<HTTPResponse> deferred_response;
 		unique_ptr<HTTPResponse> stopped_response;
 	};
+
+public:
+	HTTPFSClient(HTTPFSParams &http_params, const string &proto_host_port) : HTTPClient(proto_host_port) {
+		client = make_uniq<duckdb_httplib_openssl::Client>(proto_host_port);
+		Initialize(http_params);
+	}
+
+public:
+	void Initialize(HTTPParams &http_p) override {
+		auto &http_params = http_p.Cast<HTTPFSParams>();
+		client->set_follow_location(http_params.follow_location);
+		client->set_keep_alive(http_params.keep_alive);
+		if (!http_params.ca_cert_file.empty()) {
+			client->set_ca_cert_path(http_params.ca_cert_file.c_str());
+		} else {
+			client->set_ca_cert_path("");
+		}
+		const bool verify_ssl =
+		    http_params.override_verify_ssl ? http_params.verify_ssl : http_params.enable_server_cert_verification;
+		client->enable_server_certificate_verification(verify_ssl);
+		client->set_write_timeout(NumericCast<time_t>(http_params.timeout),
+		                          NumericCast<time_t>(http_params.timeout_usec));
+		client->set_read_timeout(NumericCast<time_t>(http_params.timeout),
+		                         NumericCast<time_t>(http_params.timeout_usec));
+		client->set_connection_timeout(NumericCast<time_t>(http_params.timeout),
+		                               NumericCast<time_t>(http_params.timeout_usec));
+		client->set_decompress(false);
+		if (!http_params.bearer_token.empty()) {
+			client->set_bearer_token_auth(http_params.bearer_token.c_str());
+		} else {
+			client->set_bearer_token_auth("");
+		}
+
+		if (!http_params.http_proxy.empty()) {
+			client->set_proxy(http_params.http_proxy, NumericCast<int>(http_params.http_proxy_port));
+
+			if (!http_params.http_proxy_username.empty()) {
+				client->set_proxy_basic_auth(http_params.http_proxy_username, http_params.http_proxy_password);
+			} else {
+				client->set_proxy_basic_auth("", "");
+			}
+		} else {
+			client->set_proxy("", -1);
+			client->set_proxy_basic_auth("", "");
+		}
+		state = http_params.state;
+	}
+
+	static void AddUserAgentIfAvailable(HTTPFSParams &http_params, HTTPHeaders &header_map) {
+		if (!http_params.user_agent.empty()) {
+			header_map.Insert("User-Agent", http_params.user_agent);
+		}
+	}
 
 	unique_ptr<HTTPResponse> Get(GetRequestInfo &info) override {
 		AddUserAgentIfAvailable(info.params.Cast<HTTPFSParams>(), info.headers);

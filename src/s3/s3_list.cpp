@@ -11,10 +11,13 @@
 
 namespace duckdb {
 
-static bool Match(vector<string>::const_iterator key, vector<string>::const_iterator key_end,
-                  vector<string>::const_iterator pattern, vector<string>::const_iterator pattern_end, bool completed) {
+enum class S3GlobMatchMode : uint8_t { PREFIX, COMPLETE };
 
-	if (key == key_end && !completed) {
+static bool Match(vector<string>::const_iterator key, vector<string>::const_iterator key_end,
+                  vector<string>::const_iterator pattern, vector<string>::const_iterator pattern_end,
+                  S3GlobMatchMode mode) {
+
+	if (key == key_end && mode == S3GlobMatchMode::PREFIX) {
 		return true;
 	}
 
@@ -25,12 +28,12 @@ static bool Match(vector<string>::const_iterator key, vector<string>::const_iter
 			}
 			pattern++;
 			while (key != key_end) {
-				if (Match(key, key_end, pattern, pattern_end, completed)) {
+				if (Match(key, key_end, pattern, pattern_end, mode)) {
 					return true;
 				}
 				key++;
 			}
-			if (!completed) {
+			if (mode == S3GlobMatchMode::PREFIX) {
 				return true;
 			}
 			return false;
@@ -41,7 +44,7 @@ static bool Match(vector<string>::const_iterator key, vector<string>::const_iter
 		key++;
 		pattern++;
 	}
-	if (pattern != pattern_end && !completed) {
+	if (pattern != pattern_end && mode == S3GlobMatchMode::PREFIX) {
 		return true;
 	}
 	return key == key_end && pattern == pattern_end;
@@ -65,6 +68,7 @@ private:
 	void SelectNextCommonPrefix() const;
 	void AppendMatchingFiles(vector<OpenFileInfo> &s3_keys) const;
 
+private:
 	S3FileSystem &fs;
 	string glob_pattern;
 	optional_ptr<FileOpener> opener;
@@ -137,10 +141,11 @@ void S3GlobResult::ScanCurrentCommonPrefix(vector<OpenFileInfo> &s3_keys) const 
 	current_common_prefix = S3Url::Decode(current_common_prefix);
 	auto key_splits = StringUtil::Split(current_common_prefix, "/");
 	auto pattern_splits = StringUtil::Split(parsed_s3_url.key, "/");
-	if (Match(key_splits.begin(), key_splits.end(), pattern_splits.begin(), pattern_splits.end(), false)) {
+	if (Match(key_splits.begin(), key_splits.end(), pattern_splits.begin(), pattern_splits.end(),
+	          S3GlobMatchMode::PREFIX)) {
 		prefix_path = S3Url::Decode(prefix_path);
 		auto response = AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, prefix_path,
-		                                         common_prefix_continuation_token, true);
+		                                         common_prefix_continuation_token, S3ListMode::HIERARCHICAL);
 		AWSListObjectV2::AppendFileList(response, s3_keys);
 		common_prefixes.insert(common_prefixes.end(), response.common_prefixes.begin(), response.common_prefixes.end());
 		common_prefix_continuation_token = response.continuation_token;
@@ -154,9 +159,9 @@ void S3GlobResult::ScanTopLevel(vector<OpenFileInfo> &s3_keys) const {
 	if (!common_prefixes.empty()) {
 		throw InternalException("We have common prefixes but we are doing a top-level request");
 	}
-	const bool hierarchical = glob_type == GlobType::HIERARCHICAL;
+	const auto list_mode = glob_type == GlobType::HIERARCHICAL ? S3ListMode::HIERARCHICAL : S3ListMode::FLAT;
 	auto response = AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, shared_path,
-	                                         main_continuation_token, hierarchical);
+	                                         main_continuation_token, list_mode);
 	auto continuation_token = response.continuation_token;
 	if (ShouldInvestigateRecursiveGlob() && !continuation_token.empty()) {
 		SelectGlobType(response, continuation_token);
@@ -185,8 +190,8 @@ void S3GlobResult::SelectGlobType(S3ListObjectsV2Result &response, string &conti
 		glob_type = GlobType::LISTING;
 		return;
 	}
-	response =
-	    AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, shared_path, main_continuation_token, true);
+	response = AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, shared_path, main_continuation_token,
+	                                    S3ListMode::HIERARCHICAL);
 	continuation_token = response.continuation_token;
 	glob_type = GlobType::HIERARCHICAL;
 }
@@ -218,7 +223,8 @@ void S3GlobResult::AppendMatchingFiles(vector<OpenFileInfo> &s3_keys) const {
 	auto pattern_splits = StringUtil::Split(parsed_s3_url.key, "/");
 	for (auto &s3_key : s3_keys) {
 		auto key_splits = StringUtil::Split(s3_key.path, "/");
-		if (Match(key_splits.begin(), key_splits.end(), pattern_splits.begin(), pattern_splits.end(), true)) {
+		if (Match(key_splits.begin(), key_splits.end(), pattern_splits.begin(), pattern_splits.end(),
+		          S3GlobMatchMode::COMPLETE)) {
 			auto result_full_url = parsed_s3_url.prefix + parsed_s3_url.bucket + "/" + s3_key.path;
 			if (!parsed_s3_url.query_param.empty()) {
 				result_full_url += '?' + parsed_s3_url.query_param;
@@ -282,13 +288,13 @@ struct S3ListRequest {
 		return result;
 	}
 
-	static S3RequestQuery BuildQuery(const ParsedS3Url &parsed_url, const string &continuation_token,
-	                                 bool use_delimiter, optional_idx max_keys) {
+	static S3RequestQuery BuildQuery(const ParsedS3Url &parsed_url, const string &continuation_token, S3ListMode mode,
+	                                 optional_idx max_keys) {
 		vector<pair<string, string>> request_params;
 		if (!continuation_token.empty()) {
 			request_params.emplace_back("continuation-token", continuation_token);
 		}
-		if (use_delimiter) {
+		if (mode == S3ListMode::HIERARCHICAL) {
 			request_params.emplace_back("delimiter", "/");
 		}
 		request_params.emplace_back("encoding-type", "url");
@@ -302,13 +308,13 @@ struct S3ListRequest {
 };
 
 S3ListObjectsV2Result AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSession &session,
-                                               const string &path, const string &continuation_token, bool use_delimiter,
+                                               const string &path, const string &continuation_token, S3ListMode mode,
                                                optional_idx max_keys) {
 	S3RequestContext request_context;
 	auto response = S3RequestExecutor::RunSession(
 	    encryption_util, session, path, RequestType::GET_REQUEST, S3RequestTarget::BUCKET,
 	    [&](const ParsedS3Url &parsed_url) {
-		    return S3ListRequest::BuildQuery(parsed_url, continuation_token, use_delimiter, max_keys);
+		    return S3ListRequest::BuildQuery(parsed_url, continuation_token, mode, max_keys);
 	    },
 	    "", "", "",
 	    [&](S3RequestData &request_data) {

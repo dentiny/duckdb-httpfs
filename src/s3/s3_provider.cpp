@@ -34,7 +34,7 @@ optional<S3ProviderMatch> S3Provider::TryMatchUrl(const string &url) {
 			return provider_match;
 		}
 	}
-	return optional<S3ProviderMatch>();
+	return {};
 }
 
 S3ProviderMatch S3Provider::MatchUrl(const string &url) {

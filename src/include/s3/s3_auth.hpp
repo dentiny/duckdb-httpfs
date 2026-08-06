@@ -14,6 +14,7 @@ public:
 	                 idx_t secret_types_len);
 	explicit S3KeyValueReader(const KeyValueSecretReader &reader);
 
+public:
 	template <class TYPE>
 	SettingLookupResult TryGetSecretKeyOrSetting(const string &secret_key, const string &setting_name, TYPE &result) {
 		Value temp_result;
@@ -54,6 +55,13 @@ private:
 };
 
 struct S3AuthParams {
+public:
+	static S3AuthParams ReadFrom(optional_ptr<FileOpener> opener, FileOpenerInfo &info);
+	static S3AuthParams ReadFrom(S3KeyValueReader &secret_reader, const string &file_path);
+	void SetRegion(string region_p);
+	bool operator==(const S3AuthParams &other) const;
+
+public:
 	S3ProviderType provider_type = S3ProviderType::S3;
 	string region;
 	string access_key_id;
@@ -66,14 +74,18 @@ struct S3AuthParams {
 	bool s3_url_compatibility_mode = false;
 	bool requester_pays = false;
 	string oauth2_bearer_token;
-
-	static S3AuthParams ReadFrom(optional_ptr<FileOpener> opener, FileOpenerInfo &info);
-	static S3AuthParams ReadFrom(S3KeyValueReader &secret_reader, const string &file_path);
-	void SetRegion(string region_p);
-	bool operator==(const S3AuthParams &other) const;
 };
 
 struct AWSEnvironmentCredentialsProvider {
+public:
+	explicit AWSEnvironmentCredentialsProvider(DBConfig &config) : config(config) {
+	}
+
+public:
+	void SetExtensionOptionValue(const string &key, const char *env_var);
+	void SetAll();
+
+public:
 	static constexpr const char *REGION_ENV_VAR = "AWS_REGION";
 	static constexpr const char *DEFAULT_REGION_ENV_VAR = "AWS_DEFAULT_REGION";
 	static constexpr const char *ACCESS_KEY_ENV_VAR = "AWS_ACCESS_KEY_ID";
@@ -84,13 +96,7 @@ struct AWSEnvironmentCredentialsProvider {
 	static constexpr const char *DUCKDB_KMS_KEY_ID_ENV_VAR = "DUCKDB_S3_KMS_KEY_ID";
 	static constexpr const char *DUCKDB_REQUESTER_PAYS_ENV_VAR = "DUCKDB_S3_REQUESTER_PAYS";
 
-	explicit AWSEnvironmentCredentialsProvider(DBConfig &config) : config(config) {
-	}
-
 	DBConfig &config;
-
-	void SetExtensionOptionValue(const string &key, const char *env_var);
-	void SetAll();
 };
 
 } // namespace duckdb

@@ -15,9 +15,15 @@ class ClientContext;
 class S3FileHandle;
 
 struct S3RefreshableHTTPParams {
+public:
 	S3RefreshableHTTPParams() = default;
 	explicit S3RefreshableHTTPParams(const HTTPFSParams &params);
 
+public:
+	void Apply(HTTPFSParams &target) const;
+	bool operator==(const S3RefreshableHTTPParams &other) const;
+
+public:
 	string http_proxy;
 	idx_t http_proxy_port = 0;
 	string http_proxy_username;
@@ -26,9 +32,6 @@ struct S3RefreshableHTTPParams {
 	bool override_verify_ssl = false;
 	bool verify_ssl = true;
 	string bearer_token;
-
-	void Apply(HTTPFSParams &target) const;
-	bool operator==(const S3RefreshableHTTPParams &other) const;
 };
 
 enum class S3RequestTarget : uint8_t { OBJECT, BUCKET };
@@ -38,6 +41,7 @@ struct S3RequestQuery {
 	S3RequestQuery(std::initializer_list<pair<string, string>> parameters);
 	explicit S3RequestQuery(vector<pair<string, string>> parameters);
 
+public:
 	const string &WireQuery() const;
 	const string &CanonicalQuery() const;
 	bool HasParameter(const string &name) const;
@@ -49,12 +53,13 @@ private:
 };
 
 struct S3RequestSnapshot : public HTTPRequestSnapshot {
-	static constexpr HTTPRequestSnapshotType TYPE = HTTPRequestSnapshotType::S3;
-
+public:
 	S3RequestSnapshot(const HTTPFSParams &http_params, const S3AuthParams &auth_params_p, string refresh_path_p,
 	                  weak_ptr<ClientContext> client_context_p = {}, bool credential_refresh_enabled_p = true,
 	                  bool region_redirected_p = false, idx_t credential_generation_p = 0);
 
+public:
+	static constexpr HTTPRequestSnapshotType TYPE = HTTPRequestSnapshotType::S3;
 	S3AuthParams auth_params;
 	string refresh_path;
 	weak_ptr<ClientContext> client_context;
@@ -129,9 +134,8 @@ private:
 	using SetRegionCallback = std::function<void(const S3RequestData &, const string &)>;
 
 	static unique_ptr<HTTPResponse> Run(const string &s3_url, const CreateDataCallback &create_data,
-	                                    bool transient_retry_eligible, const RequestCallback &request,
-	                                    const RefreshCallback &refresh_auth_params, const SetRegionCallback &set_region,
-	                                    const FinalRequestCallback &final_request);
+	                                    const RequestCallback &request, const RefreshCallback &refresh_auth_params,
+	                                    const SetRegionCallback &set_region, const FinalRequestCallback &final_request);
 	static bool TryRefreshSession(HTTPRequestSession &session, const S3RequestData &request_data);
 	static S3RequestData CreateRequestData(EncryptionUtil &encryption_util, const CapturedHTTPRequestSnapshot &captured,
 	                                       const string &s3_url, RequestType request_type, S3RequestTarget target,

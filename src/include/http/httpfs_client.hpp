@@ -10,18 +10,20 @@ namespace duckdb {
 
 class HTTPFSInfoLogType : public LogType {
 public:
-	static constexpr const char *NAME = "HTTPFSInfo";
-	static constexpr LogLevel LEVEL = LogLevel::LOG_INFO;
-
 	HTTPFSInfoLogType() : LogType(NAME, LogLevel::LOG_INFO) {
 	}
 
+public:
 	static string ConstructLogMessage(const string &type, const string &host, const string &payload = "") {
 		if (payload.empty()) {
 			return "{\"type\":\"" + type + "\",\"host\":\"" + host + "\"}";
 		}
 		return "{\"type\":\"" + type + "\",\"host\":\"" + host + "\",\"payload\":\"" + payload + "\"}";
 	}
+
+public:
+	static constexpr const char *NAME = "HTTPFSInfo";
+	static constexpr LogLevel LEVEL = LogLevel::LOG_INFO;
 };
 class HTTPLogger;
 class FileOpener;
@@ -33,17 +35,21 @@ class HTTPException;
 enum class HTTPClientReuseMode : uint8_t { SESSION_LOCAL, SHARED, NONE };
 
 struct HTTPFSParams : public HTTPParams {
+public:
 	explicit HTTPFSParams(HTTPUtil &http_util) : HTTPParams(http_util) {
 		http_proxy_port = 0;
 	}
 
+public:
 	unique_ptr<HTTPParams> Clone() const;
 
+public:
 	static constexpr bool DEFAULT_ENABLE_SERVER_CERT_VERIFICATION = false;
 	static constexpr uint64_t DEFAULT_HF_MAX_PER_PAGE = 0;
 	static constexpr bool DEFAULT_FORCE_DOWNLOAD = false;
 	static constexpr bool AUTO_FALLBACK_TO_FULL_DOWNLOAD = true;
 
+	//! Runtime parameters; append new fields and propagate them to duckdb-wasm
 	bool force_download = DEFAULT_FORCE_DOWNLOAD;
 	bool auto_fallback_to_full_download = AUTO_FALLBACK_TO_FULL_DOWNLOAD;
 	bool enable_server_cert_verification = DEFAULT_ENABLE_SERVER_CERT_VERIFICATION;
@@ -59,17 +65,10 @@ struct HTTPFSParams : public HTTPParams {
 	idx_t force_download_threshold = 0;
 	HTTPClientReuseMode client_reuse_mode = HTTPClientReuseMode::SESSION_LOCAL;
 	optional_ptr<HTTPFSUtil> httpfs_util;
-
-	// Additional fields needs to be appended at the end and need to be propagated to duckdb-wasm
-	// TODO: make this unnecessary
 };
 
 class HTTPClientConnectionCache {
 public:
-	static constexpr idx_t POOL_COUNT = 16;
-	static constexpr idx_t POOL_SIZE = 32;
-	static_assert((POOL_COUNT & (POOL_COUNT - 1)) == 0, "POOL_COUNT must be a power of two");
-
 	unique_ptr<HTTPClient> Find(const string &base_url);
 	void Store(unique_ptr<HTTPClient> &&client);
 	void Clear();
@@ -80,6 +79,12 @@ private:
 		vector<unique_ptr<HTTPClient>> entries DUCKDB_GUARDED_BY(lock) {vector<unique_ptr<HTTPClient>>(POOL_SIZE)};
 	};
 
+public:
+	static constexpr idx_t POOL_COUNT = 16;
+	static constexpr idx_t POOL_SIZE = 32;
+	static_assert((POOL_COUNT & (POOL_COUNT - 1)) == 0, "POOL_COUNT must be a power of two");
+
+private:
 	array<Pool, POOL_COUNT> pools {};
 };
 
@@ -114,9 +119,6 @@ public:
 
 	string GetName() const override;
 
-	//! Whether connection caching is enabled
-	bool connection_caching_enabled = true;
-
 private:
 	//! Send request with connection caching (acquire from pool, run, store back)
 	unique_ptr<HTTPResponse> CachingSendRequest(BaseRequest &request, unique_ptr<HTTPClient> &client);
@@ -124,6 +126,12 @@ private:
 	unique_ptr<HTTPResponse> BaseSendRequest(BaseRequest &request, unique_ptr<HTTPClient> &client);
 
 	bool EnableCaching(BaseRequest &request);
+
+public:
+	//! Whether connection caching is enabled
+	bool connection_caching_enabled = true;
+
+private:
 	HTTPClientConnectionCache connection_cache;
 };
 

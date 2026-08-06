@@ -29,6 +29,7 @@ static Value MapToStruct(const Value &map) {
 }
 
 struct S3SecretBuilder {
+public:
 	explicit S3SecretBuilder(CreateSecretInput &input_p) : input(input_p) {
 		auto scope =
 		    input.scope.empty() ? S3Provider::DefaultSecretScope(static_cast<const string &>(input.type)) : input.scope;
@@ -36,6 +37,7 @@ struct S3SecretBuilder {
 		secret->redact_keys = {"secret", "session_token"};
 	}
 
+public:
 	unique_ptr<BaseSecret> Create() {
 		S3Provider::ApplySecretDefaults(input, *secret);
 		for (const auto &option : input.options) {
@@ -96,6 +98,7 @@ private:
 		secret->secret_map["refresh_info"] = MapToStruct(value);
 	}
 
+private:
 	CreateSecretInput &input;
 	unique_ptr<KeyValueSecret> secret;
 	bool refresh = false;
@@ -292,19 +295,27 @@ unique_ptr<BaseSecret> CreateBearerTokenFunctions::CreateBearerSecretFromConfig(
 	return CreateSecretFunctionInternal(context, input, token);
 }
 
-static string TryReadTokenFile(const string &token_path, const string &error_source_message,
-                               bool fail_on_exception = true) {
+static string ReadTokenFileContents(const string &token_path) {
+	LocalFileSystem fs;
+	auto handle = fs.OpenFile(token_path, {FileOpenFlags::FILE_FLAGS_READ});
+	return handle->ReadLine();
+}
+
+static string ReadTokenFile(const string &token_path, const string &error_source_message) {
 	try {
-		LocalFileSystem fs;
-		auto handle = fs.OpenFile(token_path, {FileOpenFlags::FILE_FLAGS_READ});
-		return handle->ReadLine();
+		return ReadTokenFileContents(token_path);
 	} catch (std::exception &ex) {
-		if (!fail_on_exception) {
-			return "";
-		}
 		ErrorData error(ex);
 		throw IOException("Failed to read token path '%s'%s. (error: %s)", token_path, error_source_message,
 		                  error.RawMessage());
+	}
+}
+
+static string TryReadTokenFile(const string &token_path) {
+	try {
+		return ReadTokenFileContents(token_path);
+	} catch (std::exception &) {
+		return "";
 	}
 }
 
@@ -319,7 +330,7 @@ CreateBearerTokenFunctions::CreateHuggingFaceSecretFromCredentialChain(ClientCon
 	// Step 2: Try the ENV variable HF_TOKEN_PATH
 	const char *hf_token_path_env = std::getenv("HF_TOKEN_PATH");
 	if (hf_token_path_env) {
-		auto token = TryReadTokenFile(hf_token_path_env, " fetched from HF_TOKEN_PATH env variable");
+		auto token = ReadTokenFile(hf_token_path_env, " fetched from HF_TOKEN_PATH env variable");
 		return CreateSecretFunctionInternal(context, input, token);
 	}
 
@@ -327,12 +338,12 @@ CreateBearerTokenFunctions::CreateHuggingFaceSecretFromCredentialChain(ClientCon
 	const char *hf_home_env = std::getenv("HF_HOME");
 	if (hf_home_env) {
 		auto token_path = LocalFileSystem().JoinPath(hf_home_env, "token");
-		auto token = TryReadTokenFile(token_path, " constructed using the HF_HOME variable: '$HF_HOME/token'");
+		auto token = ReadTokenFile(token_path, " constructed using the HF_HOME variable: '$HF_HOME/token'");
 		return CreateSecretFunctionInternal(context, input, token);
 	}
 
 	// Step 4: Check the default path
-	auto token = TryReadTokenFile("~/.cache/huggingface/token", "", false);
+	auto token = TryReadTokenFile("~/.cache/huggingface/token");
 	return CreateSecretFunctionInternal(context, input, token);
 }
 } // namespace duckdb

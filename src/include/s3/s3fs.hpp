@@ -32,6 +32,7 @@ public:
 	             const S3AuthParams &auth_params_p, const S3UploadConfig &upload_config);
 	~S3FileHandle() override;
 
+public:
 	void Close() override;
 	void Initialize(optional_ptr<FileOpener> opener) override;
 	void FinalizeUpload();
@@ -51,30 +52,22 @@ private:
 
 class S3FileSystem : public HTTPFileSystem {
 public:
-	explicit S3FileSystem(BufferManager &buffer_manager) : buffer_manager(buffer_manager) {
-	}
+	explicit S3FileSystem(BufferManager &buffer_manager);
 
-	BufferManager &buffer_manager;
-
+public:
 	//! FileSystem overrides.
 	string GetName() const override;
 	bool CanHandleFile(const string &fpath) override;
-	bool OnDiskFile(FileHandle &handle) override {
-		return false;
-	}
+	bool OnDiskFile(FileHandle &handle) override;
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveFiles(const vector<string> &filenames, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void FileSync(FileHandle &handle) override;
-	FileWriteMode GetWriteMode(FileHandle &) override {
-		return FileWriteMode::CONCURRENT_SEQUENTIAL;
-	}
+	FileWriteMode GetWriteMode(FileHandle &) override;
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 
 	//! S3 is object storage so directories effectively always exist
-	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
-		return true;
-	}
+	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 
 	//! HTTP request overrides.
 	unique_ptr<HTTPResponse> HeadRequest(FileHandle &handle, const string &s3_url, HTTPHeaders header_map) override;
@@ -104,14 +97,10 @@ protected:
 	//! FileSystem extension points for S3 open/list/glob.
 	bool ListFilesExtended(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
 	                       optional_ptr<FileOpener> opener) override;
-	bool SupportsListFilesExtended() const override {
-		return true;
-	}
+	bool SupportsListFilesExtended() const override;
 	unique_ptr<MultiFileList> GlobFilesExtended(const string &path, const FileGlobInput &input,
 	                                            optional_ptr<FileOpener> opener) override;
-	bool SupportsGlobExtended() const override {
-		return true;
-	}
+	bool SupportsGlobExtended() const override;
 	unique_ptr<HTTPFileHandle> CreateHandle(const OpenFileInfo &file, FileOpenFlags flags,
 	                                        optional_ptr<FileOpener> opener) override;
 
@@ -119,5 +108,8 @@ private:
 	unique_ptr<HTTPResponse> RunS3BulkDeleteRequest(HTTPRequestSession &session, const string &secret_lookup_url,
 	                                                const string &body, string &result,
 	                                                optional_ptr<S3RequestContext> request_context = nullptr);
+
+public:
+	BufferManager &buffer_manager;
 };
 } // namespace duckdb

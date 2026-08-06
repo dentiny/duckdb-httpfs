@@ -9,8 +9,17 @@ struct DBConfig;
 class FileOpener;
 
 struct S3UploadConfig {
-	static constexpr uint64_t DEFAULT_MAX_FILESIZE = 80000000000; // 80GB
-	static constexpr uint64_t DEFAULT_MAX_PARTS_PER_FILE = 10000; // AWS DEFAULT
+public:
+	static S3UploadConfig Create(uint64_t max_file_size, uint64_t max_parts);
+	static S3UploadConfig ReadFrom(optional_ptr<FileOpener> opener);
+
+	idx_t PartSize(idx_t reserved_parts) const;
+	bool HasPartCapacity(idx_t reserved_parts) const;
+
+public:
+	//! Default upload limits
+	static constexpr uint64_t DEFAULT_MAX_FILESIZE = 80000000000;
+	static constexpr uint64_t DEFAULT_MAX_PARTS_PER_FILE = 10000;
 	static constexpr idx_t MAX_MULTIPART_PARTS = 10000;
 	static constexpr idx_t MIN_MULTIPART_PART_SIZE = 5ULL * 1024ULL * 1024ULL;
 	static constexpr idx_t MAX_MULTIPART_PART_SIZE = 5ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -20,12 +29,6 @@ struct S3UploadConfig {
 	idx_t max_parts = 0;
 	idx_t initial_part_size = 0;
 	idx_t growth_interval = 0;
-
-	static S3UploadConfig Create(uint64_t max_file_size, uint64_t max_parts);
-	static S3UploadConfig ReadFrom(optional_ptr<FileOpener> opener);
-
-	idx_t PartSize(idx_t reserved_parts) const;
-	bool HasPartCapacity(idx_t reserved_parts) const;
 };
 
 struct S3Settings {

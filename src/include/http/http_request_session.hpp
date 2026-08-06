@@ -15,14 +15,11 @@ class Logger;
 enum class HTTPRequestSnapshotType : uint8_t { HTTP, S3 };
 
 struct HTTPRequestSnapshot {
-	static constexpr HTTPRequestSnapshotType TYPE = HTTPRequestSnapshotType::HTTP;
-
 	explicit HTTPRequestSnapshot(const HTTPFSParams &params,
 	                             HTTPRequestSnapshotType type_p = HTTPRequestSnapshotType::HTTP);
 	virtual ~HTTPRequestSnapshot();
 
-	const HTTPRequestSnapshotType type;
-
+public:
 	bool CanReuseClientsWith(const HTTPRequestSnapshot &other) const;
 	unique_ptr<HTTPFSParams> CreateRequestParams() const;
 	void AddConfiguredHeaders(HTTPHeaders &headers) const;
@@ -46,6 +43,10 @@ struct HTTPRequestSnapshot {
 		return reinterpret_cast<const TARGET &>(*this);
 	}
 
+public:
+	static constexpr HTTPRequestSnapshotType TYPE = HTTPRequestSnapshotType::HTTP;
+	const HTTPRequestSnapshotType type;
+
 private:
 	const HTTPFSParams params;
 };
@@ -63,6 +64,10 @@ struct HTTPRequestSnapshotPublication {
 class HTTPClientLease {
 	friend class HTTPRequestSession;
 
+private:
+	HTTPClientLease(shared_ptr<HTTPRequestSession> session_p, reference<HTTPUtil> http_util_p,
+	                HTTPClientReuseMode reuse_mode_p, idx_t generation_p, unique_ptr<HTTPClient> client_p);
+
 public:
 	HTTPClientLease(HTTPClientLease &&other) noexcept;
 	HTTPClientLease &operator=(HTTPClientLease &&other) noexcept;
@@ -70,6 +75,7 @@ public:
 	HTTPClientLease &operator=(const HTTPClientLease &) = delete;
 	~HTTPClientLease() noexcept;
 
+public:
 	unique_ptr<HTTPClient> &Client() {
 		return client;
 	}
@@ -78,10 +84,9 @@ public:
 	}
 
 private:
-	HTTPClientLease(shared_ptr<HTTPRequestSession> session_p, reference<HTTPUtil> http_util_p,
-	                HTTPClientReuseMode reuse_mode_p, idx_t generation_p, unique_ptr<HTTPClient> client_p);
 	void Release() noexcept;
 
+private:
 	shared_ptr<HTTPRequestSession> session;
 	reference<HTTPUtil> http_util;
 	HTTPClientReuseMode reuse_mode;
@@ -97,6 +102,7 @@ public:
 	explicit HTTPRequestSession(shared_ptr<const HTTPRequestSnapshot> snapshot_p);
 	~HTTPRequestSession();
 
+public:
 	CapturedHTTPRequestSnapshot Capture() const DUCKDB_EXCLUDES(lock);
 	HTTPRequestSnapshotPublication TryPublish(const shared_ptr<const HTTPRequestSnapshot> &expected,
 	                                          shared_ptr<const HTTPRequestSnapshot> replacement) DUCKDB_EXCLUDES(lock);
@@ -110,14 +116,17 @@ private:
 		    : client(std::move(client_p)), http_util(http_util_p) {
 		}
 
+	public:
 		unique_ptr<HTTPClient> client;
 		reference<HTTPUtil> http_util;
 	};
 
+private:
 	void ReturnClient(unique_ptr<HTTPClient> client, reference<HTTPUtil> http_util, HTTPClientReuseMode reuse_mode,
 	                  idx_t generation, bool reusable) noexcept DUCKDB_EXCLUDES(lock);
 	static void CloseClients(vector<IdleClient> clients) noexcept;
 
+private:
 	mutable annotated_mutex lock;
 	shared_ptr<const HTTPRequestSnapshot> current_snapshot DUCKDB_GUARDED_BY(lock);
 	idx_t client_generation DUCKDB_GUARDED_BY(lock) = 0;
