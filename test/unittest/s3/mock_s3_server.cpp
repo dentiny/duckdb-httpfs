@@ -359,8 +359,11 @@ struct MockS3Server::Impl {
 	}
 
 	bool ShouldRejectStaleCredentials(const httplib::Request &request) const {
-		return ExtractCredentialKey(GetHeader(request, "Authorization")) == config.auth.stale_key_id &&
-		       MatchesRefreshTarget(request);
+		auto authorization = GetHeader(request, "Authorization");
+		if (!config.auth.stale_authorization.empty()) {
+			return authorization == config.auth.stale_authorization && MatchesRefreshTarget(request);
+		}
+		return ExtractCredentialKey(authorization) == config.auth.stale_key_id && MatchesRefreshTarget(request);
 	}
 
 	bool ShouldRedirectRegion(const httplib::Request &request) const {
@@ -376,8 +379,9 @@ struct MockS3Server::Impl {
 		observation.range = GetHeader(request, "Range");
 		observation.if_match = GetHeader(request, "If-Match");
 		observation.version_id = GetParameter(request, "versionId");
-		observation.key_id = ExtractCredentialKey(GetHeader(request, "Authorization"));
-		observation.region = ExtractCredentialRegion(GetHeader(request, "Authorization"));
+		observation.authorization = GetHeader(request, "Authorization");
+		observation.key_id = ExtractCredentialKey(observation.authorization);
+		observation.region = ExtractCredentialRegion(observation.authorization);
 		observation.user_agent = GetHeader(request, "User-Agent");
 		observation.session_header = GetHeader(request, "X-HTTPFS-Session");
 		observation.upload_id = GetParameter(request, "uploadId");

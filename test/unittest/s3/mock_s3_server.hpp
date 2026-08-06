@@ -45,6 +45,7 @@ struct MockS3ObjectConfig {
 
 struct MockS3AuthConfig {
 	string stale_key_id = "STALE_KEY";
+	string stale_authorization;
 	int stale_status = 403;
 	string stale_error_code = "AccessDenied";
 	string required_region;
@@ -143,6 +144,7 @@ struct MockS3RequestObservation {
 	string range;
 	string if_match;
 	string version_id;
+	string authorization;
 	string key_id;
 	string region;
 	string user_agent;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "s3/s3_provider.hpp"
+
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -34,6 +36,7 @@ private:
 };
 
 struct S3AuthParams {
+	S3ProviderType provider_type = S3ProviderType::S3;
 	string region;
 	string access_key_id;
 	string secret_access_key;
@@ -49,9 +52,6 @@ struct S3AuthParams {
 	static S3AuthParams ReadFrom(optional_ptr<FileOpener> opener, FileOpenerInfo &info);
 	static S3AuthParams ReadFrom(S3KeyValueReader &secret_reader, const string &file_path);
 	void SetRegion(string region_p);
-
-private:
-	void InitializeEndpoint();
 };
 
 struct AWSEnvironmentCredentialsProvider {

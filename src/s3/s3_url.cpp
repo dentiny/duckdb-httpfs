@@ -13,10 +13,6 @@ string S3Url::Encode(const string &input, bool encode_slash) {
 	return StringUtil::URLEncode(input, encode_slash);
 }
 
-bool S3Url::IsGCS(const string &url) {
-	return StringUtil::StartsWith(url, "gcs://") || StringUtil::StartsWith(url, "gs://");
-}
-
 static void GetQueryParam(const string &key, string &param, unordered_map<string, string> &query_params) {
 	auto found_param = query_params.find(key);
 	if (found_param != query_params.end()) {
@@ -68,27 +64,20 @@ void S3Url::ReadQueryParams(const string &url_query_param, S3AuthParams &params)
 }
 
 string S3Url::TryGetPrefix(const string &url) {
-	const string prefixes[] = {"s3://", "s3a://", "s3n://", "gcs://", "gs://", "r2://"};
-	for (auto &prefix : prefixes) {
-		if (StringUtil::StartsWith(StringUtil::Lower(url), prefix)) {
-			return prefix;
-		}
-	}
-	return {};
+	auto provider_match = S3Provider::TryMatchUrl(url);
+	return provider_match ? provider_match->prefix : string();
 }
 
 string S3Url::GetPrefix(const string &url) {
-	auto prefix = TryGetPrefix(url);
-	if (prefix.empty()) {
-		throw IOException("URL needs to start with s3://, gcs:// or r2://");
-	}
-	return prefix;
+	return S3Provider::MatchUrl(url).prefix;
 }
 
 ParsedS3Url S3Url::Parse(const string &url, const S3AuthParams &params) {
 	string http_proto, prefix, host, bucket, key, path, query_param, trimmed_s3_url;
 
-	prefix = GetPrefix(url);
+	auto provider_match = S3Provider::MatchUrl(url);
+	D_ASSERT(provider_match.type == params.provider_type);
+	prefix = std::move(provider_match.prefix);
 	auto prefix_end_pos = url.find("//") + 2;
 	auto slash_pos = url.find('/', prefix_end_pos);
 	if (slash_pos == string::npos) {

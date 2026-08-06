@@ -71,6 +71,7 @@ static void AddDeleteBatchUrlKeyParts(S3DeleteBatchKeyBuilder &key_builder, cons
 }
 
 static void AddDeleteBatchAuthKeyParts(S3DeleteBatchKeyBuilder &key_builder, const S3AuthParams &auth_params) {
+	key_builder.AddIndex(static_cast<idx_t>(auth_params.provider_type));
 	key_builder.AddString(auth_params.region);
 	key_builder.AddString(auth_params.access_key_id);
 	key_builder.AddString(auth_params.secret_access_key);
@@ -127,7 +128,7 @@ static void AddDeleteBatchSelectedSecretKeyParts(S3DeleteBatchKeyBuilder &key_bu
 		return;
 	}
 
-	for (const string type : {"s3", "r2", "gcs", "aws"}) {
+	for (const auto type : S3Provider::SecretTypes()) {
 		key_builder.AddString(type);
 		auto match = secret_manager->LookupSecret(*transaction, path, type);
 		if (!match.HasMatch()) {
@@ -151,9 +152,9 @@ static bool HasRefreshableS3Secret(optional_ptr<FileOpener> opener, const string
 	if (!opener) {
 		return false;
 	}
-	const char *secret_types[] = {"s3", "r2", "gcs", "aws"};
+	auto secret_types = S3Provider::SecretTypes();
 	FileOpenerInfo info = {path};
-	KeyValueSecretReader secret_reader(*opener, info, secret_types, 4);
+	KeyValueSecretReader secret_reader(*opener, info, secret_types.data(), secret_types.size());
 	Value refresh_info;
 	return secret_reader.TryGetSecretKey("refresh_info", refresh_info);
 }
@@ -213,13 +214,12 @@ static S3RequestData CreateS3BulkDeleteRequestData(EncryptionUtil &encryption_ut
 	result.captured = captured;
 	result.auth_params = snapshot.auth_params;
 	result.http_params = snapshot.CreateRequestParams();
-	result.source_url = secret_lookup_url;
 
 	auto request_url = S3Url::Parse(secret_lookup_url, result.auth_params);
 	auto request_path = GetS3BucketPath(request_url);
-	result.headers =
-	    S3RequestUtil::CreateHeader(encryption_util, request_path, "delete=", request_url.host, "s3", "POST",
-	                                result.auth_params, "", "", payload_hash, "application/xml", content_md5);
+	request_url.path = request_path;
+	result.headers = S3RequestUtil::CreateHeaders(encryption_util, request_url, "delete=", "POST", result.auth_params,
+	                                              "", "", payload_hash, "application/xml", content_md5);
 	snapshot.AddConfiguredHeaders(result.headers);
 	result.http_url = request_url.http_proto + request_url.host + S3Url::Encode(request_path) + "?delete";
 	return result;

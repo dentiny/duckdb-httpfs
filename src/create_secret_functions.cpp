@@ -1,5 +1,6 @@
 #include "create_secret_functions.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "s3/s3_provider.hpp"
 #include "s3/s3fs.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/local_file_system.hpp"
@@ -7,10 +8,9 @@
 namespace duckdb {
 
 void CreateS3SecretFunctions::Register(ExtensionLoader &loader) {
-	RegisterCreateSecretFunction(loader, "s3");
-	RegisterCreateSecretFunction(loader, "aws");
-	RegisterCreateSecretFunction(loader, "r2");
-	RegisterCreateSecretFunction(loader, "gcs");
+	for (const auto secret_type : S3Provider::SecretTypes()) {
+		RegisterCreateSecretFunction(loader, secret_type);
+	}
 }
 
 static Value MapToStruct(const Value &map) {
@@ -30,13 +30,14 @@ static Value MapToStruct(const Value &map) {
 
 struct S3SecretBuilder {
 	explicit S3SecretBuilder(CreateSecretInput &input_p) : input(input_p) {
-		auto scope = input.scope.empty() ? DefaultScope() : input.scope;
+		auto scope =
+		    input.scope.empty() ? S3Provider::DefaultSecretScope(static_cast<const string &>(input.type)) : input.scope;
 		secret = make_uniq<KeyValueSecret>(std::move(scope), input.type, input.provider, input.name);
 		secret->redact_keys = {"secret", "session_token"};
 	}
 
 	unique_ptr<BaseSecret> Create() {
-		ApplyR2Endpoint();
+		S3Provider::ApplySecretDefaults(input, *secret);
 		for (const auto &option : input.options) {
 			ApplyOption(StringUtil::Lower(option.first), option.second);
 		}
@@ -44,31 +45,6 @@ struct S3SecretBuilder {
 	}
 
 private:
-	vector<string> DefaultScope() const {
-		if (input.type == "s3") {
-			return {"s3://", "s3n://", "s3a://"};
-		}
-		if (input.type == "r2") {
-			return {"r2://"};
-		}
-		if (input.type == "gcs") {
-			return {"gcs://", "gs://"};
-		}
-		if (input.type == "aws") {
-			return {""};
-		}
-		throw InternalException("Unknown secret type found in httpfs extension: '%s'", input.type);
-	}
-
-	void ApplyR2Endpoint() {
-		auto account_id = input.options.find("account_id");
-		if (input.type != "r2" || account_id == input.options.end()) {
-			return;
-		}
-		secret->secret_map["endpoint"] = account_id->second.ToString() + ".r2.cloudflarestorage.com";
-		secret->secret_map["url_style"] = "path";
-	}
-
 	void ApplyOption(const string &name, const Value &value) {
 		if (name == "key_id" || name == "secret" || name == "http_proxy" || name == "http_proxy_password" ||
 		    name == "http_proxy_username" || name == "extra_http_headers") {
@@ -80,15 +56,12 @@ private:
 		} else if (name == "use_ssl" || name == "verify_ssl" || name == "url_compatibility_mode" ||
 		           name == "requester_pays") {
 			SetBooleanOption(name, value);
-		} else if (name == "account_id") {
-			return;
 		} else if (name == "refresh") {
 			SetRefresh(value);
 		} else if (name == "refresh_info") {
 			SetRefreshInfo(value);
-		} else if (name == "bearer_token" && input.type == "gcs") {
-			secret->secret_map["bearer_token"] = value.ToString();
-			secret->redact_keys.insert("bearer_token");
+		} else if (S3Provider::TryApplySecretOption(input, name, value, *secret)) {
+			return;
 		} else {
 			throw InvalidInputException("Unknown named parameter passed to CreateSecretFunctionInternal: " + name);
 		}
@@ -162,8 +135,7 @@ CreateSecretInput CreateS3SecretFunctions::GenerateRefreshSecretInfo(const Secre
 }
 
 static bool SecretCredentialMaterialChanged(const KeyValueSecret &old_secret, const KeyValueSecret &new_secret) {
-	for (auto &key : {"key_id", "secret", "session_token", "region", "endpoint", "kms_key_id", "url_style", "use_ssl",
-	                  "url_compatibility_mode", "requester_pays", "bearer_token", "account_id"}) {
+	for (const auto key : S3Provider::CredentialMaterialKeys()) {
 		Value old_value;
 		Value new_value;
 		auto old_has_value = old_secret.TryGetValue(key, old_value);
@@ -245,13 +217,7 @@ void CreateS3SecretFunctions::SetBaseNamedParams(CreateSecretFunction &function,
 	// Debugging/testing option: it allows specifying how the secret will be refreshed using a manually specfied MAP
 	function.named_parameters["refresh_info"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 
-	if (type == "r2") {
-		function.named_parameters["account_id"] = LogicalType::VARCHAR;
-	}
-
-	if (type == "gcs") {
-		function.named_parameters["bearer_token"] = LogicalType::VARCHAR;
-	}
+	S3Provider::SetSecretNamedParameters(type, function);
 }
 
 void CreateS3SecretFunctions::RegisterCreateSecretFunction(ExtensionLoader &loader, string type) {

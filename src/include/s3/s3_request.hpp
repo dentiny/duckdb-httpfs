@@ -43,24 +43,21 @@ struct S3RequestData {
 	S3AuthParams auth_params;
 	unique_ptr<HTTPParams> http_params;
 	CapturedHTTPRequestSnapshot captured;
-	string source_url;
 	string http_url;
 	HTTPHeaders headers;
 };
 
 struct S3RequestUtil {
-	static HTTPHeaders CreateHeader(EncryptionUtil &encryption_util, string url, string query, string host,
-	                                string service, string method, const S3AuthParams &auth_params,
-	                                string date_now = "", string datetime_now = "", string payload_hash = "",
-	                                string content_type = "", string content_md5 = "");
+	static HTTPHeaders CreateHeaders(EncryptionUtil &encryption_util, const ParsedS3Url &parsed_url, string query,
+	                                 string method, const S3AuthParams &auth_params, string date_now = "",
+	                                 string datetime_now = "", string payload_hash = "", string content_type = "",
+	                                 string content_md5 = "");
 	static string GetPayloadHash(EncryptionUtil &encryption_util, const_data_ptr_t buffer, idx_t buffer_len);
 	static bool IsRequestTimeout(const HTTPResponse &response);
 
 	static optional_idx TryFindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
 	static optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
 	static string GetBadRequestError(const S3AuthParams &auth_params, const string &correct_region = "");
-	static string GetAuthError(const S3AuthParams &auth_params);
-	static string GetGCSAuthError(const S3AuthParams &auth_params);
 	static string ParseError(const string &error);
 	static HTTPException GetError(const S3AuthParams &auth_params, const HTTPResponse &response, const string &url);
 	static HTTPException GetRequestError(const S3RequestData &request_data, const HTTPResponse &response);

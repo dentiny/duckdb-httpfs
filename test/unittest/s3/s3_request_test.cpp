@@ -6,6 +6,7 @@
 #include "http/httpfs.hpp"
 #include "http/httpfs_client.hpp"
 #include "crypto.hpp"
+#include "s3/s3_provider.hpp"
 #include "s3/s3_request.hpp"
 #include "s3/s3fs.hpp"
 
@@ -191,7 +192,141 @@ CREATE SECRET s3_region_redirect (
 	REQUIRE(logs->GetValue(0, 0).GetValue<int64_t>() == 1);
 }
 
+static void ConfigureGCSBearer(Connection &con, MockS3Server &server, const string &client_implementation) {
+	S3TestHelper::RequireQueryOk(con,
+	                             StringUtil::Format("SET httpfs_client_implementation='%s'", client_implementation));
+	S3TestHelper::RequireQueryOk(con, "SET httpfs_connection_caching=false");
+	S3TestHelper::RequireQueryOk(con, StringUtil::Format(R"(
+CREATE SECRET gcs_bearer (
+	TYPE GCS,
+	SCOPE 'gcs://refresh-bucket/',
+	BEARER_TOKEN 'gcs-test-token',
+	ENDPOINT '%s',
+	USE_SSL false,
+	URL_STYLE 'path'
+))",
+	                                                     server.Endpoint()));
+}
+
+static void RunGCSBearerRequestScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.auth.stale_key_id = "NEVER_STALE";
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	S3TestHelper::LoadExtension(db);
+	ConfigureGCSBearer(con, server, client_implementation);
+
+	const string gcs_path = "gcs://refresh-bucket/object.bin";
+	S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	auto handle = fs.OpenFile(gcs_path, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+	REQUIRE(handle);
+
+	auto list_result = con.Query("SELECT file FROM glob('gcs://refresh-bucket/*.bin')");
+	REQUIRE(list_result);
+	INFO((list_result->HasError() ? list_result->GetError() : string()));
+	REQUIRE_FALSE(list_result->HasError());
+	REQUIRE(list_result->RowCount() == 1);
+
+	fs.RemoveFiles({gcs_path});
+	S3TestHelper::RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	bool saw_object = false;
+	bool saw_list = false;
+	bool saw_bulk_delete = false;
+	for (const auto &observation : observations) {
+		if (observation.authorization != "Bearer gcs-test-token") {
+			continue;
+		}
+		saw_object |= observation.method == "HEAD" && observation.target.find("object.bin") != string::npos;
+		saw_list |= observation.method == "GET" && observation.target.find("list-type=2") != string::npos;
+		saw_bulk_delete |= observation.method == "POST" && observation.target.find("delete") != string::npos;
+	}
+	REQUIRE(saw_object);
+	REQUIRE(saw_list);
+	REQUIRE(saw_bulk_delete);
+}
+
+static void RunGCSListAuthErrorScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.auth.stale_authorization = "Bearer gcs-test-token";
+	config.auth.refresh_target = MockS3RefreshTarget::LIST_OBJECTS_GET;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	S3TestHelper::LoadExtension(db);
+	ConfigureGCSBearer(con, server, client_implementation);
+
+	auto result = con.Query("SELECT file FROM glob('gcs://refresh-bucket/*.bin')");
+	REQUIRE(result);
+	REQUIRE(result->HasError());
+	INFO(result->GetError());
+	REQUIRE(result->GetError().find("Authentication Failure - GCS authentication failed") != string::npos);
+}
+
 } // namespace
+
+TEST_CASE("S3 provider policy resolves URL aliases and default scopes", "[httpfs][s3][provider]") {
+	for (const auto &entry : {pair<string, S3ProviderType> {"s3://bucket/key", S3ProviderType::S3},
+	                          pair<string, S3ProviderType> {"S3A://bucket/key", S3ProviderType::S3},
+	                          pair<string, S3ProviderType> {"s3n://bucket/key", S3ProviderType::S3},
+	                          pair<string, S3ProviderType> {"gcs://bucket/key", S3ProviderType::GCS},
+	                          pair<string, S3ProviderType> {"GS://bucket/key", S3ProviderType::GCS},
+	                          pair<string, S3ProviderType> {"r2://bucket/key", S3ProviderType::R2}}) {
+		auto provider_match = S3Provider::MatchUrl(entry.first);
+		REQUIRE(provider_match.type == entry.second);
+	}
+	REQUIRE_FALSE(S3Provider::TryMatchUrl("https://bucket/key"));
+	REQUIRE_FALSE(S3Provider::TryMatchUrl("aws://bucket/key"));
+	REQUIRE(S3Provider::DefaultSecretScope("s3") == vector<string> {"s3://", "s3n://", "s3a://"});
+	REQUIRE(S3Provider::DefaultSecretScope("gcs") == vector<string> {"gcs://", "gs://"});
+	REQUIRE(S3Provider::DefaultSecretScope("r2") == vector<string> {"r2://"});
+	REQUIRE(S3Provider::DefaultSecretScope("aws") == vector<string> {""});
+}
+
+TEST_CASE("S3 provider policy selects request authentication", "[httpfs][s3][provider][signing]") {
+	::AESStateSSLFactory encryption_util;
+	ParsedS3Url parsed_url;
+	parsed_url.path = "/bucket/key";
+	parsed_url.host = "storage.example.com";
+
+	SECTION("anonymous") {
+		S3AuthParams auth_params;
+		auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, "", "GET", auth_params);
+		REQUIRE(headers.GetHeaderValue("Host") == parsed_url.host);
+		REQUIRE_FALSE(headers.HasHeader("Authorization"));
+	}
+
+	for (const auto provider_type : {S3ProviderType::S3, S3ProviderType::R2, S3ProviderType::GCS}) {
+		S3AuthParams auth_params;
+		auth_params.provider_type = provider_type;
+		auth_params.region = "auto";
+		auth_params.access_key_id = "key";
+		auth_params.secret_access_key = "secret";
+		auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, "", "GET", auth_params, "20260806",
+		                                            "20260806T120000Z");
+		REQUIRE(StringUtil::StartsWith(headers.GetHeaderValue("Authorization"), "AWS4-HMAC-SHA256"));
+	}
+
+	SECTION("GCS bearer takes precedence over HMAC") {
+		S3AuthParams auth_params;
+		auth_params.provider_type = S3ProviderType::GCS;
+		auth_params.access_key_id = "key";
+		auth_params.secret_access_key = "secret";
+		auth_params.oauth2_bearer_token = "token";
+		auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, "delete=", "POST", auth_params, "", "",
+		                                            "payload", "application/xml", "content-md5");
+		REQUIRE(headers.GetHeaderValue("Authorization") == "Bearer token");
+		REQUIRE(headers.GetHeaderValue("Content-Type") == "application/xml");
+		REQUIRE(headers.GetHeaderValue("Content-MD5") == "content-md5");
+		REQUIRE_FALSE(headers.HasHeader("x-amz-date"));
+	}
+}
 
 TEST_CASE("S3 request signing remains deterministic", "[httpfs][s3][signing]") {
 	::AESStateSSLFactory encryption_util;
@@ -199,9 +334,12 @@ TEST_CASE("S3 request signing remains deterministic", "[httpfs][s3][signing]") {
 	auth_params.region = "us-east-1";
 	auth_params.access_key_id = "AKIAIOSFODNN7EXAMPLE";
 	auth_params.secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+	ParsedS3Url parsed_url;
+	parsed_url.path = "/test.txt";
+	parsed_url.host = "examplebucket.s3.amazonaws.com";
 
-	auto headers = S3RequestUtil::CreateHeader(encryption_util, "/test.txt", "", "examplebucket.s3.amazonaws.com", "s3",
-	                                           "GET", auth_params, "20130524", "20130524T000000Z");
+	auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, "", "GET", auth_params, "20130524",
+	                                            "20130524T000000Z");
 
 	REQUIRE(headers.GetHeaderValue("Host") == "examplebucket.s3.amazonaws.com");
 	REQUIRE(headers.GetHeaderValue("x-amz-content-sha256") ==
@@ -221,10 +359,12 @@ TEST_CASE("S3 request signing includes optional headers", "[httpfs][s3][signing]
 	auth_params.session_token = "token";
 	auth_params.kms_key_id = "kms-key";
 	auth_params.requester_pays = true;
+	ParsedS3Url parsed_url;
+	parsed_url.path = "/bucket/key";
+	parsed_url.host = "bucket.example.com";
 
-	auto headers =
-	    S3RequestUtil::CreateHeader(encryption_util, "/bucket/key", "", "bucket.example.com", "s3", "PUT", auth_params,
-	                                "20260730", "20260730T120000Z", "", "application/octet-stream", "content-md5");
+	auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, "", "PUT", auth_params, "20260730",
+	                                            "20260730T120000Z", "", "application/octet-stream", "content-md5");
 
 	REQUIRE(headers.GetHeaderValue("x-amz-security-token") == "token");
 	REQUIRE(headers.GetHeaderValue("x-amz-request-payer") == "requester");
@@ -288,6 +428,24 @@ TEST_CASE("S3 request sessions publish region redirects", "[httpfs][request-sess
 	}
 	SECTION("curl LIST") {
 		RunS3RegionRedirectScenario("curl", true);
+	}
+}
+
+TEST_CASE("GCS bearer authentication is shared by object, list and bulk-delete requests", "[httpfs][s3][gcs][bearer]") {
+	SECTION("httplib") {
+		RunGCSBearerRequestScenario("httplib");
+	}
+	SECTION("curl") {
+		RunGCSBearerRequestScenario("curl");
+	}
+}
+
+TEST_CASE("GCS list failures use provider-specific authentication diagnostics", "[httpfs][s3][gcs][errors]") {
+	SECTION("httplib") {
+		RunGCSListAuthErrorScenario("httplib");
+	}
+	SECTION("curl") {
+		RunGCSListAuthErrorScenario("curl");
 	}
 }
 
