@@ -483,8 +483,8 @@ static bool IsS3RequestTimeoutError(const ErrorData &error) {
 	return S3XMLResponseParser::TryParseError(body_entry->second, s3_error) && s3_error.code == "RequestTimeout";
 }
 
-static void SleepForS3RequestTimeoutRetry(const HTTPFSParams &http_params, idx_t transient_retries, double &wait_ms) {
-	if (transient_retries == 0) {
+void S3RequestExecutor::SleepForRetry(const HTTPParams &http_params, idx_t retries, double &wait_ms) {
+	if (retries == 0) {
 		wait_ms = static_cast<double>(http_params.retry_wait_ms);
 		return;
 	}
@@ -527,7 +527,7 @@ unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, const Crea
 			}
 			if (transient_retry_eligible && result && transient_retries < http_params.retries &&
 			    S3RequestUtil::IsRequestTimeout(*result)) {
-				SleepForS3RequestTimeoutRetry(http_params, transient_retries, transient_wait_ms);
+				SleepForRetry(http_params, transient_retries, transient_wait_ms);
 				transient_retries++;
 				continue;
 			}
@@ -548,7 +548,7 @@ unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, const Crea
 				continue;
 			}
 			if (transient_retry_eligible && transient_retries < http_params.retries && IsS3RequestTimeoutError(error)) {
-				SleepForS3RequestTimeoutRetry(http_params, transient_retries, transient_wait_ms);
+				SleepForRetry(http_params, transient_retries, transient_wait_ms);
 				transient_retries++;
 				continue;
 			}

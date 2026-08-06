@@ -114,6 +114,7 @@ struct S3RequestExecutor {
 	static S3RefreshableHTTPParams ReadRefreshableHTTPParams(optional_ptr<FileOpener> opener, const string &path);
 	static shared_ptr<HTTPRequestSession> CreateSession(optional_ptr<FileOpener> opener, const string &path,
 	                                                    const S3AuthParams &auth_params);
+	static void SleepForRetry(const HTTPParams &http_params, idx_t retries, double &wait_ms);
 
 	static unique_ptr<HTTPResponse> SendSessionRequest(HTTPRequestSession &session,
 	                                                   const CapturedHTTPRequestSnapshot &captured,
