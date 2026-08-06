@@ -869,38 +869,6 @@ unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(HTTPRequestSession &session
 	    {}, request_context);
 }
 
-optional_idx S3RequestUtil::TryFindTagContents(const string &response, const string &tag, idx_t cur_pos,
-                                               string &result) {
-	string open_tag = "<" + tag + ">";
-	string close_tag = "</" + tag + ">";
-	auto open_tag_pos = response.find(open_tag, cur_pos);
-	if (open_tag_pos == string::npos) {
-		// tag not found
-		return optional_idx();
-	}
-	auto close_tag_pos = response.find(close_tag, open_tag_pos + open_tag.size());
-	if (close_tag_pos == string::npos) {
-		return optional_idx();
-	}
-	result = response.substr(open_tag_pos + open_tag.size(), close_tag_pos - open_tag_pos - open_tag.size());
-	return close_tag_pos + close_tag.size();
-}
-
-optional_idx S3RequestUtil::FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result) {
-	string open_tag = "<" + tag + ">";
-	auto open_tag_pos = response.find(open_tag, cur_pos);
-	if (open_tag_pos == string::npos) {
-		// tag not found
-		return optional_idx();
-	}
-	auto next_pos = S3RequestUtil::TryFindTagContents(response, tag, cur_pos, result);
-	if (!next_pos.IsValid()) {
-		throw InternalException("Failed to parse S3 result: found open tag for %s but did not find matching close tag",
-		                        tag);
-	}
-	return next_pos;
-}
-
 string S3RequestUtil::ParseError(const string &error) {
 	S3XMLError parsed_error;
 	if (!S3XMLResponseParser::TryParseError(error, parsed_error) || parsed_error.code.empty()) {

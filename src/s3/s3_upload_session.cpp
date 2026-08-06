@@ -10,7 +10,6 @@
 #include "duckdb/common/string_util.hpp"
 
 #include <cstring>
-#include <sstream>
 
 namespace duckdb {
 
@@ -516,14 +515,7 @@ S3UploadSession::MultipartSnapshot S3UploadSession::GetMultipartSnapshot() DUCKD
 void S3UploadSession::CompleteMultipartUpload() {
 	auto snapshot = GetMultipartSnapshot();
 	D_ASSERT(snapshot.upload_id);
-	std::stringstream body;
-	body << "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">";
-	for (idx_t part_index = 0; part_index < snapshot.etags.size(); part_index++) {
-		body << "<Part><ETag>" << snapshot.etags[part_index] << "</ETag><PartNumber>" << part_index + 1
-		     << "</PartNumber></Part>";
-	}
-	body << "</CompleteMultipartUpload>";
-	auto completion_body = body.str();
+	auto completion_body = S3XMLWriter::WriteCompleteMultipartUploadRequest(snapshot.etags);
 
 	string result;
 	S3RequestContext request_context;

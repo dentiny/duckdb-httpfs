@@ -2,6 +2,7 @@
 
 #include "s3/s3fs.hpp"
 
+#include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar/string_common.hpp"
@@ -59,7 +60,7 @@ private:
 	void ScanCurrentCommonPrefix(vector<OpenFileInfo> &s3_keys) const;
 	void ScanTopLevel(vector<OpenFileInfo> &s3_keys) const;
 	bool ShouldInvestigateRecursiveGlob() const;
-	void SelectGlobType(string &response, string &continuation_token) const;
+	void SelectGlobType(S3ListObjectsV2Result &response, string &continuation_token) const;
 	static bool ContainsDenseDirectories(const vector<OpenFileInfo> &s3_keys);
 	void SelectNextCommonPrefix() const;
 	void AppendMatchingFiles(vector<OpenFileInfo> &s3_keys) const;
@@ -140,10 +141,9 @@ void S3GlobResult::ScanCurrentCommonPrefix(vector<OpenFileInfo> &s3_keys) const 
 		prefix_path = S3Url::Decode(prefix_path);
 		auto response = AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, prefix_path,
 		                                         common_prefix_continuation_token, true);
-		AWSListObjectV2::ParseFileList(response, s3_keys);
-		auto more_prefixes = AWSListObjectV2::ParseCommonPrefix(response);
-		common_prefixes.insert(common_prefixes.end(), more_prefixes.begin(), more_prefixes.end());
-		common_prefix_continuation_token = AWSListObjectV2::ParseContinuationToken(response);
+		AWSListObjectV2::AppendFileList(response, s3_keys);
+		common_prefixes.insert(common_prefixes.end(), response.common_prefixes.begin(), response.common_prefixes.end());
+		common_prefix_continuation_token = response.continuation_token;
 	}
 	if (common_prefix_continuation_token.empty()) {
 		SelectNextCommonPrefix();
@@ -157,13 +157,13 @@ void S3GlobResult::ScanTopLevel(vector<OpenFileInfo> &s3_keys) const {
 	const bool hierarchical = glob_type == GlobType::HIERARCHICAL;
 	auto response = AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, shared_path,
 	                                         main_continuation_token, hierarchical);
-	auto continuation_token = AWSListObjectV2::ParseContinuationToken(response);
+	auto continuation_token = response.continuation_token;
 	if (ShouldInvestigateRecursiveGlob() && !continuation_token.empty()) {
 		SelectGlobType(response, continuation_token);
 	}
 	main_continuation_token = continuation_token;
-	AWSListObjectV2::ParseFileList(response, s3_keys);
-	common_prefixes = AWSListObjectV2::ParseCommonPrefix(response);
+	AWSListObjectV2::AppendFileList(response, s3_keys);
+	common_prefixes = response.common_prefixes;
 	SelectNextCommonPrefix();
 }
 
@@ -178,16 +178,16 @@ bool S3GlobResult::ShouldInvestigateRecursiveGlob() const {
 	return value.GetValue<bool>();
 }
 
-void S3GlobResult::SelectGlobType(string &response, string &continuation_token) const {
+void S3GlobResult::SelectGlobType(S3ListObjectsV2Result &response, string &continuation_token) const {
 	vector<OpenFileInfo> s3_keys;
-	AWSListObjectV2::ParseFileList(response, s3_keys);
+	AWSListObjectV2::AppendFileList(response, s3_keys);
 	if (!ContainsDenseDirectories(s3_keys)) {
 		glob_type = GlobType::LISTING;
 		return;
 	}
 	response =
 	    AWSListObjectV2::Request(fs.GetEncryptionUtil(), *request_session, shared_path, main_continuation_token, true);
-	continuation_token = AWSListObjectV2::ParseContinuationToken(response);
+	continuation_token = response.continuation_token;
 	glob_type = GlobType::HIERARCHICAL;
 }
 
@@ -265,7 +265,7 @@ bool S3FileSystem::ListFilesExtended(const string &directory, const std::functio
 }
 
 struct S3ListRequest {
-	static string Finish(const S3RequestContext &request_context, unique_ptr<HTTPResponse> response) {
+	static S3ListObjectsV2Result Finish(const S3RequestContext &request_context, unique_ptr<HTTPResponse> response) {
 		if (response->HasRequestError() || response->status != HTTPStatusCode::OK_200) {
 			auto display_url = request_context.display_url;
 			StringUtil::RTrim(display_url, "/");
@@ -275,7 +275,11 @@ struct S3ListRequest {
 			throw S3RequestUtil::GetError(request_context.auth_params, *response, request_context.request_type,
 			                              "listing", display_url);
 		}
-		return std::move(response->body);
+		S3ListObjectsV2Result result;
+		if (!S3XMLResponseParser::TryParseListObjectsV2(response->body, result)) {
+			throw IOException("Malformed S3 list response for \"%s\"", request_context.display_url);
+		}
+		return result;
 	}
 
 	static S3RequestQuery BuildQuery(const ParsedS3Url &parsed_url, const string &continuation_token,
@@ -297,8 +301,9 @@ struct S3ListRequest {
 	}
 };
 
-string AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSession &session, const string &path,
-                                const string &continuation_token, bool use_delimiter, optional_idx max_keys) {
+S3ListObjectsV2Result AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSession &session,
+                                               const string &path, const string &continuation_token, bool use_delimiter,
+                                               optional_idx max_keys) {
 	S3RequestContext request_context;
 	auto response = S3RequestExecutor::RunSession(
 	    encryption_util, session, path, RequestType::GET_REQUEST, S3RequestTarget::BUCKET,
@@ -323,98 +328,33 @@ string AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSess
 	return S3ListRequest::Finish(request_context, std::move(response));
 }
 
-void AWSListObjectV2::ParseFileList(string &aws_response, vector<OpenFileInfo> &result) {
-	// Example S3 response:
-	//	<Contents>
-	//		<Key>lineitem_sf10_partitioned_shipdate/l_shipdate%3D1997-03-28/data_0.parquet</Key>
-	//		<LastModified>2024-11-09T11:38:08.000Z</LastModified>
-	//		<ETag>&quot;bdf10f525f8355fb80d1ff2d8c62cc8b&quot;</ETag>
-	//		<Size>1127863</Size>
-	//		<StorageClass>STANDARD</StorageClass>
-	//	</Contents>
-	idx_t cur_pos = 0;
-	while (true) {
-		string contents;
-		auto next_pos = S3RequestUtil::FindTagContents(aws_response, "Contents", cur_pos, contents);
-		if (!next_pos.IsValid()) {
-			// exhausted all contents
-			break;
-		}
-		// move to the next position
-		cur_pos = next_pos.GetIndex();
-
-		// parse the contents
-		string key;
-		auto key_pos = S3RequestUtil::FindTagContents(contents, "Key", 0, key);
-		if (!key_pos.IsValid()) {
-			throw InternalException("Key not found in S3 response: %s", contents);
-		}
-		auto parsed_path = S3Url::Decode(key);
-		if (parsed_path.back() == '/') {
-			// not a file but a directory
-			continue;
-		}
-		// construct the file
-		OpenFileInfo result_file(parsed_path);
-
-		auto extra_info = make_shared_ptr<ExtendedOpenFileInfo>();
-		// get file attributes
-		string last_modified, etag, size;
-		auto last_modified_pos = S3RequestUtil::FindTagContents(contents, "LastModified", 0, last_modified);
-		if (last_modified_pos.IsValid()) {
-			extra_info->options["last_modified"] = Value(last_modified).DefaultCastAs(LogicalType::TIMESTAMP);
-		}
-		auto etag_pos = S3RequestUtil::FindTagContents(contents, "ETag", 0, etag);
-		if (etag_pos.IsValid()) {
-			etag = StringUtil::Replace(etag, "&quot;", "\"");
-			etag = StringUtil::Replace(etag, "&#34;", "\"");
-			extra_info->options["etag"] = Value(std::move(etag));
-		}
-		auto size_pos = S3RequestUtil::FindTagContents(contents, "Size", 0, size);
-		if (size_pos.IsValid()) {
-			extra_info->options["file_size"] = Value(size).DefaultCastAs(LogicalType::UBIGINT);
-		}
-		result_file.extended_info = std::move(extra_info);
-		result.push_back(std::move(result_file));
-	}
-}
-
-string AWSListObjectV2::ParseContinuationToken(string &aws_response) {
-
-	auto open_tag_pos = aws_response.find("<NextContinuationToken>");
-	if (open_tag_pos == string::npos) {
-		return "";
-	} else {
-		auto close_tag_pos = aws_response.find("</NextContinuationToken>", open_tag_pos + 23);
-		if (close_tag_pos == string::npos) {
-			throw InternalException("Failed to parse S3 result");
-		}
-		return aws_response.substr(open_tag_pos + 23, close_tag_pos - open_tag_pos - 23);
-	}
-}
-
-vector<string> AWSListObjectV2::ParseCommonPrefix(string &aws_response) {
-	vector<string> s3_prefixes;
-	idx_t cur_pos = 0;
-	while (true) {
-		cur_pos = aws_response.find("<CommonPrefixes>", cur_pos);
-		if (cur_pos == string::npos) {
-			break;
-		}
-		auto next_open_tag_pos = aws_response.find("<Prefix>", cur_pos);
-		if (next_open_tag_pos == string::npos) {
-			throw InternalException("Parsing error while parsing s3 listobject result");
-		} else {
-			auto next_close_tag_pos = aws_response.find("</Prefix>", next_open_tag_pos + 8);
-			if (next_close_tag_pos == string::npos) {
-				throw InternalException("Failed to parse S3 result");
+void AWSListObjectV2::AppendFileList(const S3ListObjectsV2Result &response, vector<OpenFileInfo> &result) {
+	for (const auto &object : response.objects) {
+		try {
+			auto parsed_path = S3Url::Decode(object.key);
+			if (parsed_path.back() == '/') {
+				continue;
 			}
-			auto parsed_path = aws_response.substr(next_open_tag_pos + 8, next_close_tag_pos - next_open_tag_pos - 8);
-			s3_prefixes.push_back(parsed_path);
-			cur_pos = next_close_tag_pos + 6;
+			OpenFileInfo result_file(parsed_path);
+			auto extra_info = make_shared_ptr<ExtendedOpenFileInfo>();
+			if (!object.last_modified.empty()) {
+				extra_info->options["last_modified"] =
+				    Value(object.last_modified).DefaultCastAs(LogicalType::TIMESTAMP);
+			}
+			if (!object.etag.empty()) {
+				extra_info->options["etag"] = Value(object.etag);
+			}
+			if (!object.size.empty()) {
+				extra_info->options["file_size"] = Value(object.size).DefaultCastAs(LogicalType::UBIGINT);
+			}
+			result_file.extended_info = std::move(extra_info);
+			result.push_back(std::move(result_file));
+		} catch (const InvalidInputException &exception) {
+			throw IOException("Malformed S3 list response for key \"%s\": %s", object.key, exception.what());
+		} catch (const ConversionException &exception) {
+			throw IOException("Malformed S3 list response for key \"%s\": %s", object.key, exception.what());
 		}
 	}
-	return s3_prefixes;
 }
 
 } // namespace duckdb

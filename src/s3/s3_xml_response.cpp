@@ -26,19 +26,19 @@ struct S3XMLNamespaceBinding {
 	string uri;
 };
 
+struct S3XMLNode {
+	string local_name;
+	string namespace_uri;
+	string text;
+	vector<S3XMLNode> children;
+};
+
 struct S3XMLElementFrame {
 	S3XMLQualifiedName name;
 	string namespace_uri;
 	string text;
 	idx_t namespace_count;
-	bool has_child_elements = false;
-};
-
-struct S3XMLChild {
-	string local_name;
-	string namespace_uri;
-	string text;
-	bool has_child_elements;
+	vector<S3XMLNode> children;
 };
 
 struct S3XMLReader {
@@ -48,6 +48,31 @@ struct S3XMLReader {
 
 	bool Parse(S3XMLResponse &response) {
 		response = S3XMLResponse();
+		if (!ParseDocument()) {
+			return false;
+		}
+		InterpretResponse(response);
+		return true;
+	}
+
+	bool Parse(S3ListObjectsV2Result &result) {
+		result = S3ListObjectsV2Result();
+		if (!ParseDocument()) {
+			return false;
+		}
+		return InterpretListObjectsV2(result);
+	}
+
+	bool Parse(S3DeleteObjectsResult &result) {
+		result = S3DeleteObjectsResult();
+		if (!ParseDocument()) {
+			return false;
+		}
+		return InterpretDeleteObjects(result);
+	}
+
+private:
+	bool ParseDocument() {
 		if (!ValidateCharacters()) {
 			return false;
 		}
@@ -96,15 +121,16 @@ struct S3XMLReader {
 		if (!root_seen || !root_closed || !elements.empty()) {
 			return false;
 		}
-		InterpretResponse(response);
 		return true;
 	}
 
-private:
 	static constexpr const char *UTF8_BOM = "\xEF\xBB\xBF";
 	static constexpr const char *XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace";
 	static constexpr const char *XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/";
 	static constexpr const char *S3_NAMESPACE = "http://s3.amazonaws.com/doc/2006-03-01/";
+	static constexpr const char *GCS_S3_NAMESPACE = "http://doc.s3.amazonaws.com/2006-03-01";
+	static constexpr const char *GCS_STORAGE_NAMESPACE = "http://doc.storage.googleapis.com/2010-03-01";
+	static constexpr idx_t MAX_NESTING_DEPTH = 256;
 
 	bool HasPrefix(const char *prefix) const {
 		return input.compare(position, strlen(prefix), prefix) == 0;
@@ -411,7 +437,7 @@ private:
 	}
 
 	bool ParseStartElement() {
-		if (root_closed || position >= input.size() || input[position] != '<') {
+		if (root_closed || elements.size() >= MAX_NESTING_DEPTH || position >= input.size() || input[position] != '<') {
 			return false;
 		}
 		position++;
@@ -479,12 +505,9 @@ private:
 				return false;
 			}
 			root_seen = true;
-			root_local_name = element_name.local_name;
-			root_namespace_uri = namespace_uri;
-		} else {
-			elements.back().has_child_elements = true;
 		}
-		elements.push_back({std::move(element_name), std::move(namespace_uri), string(), namespace_count, false});
+		elements.push_back(
+		    {std::move(element_name), std::move(namespace_uri), string(), namespace_count, vector<S3XMLNode>()});
 		if (self_closing) {
 			return CloseElement();
 		}
@@ -515,14 +538,14 @@ private:
 		auto frame = std::move(elements.back());
 		elements.pop_back();
 		namespaces.resize(frame.namespace_count);
+		S3XMLNode node {std::move(frame.name.local_name), std::move(frame.namespace_uri), std::move(frame.text),
+		                std::move(frame.children)};
 		if (elements.empty()) {
+			root = std::move(node);
 			root_closed = true;
 			return true;
 		}
-		if (elements.size() == 1) {
-			children.push_back({frame.name.local_name, std::move(frame.namespace_uri), std::move(frame.text),
-			                    frame.has_child_elements});
-		}
+		elements.back().children.push_back(std::move(node));
 		return true;
 	}
 
@@ -593,54 +616,130 @@ private:
 		return true;
 	}
 
+	enum class ChildTextResult : uint8_t { MISSING, FOUND, INVALID };
+
 	bool HasSupportedNamespace() const {
-		return root_namespace_uri.empty() || root_namespace_uri == S3_NAMESPACE;
+		const auto &namespace_uri = root.namespace_uri;
+		return namespace_uri.empty() || namespace_uri == S3_NAMESPACE || namespace_uri == GCS_S3_NAMESPACE ||
+		       namespace_uri == string(GCS_S3_NAMESPACE) + "/" || namespace_uri == GCS_STORAGE_NAMESPACE ||
+		       namespace_uri == string(GCS_STORAGE_NAMESPACE) + "/";
 	}
 
-	bool TryGetChildText(const string &local_name, string &result) const {
+	static ChildTextResult GetChildText(const S3XMLNode &parent, const string &namespace_uri, const string &local_name,
+	                                    string &result) {
 		idx_t matches = 0;
-		for (const auto &child : children) {
-			if (child.local_name != local_name || child.namespace_uri != root_namespace_uri) {
+		for (const auto &child : parent.children) {
+			if (child.local_name != local_name || child.namespace_uri != namespace_uri) {
 				continue;
 			}
 			matches++;
-			if (child.has_child_elements) {
-				return false;
+			if (!child.children.empty()) {
+				return ChildTextResult::INVALID;
 			}
 			result = child.text;
 		}
-		return matches == 1;
+		if (matches > 1) {
+			return ChildTextResult::INVALID;
+		}
+		return matches == 1 ? ChildTextResult::FOUND : ChildTextResult::MISSING;
+	}
+
+	static bool GetOptionalChildText(const S3XMLNode &parent, const string &namespace_uri, const string &local_name,
+	                                 string &result) {
+		return GetChildText(parent, namespace_uri, local_name, result) != ChildTextResult::INVALID;
 	}
 
 	void InterpretResponse(S3XMLResponse &response) const {
 		if (!HasSupportedNamespace()) {
 			return;
 		}
-		if (root_local_name == "InitiateMultipartUploadResult") {
-			if (TryGetChildText("UploadId", response.upload_id) && !response.upload_id.empty()) {
+		if (root.local_name == "InitiateMultipartUploadResult") {
+			if (GetChildText(root, root.namespace_uri, "UploadId", response.upload_id) == ChildTextResult::FOUND &&
+			    !response.upload_id.empty()) {
 				response.type = S3XMLResponseType::MULTIPART_INITIALIZATION;
 			}
 			return;
 		}
-		if (root_local_name == "CompleteMultipartUploadResult") {
-			if (TryGetChildText("ETag", response.etag) && !response.etag.empty()) {
+		if (root.local_name == "CompleteMultipartUploadResult") {
+			if (GetChildText(root, root.namespace_uri, "ETag", response.etag) == ChildTextResult::FOUND &&
+			    !response.etag.empty()) {
 				response.type = S3XMLResponseType::MULTIPART_COMPLETION;
 			}
 			return;
 		}
-		if (root_local_name != "Error") {
+		if (root.local_name != "Error") {
 			return;
 		}
 		response.type = S3XMLResponseType::ERROR;
-		if (!TryGetChildText("Code", response.error_code)) {
+		if (GetChildText(root, root.namespace_uri, "Code", response.error_code) != ChildTextResult::FOUND) {
 			response.error_code.clear();
 		}
-		if (!TryGetChildText("Message", response.error_message)) {
+		if (GetChildText(root, root.namespace_uri, "Message", response.error_message) != ChildTextResult::FOUND) {
 			response.error_message.clear();
 		}
-		if (!TryGetChildText("AWSAccessKeyId", response.error_access_key_id)) {
+		if (GetChildText(root, root.namespace_uri, "AWSAccessKeyId", response.error_access_key_id) !=
+		    ChildTextResult::FOUND) {
 			response.error_access_key_id.clear();
 		}
+	}
+
+	bool InterpretListObjectsV2(S3ListObjectsV2Result &result) const {
+		if (!HasSupportedNamespace() || root.local_name != "ListBucketResult") {
+			return false;
+		}
+		if (!GetOptionalChildText(root, root.namespace_uri, "NextContinuationToken", result.continuation_token)) {
+			return false;
+		}
+		for (const auto &child : root.children) {
+			if (child.namespace_uri != root.namespace_uri) {
+				continue;
+			}
+			if (child.local_name == "Contents") {
+				S3ListObjectsV2Object object;
+				if (GetChildText(child, root.namespace_uri, "Key", object.key) != ChildTextResult::FOUND ||
+				    object.key.empty()) {
+					return false;
+				}
+				if (!GetOptionalChildText(child, root.namespace_uri, "LastModified", object.last_modified) ||
+				    !GetOptionalChildText(child, root.namespace_uri, "ETag", object.etag) ||
+				    !GetOptionalChildText(child, root.namespace_uri, "Size", object.size)) {
+					return false;
+				}
+				result.objects.push_back(std::move(object));
+				continue;
+			}
+			if (child.local_name == "CommonPrefixes") {
+				string prefix;
+				auto prefix_result = GetChildText(child, root.namespace_uri, "Prefix", prefix);
+				if (prefix_result == ChildTextResult::INVALID) {
+					return false;
+				}
+				if (prefix_result == ChildTextResult::FOUND && !prefix.empty()) {
+					result.common_prefixes.push_back(std::move(prefix));
+				}
+			}
+		}
+		return true;
+	}
+
+	bool InterpretDeleteObjects(S3DeleteObjectsResult &result) const {
+		if (!HasSupportedNamespace() || root.local_name != "DeleteResult") {
+			return false;
+		}
+		for (const auto &child : root.children) {
+			if (child.namespace_uri != root.namespace_uri || child.local_name != "Error") {
+				continue;
+			}
+			S3DeleteObjectsError error;
+			if (GetChildText(child, root.namespace_uri, "Key", error.key) != ChildTextResult::FOUND ||
+			    error.key.empty() ||
+			    GetChildText(child, root.namespace_uri, "Code", error.code) != ChildTextResult::FOUND ||
+			    error.code.empty() || !GetOptionalChildText(child, root.namespace_uri, "Message", error.message)) {
+				return false;
+			}
+			result.errors.push_back(std::move(error));
+		}
+		return true;
 	}
 
 private:
@@ -648,11 +747,9 @@ private:
 	idx_t position = 0;
 	bool root_seen = false;
 	bool root_closed = false;
-	string root_local_name;
-	string root_namespace_uri;
+	S3XMLNode root;
 	vector<S3XMLNamespaceBinding> namespaces;
 	vector<S3XMLElementFrame> elements;
-	vector<S3XMLChild> children;
 };
 
 } // namespace
@@ -671,6 +768,59 @@ bool S3XMLResponseParser::TryParseError(const string &input, S3XMLError &error) 
 	error.message = std::move(response.error_message);
 	error.access_key_id = std::move(response.error_access_key_id);
 	return true;
+}
+
+bool S3XMLResponseParser::TryParseListObjectsV2(const string &input, S3ListObjectsV2Result &result) {
+	return S3XMLReader(input).Parse(result);
+}
+
+bool S3XMLResponseParser::TryParseDeleteObjects(const string &input, S3DeleteObjectsResult &result) {
+	return S3XMLReader(input).Parse(result);
+}
+
+string S3XMLWriter::EscapeText(const string &text) {
+	string result;
+	result.reserve(text.size());
+	for (const auto value : text) {
+		switch (value) {
+		case '&':
+			result += "&amp;";
+			break;
+		case '<':
+			result += "&lt;";
+			break;
+		case '>':
+			result += "&gt;";
+			break;
+		case '\r':
+			result += "&#13;";
+			break;
+		default:
+			result.push_back(value);
+		}
+	}
+	return result;
+}
+
+string S3XMLWriter::WriteDeleteObjectsRequest(const vector<string> &keys, idx_t begin, idx_t end) {
+	D_ASSERT(begin <= end && end <= keys.size());
+	string result = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+	                "<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">";
+	for (idx_t key_index = begin; key_index < end; key_index++) {
+		result += "<Object><Key>" + EscapeText(keys[key_index]) + "</Key></Object>";
+	}
+	result += "<Quiet>true</Quiet></Delete>";
+	return result;
+}
+
+string S3XMLWriter::WriteCompleteMultipartUploadRequest(const vector<string> &etags) {
+	string result = "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">";
+	for (idx_t part_index = 0; part_index < etags.size(); part_index++) {
+		result += "<Part><ETag>" + EscapeText(etags[part_index]) + "</ETag><PartNumber>" +
+		          std::to_string(part_index + 1) + "</PartNumber></Part>";
+	}
+	result += "</CompleteMultipartUpload>";
+	return result;
 }
 
 } // namespace duckdb

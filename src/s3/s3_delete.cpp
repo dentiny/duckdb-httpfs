@@ -2,6 +2,7 @@
 
 #include "s3/s3_request.hpp"
 #include "s3/s3_url.hpp"
+#include "s3/s3_xml_response.hpp"
 
 #include "duckdb/common/crypto/md5.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -9,7 +10,6 @@
 #include "duckdb/main/secret/secret_manager.hpp"
 
 #include <algorithm>
-#include <sstream>
 
 namespace duckdb {
 
@@ -188,17 +188,6 @@ static string CreateDeleteBatchKey(const S3DeleteBatchUrlInfo &url_info,
 	return key_builder.Build();
 }
 
-static string CreateS3DeleteBody(const vector<string> &keys, idx_t begin, idx_t end) {
-	std::stringstream body;
-	body << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
-	body << "<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">";
-	for (idx_t i = begin; i < end; i++) {
-		body << "<Object><Key>" << keys[i] << "</Key></Object>";
-	}
-	body << "<Quiet>true</Quiet></Delete>";
-	return body.str();
-}
-
 static string GetS3DeleteContentMD5(const string &body) {
 	MD5Context md5_context;
 	md5_context.Add(body);
@@ -274,7 +263,7 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 
 		for (idx_t batch_start = 0; batch_start < keys.size(); batch_start += MAX_KEYS_PER_REQUEST) {
 			idx_t batch_end = MinValue<idx_t>(batch_start + MAX_KEYS_PER_REQUEST, keys.size());
-			auto body = CreateS3DeleteBody(keys, batch_start, batch_end);
+			auto body = S3XMLWriter::WriteDeleteObjectsRequest(keys, batch_start, batch_end);
 			string result;
 			S3RequestContext request_context;
 			auto res = RunS3BulkDeleteRequest(*delete_session, secret_lookup_paths[batch_start], body, result,
@@ -289,11 +278,21 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 				                              "bulk-deleting from", request_context.display_url);
 			}
 
-			idx_t cur_pos = 0;
-			string error_content;
-			auto error_pos = S3RequestUtil::FindTagContents(result, "Error", cur_pos, error_content);
-			if (error_pos.IsValid()) {
-				throw IOException("Failed to remove files: %s", error_content);
+			S3DeleteObjectsResult delete_result;
+			if (!S3XMLResponseParser::TryParseDeleteObjects(result, delete_result)) {
+				throw IOException("Malformed S3 bulk delete response for \"%s\"", request_context.display_url);
+			}
+			if (!delete_result.errors.empty()) {
+				vector<string> errors;
+				for (const auto &error : delete_result.errors) {
+					auto description = StringUtil::Format("\"%s\": %s", error.key, error.code);
+					if (!error.message.empty()) {
+						description += ": " + error.message;
+					}
+					errors.push_back(std::move(description));
+				}
+				throw IOException("S3 bulk delete for \"%s\" failed: %s", request_context.display_url,
+				                  StringUtil::Join(errors, "; "));
 			}
 		}
 	}

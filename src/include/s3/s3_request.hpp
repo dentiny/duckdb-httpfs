@@ -87,8 +87,6 @@ struct S3RequestUtil {
 	static string GetPayloadHash(EncryptionUtil &encryption_util, const_data_ptr_t buffer, idx_t buffer_len);
 	static bool IsRequestTimeout(const HTTPResponse &response);
 
-	static optional_idx TryFindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
-	static optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
 	static string ParseError(const string &error);
 	static HTTPException GetError(const S3AuthParams &auth_params, const HTTPResponse &response,
 	                              RequestType request_type, const string &operation, const string &display_url);
