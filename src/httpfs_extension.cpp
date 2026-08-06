@@ -64,11 +64,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 void HttpfsExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
-std::string HttpfsExtension::Name() {
+string HttpfsExtension::Name() {
 	return "httpfs";
 }
 
-std::string HttpfsExtension::Version() const {
+string HttpfsExtension::Version() const {
 #ifdef EXT_VERSION_HTTPFS
 	return EXT_VERSION_HTTPFS;
 #else

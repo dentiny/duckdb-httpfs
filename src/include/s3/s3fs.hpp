@@ -43,7 +43,7 @@ protected:
 	HTTPMetadataCacheEntry GetCacheEntry() const override;
 
 private:
-	void SetRegion(string region_p);
+	void SetRegion(const string &region);
 
 private:
 	unique_ptr<S3UploadSession> upload_session;
@@ -77,19 +77,21 @@ public:
 	}
 
 	//! HTTP request overrides.
-	unique_ptr<HTTPResponse> HeadRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) override;
+	unique_ptr<HTTPResponse> HeadRequest(FileHandle &handle, const string &s3_url, HTTPHeaders header_map) override;
 	unique_ptr<HTTPResponse> GetRequest(FileHandle &handle, string url, HTTPHeaders header_map,
 	                                    const HTTPReadConfig &read_config, CachedFileDownload &download) override;
 	unique_ptr<HTTPResponse> GetRangeRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map,
 	                                         const HTTPReadConfig &read_config, idx_t file_offset,
 	                                         data_ptr_t buffer_out, idx_t buffer_out_len) override;
-	unique_ptr<HTTPResponse> PostRequest(HTTPRequestSession &session, string s3_url, string &buffer_out,
-	                                     const_data_ptr_t buffer_in, idx_t buffer_in_len, string http_params = "",
+	unique_ptr<HTTPResponse> PostRequest(HTTPRequestSession &session, const string &s3_url, string &buffer_out,
+	                                     const_data_ptr_t buffer_in, idx_t buffer_in_len,
+	                                     const string &http_params = "",
 	                                     S3PostRequestMode mode = S3PostRequestMode::REPLAYABLE);
-	unique_ptr<HTTPResponse> PutRequest(HTTPRequestSession &session, string s3_url, const_data_ptr_t buffer_in,
-	                                    idx_t buffer_in_len, string http_params = "");
-	unique_ptr<HTTPResponse> DeleteRequest(HTTPRequestSession &session, string s3_url, string http_params);
-	unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, string s3_url, HTTPHeaders header_map) override;
+	unique_ptr<HTTPResponse> PutRequest(HTTPRequestSession &session, const string &s3_url, const_data_ptr_t buffer_in,
+	                                    idx_t buffer_in_len, const string &http_params = "");
+	unique_ptr<HTTPResponse> DeleteRequest(HTTPRequestSession &session, const string &s3_url,
+	                                       const string &http_params);
+	unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, const string &s3_url, HTTPHeaders header_map) override;
 	HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) override;
 
 	EncryptionUtil &GetEncryptionUtil();

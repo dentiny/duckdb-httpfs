@@ -248,7 +248,7 @@ unique_ptr<HTTPResponse> S3FileSystem::RunS3BulkDeleteRequest(HTTPRequestSession
 		                          });
 	    },
 	    [&](const S3RequestData &request_data) { return S3RequestExecutor::TryRefreshSession(session, request_data); },
-	    [&](const S3RequestData &request_data, string correct_region) {
+	    [&](const S3RequestData &request_data, const string &correct_region) {
 		    string previous_region;
 		    S3RequestExecutor::SetSessionRegion(session, correct_region, previous_region);
 	    });

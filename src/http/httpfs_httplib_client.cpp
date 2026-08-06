@@ -23,9 +23,12 @@ public:
 		const bool verify_ssl =
 		    http_params.override_verify_ssl ? http_params.verify_ssl : http_params.enable_server_cert_verification;
 		client->enable_server_certificate_verification(verify_ssl);
-		client->set_write_timeout(http_params.timeout, http_params.timeout_usec);
-		client->set_read_timeout(http_params.timeout, http_params.timeout_usec);
-		client->set_connection_timeout(http_params.timeout, http_params.timeout_usec);
+		client->set_write_timeout(NumericCast<time_t>(http_params.timeout),
+		                          NumericCast<time_t>(http_params.timeout_usec));
+		client->set_read_timeout(NumericCast<time_t>(http_params.timeout),
+		                         NumericCast<time_t>(http_params.timeout_usec));
+		client->set_connection_timeout(NumericCast<time_t>(http_params.timeout),
+		                               NumericCast<time_t>(http_params.timeout_usec));
 		client->set_decompress(false);
 		if (!http_params.bearer_token.empty()) {
 			client->set_bearer_token_auth(http_params.bearer_token.c_str());
@@ -34,7 +37,7 @@ public:
 		}
 
 		if (!http_params.http_proxy.empty()) {
-			client->set_proxy(http_params.http_proxy, http_params.http_proxy_port);
+			client->set_proxy(http_params.http_proxy, NumericCast<int>(http_params.http_proxy_port));
 
 			if (!http_params.http_proxy_username.empty()) {
 				client->set_proxy_basic_auth(http_params.http_proxy_username, http_params.http_proxy_password);
@@ -98,7 +101,7 @@ public:
 			if (stopped_response) {
 				return std::move(stopped_response);
 			}
-			return client.TransformResult(std::move(result));
+			return client.TransformResult(result);
 		}
 
 	private:
@@ -218,7 +221,7 @@ public:
 	}
 
 private:
-	duckdb_httplib_openssl::Headers TransformHeaders(const HTTPHeaders &header_map, const HTTPParams &params) {
+	static duckdb_httplib_openssl::Headers TransformHeaders(const HTTPHeaders &header_map, const HTTPParams &params) {
 		auto &httpfs_params = params.Cast<HTTPFSParams>();
 
 		duckdb_httplib_openssl::Headers headers;
@@ -233,7 +236,7 @@ private:
 		return headers;
 	}
 
-	unique_ptr<HTTPResponse> TransformResponse(const duckdb_httplib_openssl::Response &response) {
+	static unique_ptr<HTTPResponse> TransformResponse(const duckdb_httplib_openssl::Response &response) {
 		auto status_code = HTTPUtil::ToStatusCode(response.status);
 		auto result = make_uniq<HTTPResponse>(status_code);
 		result->body = response.body;
@@ -244,7 +247,7 @@ private:
 		return result;
 	}
 
-	unique_ptr<HTTPResponse> TransformResult(duckdb_httplib_openssl::Result &&res) {
+	static unique_ptr<HTTPResponse> TransformResult(const duckdb_httplib_openssl::Result &res) {
 		if (res.error() == duckdb_httplib_openssl::Error::Success) {
 			auto &response = res.value();
 			return TransformResponse(response);
@@ -271,7 +274,7 @@ unordered_map<string, string> HTTPFSUtil::ParseGetParameters(const string &text)
 
 	unordered_map<string, string> result;
 	for (auto &entry : query_params) {
-		result.emplace(std::move(entry.first), std::move(entry.second));
+		result.emplace(entry.first, entry.second);
 	}
 	return result;
 }

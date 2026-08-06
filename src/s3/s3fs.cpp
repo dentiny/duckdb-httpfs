@@ -68,9 +68,9 @@ S3FileHandle::~S3FileHandle() {
 	}
 }
 
-void S3FileHandle::SetRegion(string region_p) {
+void S3FileHandle::SetRegion(const string &region) {
 	string previous_region;
-	S3RequestExecutor::SetSessionRegion(*request_session, region_p, previous_region);
+	S3RequestExecutor::SetSessionRegion(*request_session, region, previous_region);
 }
 
 void S3FileHandle::Close() {
@@ -107,7 +107,7 @@ unique_ptr<HTTPFileHandle> S3FileSystem::CreateHandle(const OpenFileInfo &file, 
 		upload_config = S3UploadConfig::ReadFrom(opener);
 	}
 
-	return duckdb::make_uniq<S3FileHandle>(*this, file, flags, std::move(params), auth_params, upload_config);
+	return make_uniq<S3FileHandle>(*this, file, flags, std::move(params), auth_params, upload_config);
 }
 
 void S3FileHandle::InitializeFromCacheEntry(const HTTPMetadataCacheEntry &cache_entry) {

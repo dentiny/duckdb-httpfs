@@ -245,7 +245,7 @@ void S3UploadSession::FailOperation(ErrorData error, FailureDisposition disposit
 shared_ptr<const ErrorData> S3UploadSession::AbortMultipartUpload(const string &upload_id) {
 	auto query_param = "uploadId=" + S3Url::Encode(upload_id, true);
 	try {
-		auto response = s3fs.get().DeleteRequest(*request_session, path, std::move(query_param));
+		auto response = s3fs.get().DeleteRequest(*request_session, path, query_param);
 		if (response->status == HTTPStatusCode::NoContent_204) {
 			return nullptr;
 		}

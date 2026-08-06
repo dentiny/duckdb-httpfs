@@ -1,10 +1,10 @@
 #pragma once
 
 #include "duckdb/common/http_util.hpp"
+#include "duckdb/common/array.hpp"
 #include "duckdb/common/mutex.hpp"
+#include "duckdb/common/vector.hpp"
 #include "duckdb/logging/log_type.hpp"
-
-#include <array>
 
 namespace duckdb {
 
@@ -32,7 +32,7 @@ class HTTPFSUtil;
 enum class HTTPClientReuseMode : uint8_t { SESSION_LOCAL, SHARED, NONE };
 
 struct HTTPFSParams : public HTTPParams {
-	HTTPFSParams(HTTPUtil &http_util) : HTTPParams(http_util) {
+	explicit HTTPFSParams(HTTPUtil &http_util) : HTTPParams(http_util) {
 		http_proxy_port = 0;
 	}
 
@@ -65,8 +65,8 @@ struct HTTPFSParams : public HTTPParams {
 
 class HTTPClientConnectionCache {
 public:
-	static constexpr size_t POOL_COUNT = 16;
-	static constexpr size_t POOL_SIZE = 32;
+	static constexpr idx_t POOL_COUNT = 16;
+	static constexpr idx_t POOL_SIZE = 32;
 	static_assert((POOL_COUNT & (POOL_COUNT - 1)) == 0, "POOL_COUNT must be a power of two");
 
 	unique_ptr<HTTPClient> Find(const string &base_url);
@@ -76,11 +76,10 @@ public:
 private:
 	struct Pool {
 		annotated_mutex lock {};
-		std::vector<unique_ptr<HTTPClient>> entries DUCKDB_GUARDED_BY(lock) {
-		    std::vector<unique_ptr<HTTPClient>>(POOL_SIZE)};
+		vector<unique_ptr<HTTPClient>> entries DUCKDB_GUARDED_BY(lock) {vector<unique_ptr<HTTPClient>>(POOL_SIZE)};
 	};
 
-	std::array<Pool, POOL_COUNT> pools {};
+	array<Pool, POOL_COUNT> pools {};
 };
 
 class HTTPFSUtil : public HTTPUtil {
@@ -129,7 +128,7 @@ private:
 #endif
 
 struct HeaderCollector {
-	std::vector<HTTPHeaders> header_collection;
+	vector<HTTPHeaders> header_collection;
 };
 
 } // namespace duckdb

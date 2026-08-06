@@ -33,12 +33,12 @@ public:
 		map[path] = std::move(val);
 	};
 
-	void Erase(string path) DUCKDB_EXCLUDES(lock) {
+	void Erase(const string &path) DUCKDB_EXCLUDES(lock) {
 		annotated_lock_guard<annotated_mutex> guard(lock);
 		map.erase(path);
 	};
 
-	bool Find(string path, HTTPMetadataCacheEntry &ret_val) DUCKDB_EXCLUDES(lock) {
+	bool Find(const string &path, HTTPMetadataCacheEntry &ret_val) DUCKDB_EXCLUDES(lock) {
 		annotated_lock_guard<annotated_mutex> guard(lock);
 		auto lookup = map.find(path);
 		if (lookup == map.end()) {

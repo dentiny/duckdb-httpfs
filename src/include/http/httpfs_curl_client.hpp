@@ -35,7 +35,7 @@ public:
 	~CURLHandle();
 
 public:
-	operator CURL *() {
+	operator CURL *() { // NOLINT(google-explicit-constructor)
 		return curl;
 	}
 	CURLcode Execute() {
@@ -48,11 +48,6 @@ private:
 
 class CURLRequestHeaders {
 public:
-	CURLRequestHeaders(vector<std::string> &input) {
-		for (auto &header : input) {
-			Add(header);
-		}
-	}
 	CURLRequestHeaders() {
 	}
 	CURLRequestHeaders(CURLRequestHeaders &&other) noexcept {
@@ -72,7 +67,7 @@ public:
 		}
 		headers = nullptr;
 	}
-	operator bool() const {
+	explicit operator bool() const {
 		return headers != nullptr;
 	}
 

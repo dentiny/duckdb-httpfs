@@ -113,7 +113,7 @@ private:
 	void ThrowIfFailed() DUCKDB_EXCLUDES(state_lock);
 
 	unique_ptr<BufferedPart> AllocateBufferedPart(idx_t capacity);
-	idx_t AppendToBufferedPart(BufferedPart &buffered_part, const_data_ptr_t data, idx_t size);
+	static idx_t AppendToBufferedPart(BufferedPart &buffered_part, const_data_ptr_t data, idx_t size);
 	void ReservePart(PreparedWrite &write, const_data_ptr_t data, idx_t size) DUCKDB_REQUIRES(state_lock);
 	void ReservePart(PreparedWrite &write, unique_ptr<BufferedPart> buffered_part) DUCKDB_REQUIRES(state_lock);
 	shared_ptr<const string> EnsureMultipartUpload();

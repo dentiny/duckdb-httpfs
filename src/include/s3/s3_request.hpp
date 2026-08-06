@@ -58,7 +58,7 @@ struct S3RequestUtil {
 
 	static optional_idx TryFindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
 	static optional_idx FindTagContents(const string &response, const string &tag, idx_t cur_pos, string &result);
-	static string GetBadRequestError(const S3AuthParams &auth_params, string correct_region = "");
+	static string GetBadRequestError(const S3AuthParams &auth_params, const string &correct_region = "");
 	static string GetAuthError(const S3AuthParams &auth_params);
 	static string GetGCSAuthError(const S3AuthParams &auth_params);
 	static string ParseError(const string &error);
@@ -70,18 +70,19 @@ struct S3RequestExecutor {
 	using CreateDataCallback = std::function<S3RequestData()>;
 	using RequestCallback = std::function<unique_ptr<HTTPResponse>(S3RequestData &)>;
 	using RefreshCallback = std::function<bool(const S3RequestData &)>;
-	using SetRegionCallback = std::function<void(const S3RequestData &, string)>;
+	using SetRegionCallback = std::function<void(const S3RequestData &, const string &)>;
 
-	static unique_ptr<HTTPResponse> Run(const string &s3_url, CreateDataCallback create_data,
-	                                    bool transient_retry_eligible, RequestCallback request,
-	                                    RefreshCallback refresh_auth_params, SetRegionCallback set_region);
+	static unique_ptr<HTTPResponse> Run(const string &s3_url, const CreateDataCallback &create_data,
+	                                    bool transient_retry_eligible, const RequestCallback &request,
+	                                    const RefreshCallback &refresh_auth_params,
+	                                    const SetRegionCallback &set_region);
 	static unique_ptr<HTTPResponse> RunSession(EncryptionUtil &encryption_util, HTTPRequestSession &session,
 	                                           const string &s3_url, const string &method, const string &query_string,
 	                                           const string &payload_hash, const string &content_type,
-	                                           const string &content_md5, RequestCallback request);
+	                                           const string &content_md5, const RequestCallback &request);
 	static unique_ptr<HTTPResponse> RunHandle(EncryptionUtil &encryption_util, S3FileHandle &handle,
 	                                          const string &s3_url, const string &method, const string &version_id,
-	                                          RequestCallback request);
+	                                          const RequestCallback &request);
 
 	static bool TryRefreshSession(HTTPRequestSession &session, const S3RequestData &request_data);
 	static bool SetSessionRegion(HTTPRequestSession &session, const string &correct_region, string &previous_region);

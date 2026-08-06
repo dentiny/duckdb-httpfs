@@ -52,40 +52,45 @@ static unique_ptr<HTTPResponse> SendSessionRequest(HTTPRequestSession &session,
 	}
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::RunHeadRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-                                                        HTTPSendCallback send_request) {
+unique_ptr<HTTPResponse> HTTPFileSystem::RunHeadRequest(const string &url, const HTTPHeaders &header_map,
+                                                        HTTPFSParams &http_params,
+                                                        const HTTPSendCallback &send_request) {
 	auto request_headers = RemoveRangeHeader(header_map);
 	http_params.extra_headers.erase("Range");
 	HeadRequestInfo head_request(url, request_headers, http_params);
 	return send_request(head_request);
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::RunDeleteRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-                                                          HTTPSendCallback send_request) {
+unique_ptr<HTTPResponse> HTTPFileSystem::RunDeleteRequest(const string &url, const HTTPHeaders &header_map,
+                                                          HTTPFSParams &http_params,
+                                                          const HTTPSendCallback &send_request) {
 	DeleteRequestInfo delete_request(url, header_map, http_params);
 	return send_request(delete_request);
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::RunPostRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-                                                        string &buffer_out, const_data_ptr_t buffer_in,
-                                                        idx_t buffer_in_len, HTTPSendCallback send_request) {
+unique_ptr<HTTPResponse> HTTPFileSystem::RunPostRequest(const string &url, const HTTPHeaders &header_map,
+                                                        HTTPFSParams &http_params, string &buffer_out,
+                                                        const_data_ptr_t buffer_in, idx_t buffer_in_len,
+                                                        const HTTPSendCallback &send_request) {
 	PostRequestInfo post_request(url, header_map, http_params, buffer_in, buffer_in_len);
 	auto result = send_request(post_request);
 	buffer_out = std::move(post_request.buffer_out);
 	return result;
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::RunPutRequest(string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-                                                       const_data_ptr_t buffer_in, idx_t buffer_in_len,
-                                                       const string &content_type, HTTPSendCallback send_request) {
+unique_ptr<HTTPResponse> HTTPFileSystem::RunPutRequest(const string &url, const HTTPHeaders &header_map,
+                                                       HTTPFSParams &http_params, const_data_ptr_t buffer_in,
+                                                       idx_t buffer_in_len, const string &content_type,
+                                                       const HTTPSendCallback &send_request) {
 	PutRequestInfo put_request(url, header_map, http_params, buffer_in, buffer_in_len, content_type);
 	return send_request(put_request);
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRequest(HTTPFileHandle &hfh, string url, HTTPHeaders header_map,
-                                                       HTTPFSParams &http_params, const HTTPReadConfig &read_config,
-                                                       CachedFileDownload &download, HTTPErrorCallback get_error,
-                                                       HTTPSendCallback send_request) {
+unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRequest(HTTPFileHandle &hfh, const string &url,
+                                                       const HTTPHeaders &header_map, HTTPFSParams &http_params,
+                                                       const HTTPReadConfig &read_config, CachedFileDownload &download,
+                                                       const HTTPErrorCallback &get_error,
+                                                       const HTTPSendCallback &send_request) {
 	auto request_headers = PrepareFullGetHeaders(header_map, read_config);
 	http_params.extra_headers.erase("Range");
 	GetRequestInfo get_request(
@@ -219,8 +224,8 @@ private:
 			return;
 		}
 		throw IOException("Short read for HTTP GET to '%s': requested range %s (%llu bytes), but received %llu bytes",
-		                  url, range_expression, static_cast<unsigned long long>(buffer_out_len),
-		                  static_cast<unsigned long long>(out_offset));
+		                  url, range_expression, static_cast<uint64_t>(buffer_out_len),
+		                  static_cast<uint64_t>(out_offset));
 	}
 
 	static bool IsSuccessfulResponse(const unique_ptr<HTTPResponse> &response) {
@@ -249,13 +254,16 @@ private:
 	bool range_request_not_supported = false;
 };
 
-unique_ptr<HTTPResponse>
-HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh, string url, HTTPHeaders header_map, HTTPFSParams &http_params,
-                                   const HTTPReadConfig &read_config, idx_t file_offset, data_ptr_t buffer_out,
-                                   idx_t buffer_out_len, HTTPErrorCallback get_error, HTTPSendCallback send_request) {
+unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh, const string &url,
+                                                            const HTTPHeaders &header_map, HTTPFSParams &http_params,
+                                                            const HTTPReadConfig &read_config, idx_t file_offset,
+                                                            data_ptr_t buffer_out, idx_t buffer_out_len,
+                                                            const HTTPErrorCallback &get_error,
+                                                            const HTTPSendCallback &send_request) {
 	auto range_expr = "bytes=" + to_string(file_offset) + "-" + to_string(file_offset + buffer_out_len - 1);
-	header_map["Range"] = range_expr;
-	ApplyReadCondition(header_map, read_config);
+	auto request_headers = header_map;
+	request_headers["Range"] = range_expr;
+	ApplyReadCondition(request_headers, read_config);
 
 	D_ASSERT(hfh.file_state);
 	auto range_request = hfh.file_state->BeginRangeRequest(read_config.auto_fallback_to_full_download);
@@ -266,17 +274,18 @@ HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh, string url, HTTPHeaders 
 	}
 
 	HTTPRangeRequestContext context(
-	    hfh, read_config, url, range_expr, buffer_out, buffer_out_len, std::move(range_request), std::move(get_error),
+	    hfh, read_config, url, range_expr, buffer_out, buffer_out_len, std::move(range_request), get_error,
 	    [&](const HTTPResponse &response) { ValidateResponseETag(hfh, read_config, response); });
 	GetRequestInfo get_request(
-	    url, header_map, http_params, [&](const HTTPResponse &response) { return context.HandleResponse(response); },
+	    url, request_headers, http_params,
+	    [&](const HTTPResponse &response) { return context.HandleResponse(response); },
 	    [&](const_data_ptr_t data, idx_t data_length) { return context.HandleContent(data, data_length); });
 
 	get_request.try_request = read_config.auto_fallback_to_full_download;
 	return context.Finalize(send_request(get_request), get_request);
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::HeadRequest(FileHandle &handle, string url, HTTPHeaders header_map) {
+unique_ptr<HTTPResponse> HTTPFileSystem::HeadRequest(FileHandle &handle, const string &url, HTTPHeaders header_map) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
 	auto captured = hfh.request_session->Capture();
 	captured.snapshot->AddConfiguredHeaders(header_map);
@@ -286,7 +295,7 @@ unique_ptr<HTTPResponse> HTTPFileSystem::HeadRequest(FileHandle &handle, string 
 	});
 }
 
-unique_ptr<HTTPResponse> HTTPFileSystem::DeleteRequest(FileHandle &handle, string url, HTTPHeaders header_map) {
+unique_ptr<HTTPResponse> HTTPFileSystem::DeleteRequest(FileHandle &handle, const string &url, HTTPHeaders header_map) {
 	auto &hfh = handle.Cast<HTTPFileHandle>();
 	auto captured = hfh.request_session->Capture();
 	captured.snapshot->AddConfiguredHeaders(header_map);

@@ -1,5 +1,6 @@
 #include "s3/s3_xml_response.hpp"
 
+#include "duckdb/common/pair.hpp"
 #include "utf8proc_wrapper.hpp"
 
 #include <algorithm>
@@ -319,9 +320,10 @@ private:
 				return false;
 			}
 			SkipWhitespace();
-			if (position >= input.size() || input[position++] != '=') {
+			if (position >= input.size() || input[position] != '=') {
 				return false;
 			}
+			position++;
 			SkipWhitespace();
 			if (!ParseDeclarationValue(attribute.value)) {
 				return false;
@@ -450,9 +452,10 @@ private:
 				}
 			}
 			SkipWhitespace();
-			if (position >= input.size() || input[position++] != '=') {
+			if (position >= input.size() || input[position] != '=') {
 				return false;
 			}
+			position++;
 			SkipWhitespace();
 			if (!ParseAttributeValue(attribute.value)) {
 				return false;
@@ -498,9 +501,10 @@ private:
 			return false;
 		}
 		SkipWhitespace();
-		if (position >= input.size() || input[position++] != '>') {
+		if (position >= input.size() || input[position] != '>') {
 			return false;
 		}
+		position++;
 		if (!SameName(elements.back().name, name)) {
 			return false;
 		}
@@ -569,7 +573,7 @@ private:
 	}
 
 	bool ValidateAttributes(const vector<S3XMLAttribute> &attributes) const {
-		vector<std::pair<string, string>> expanded_names;
+		vector<pair<string, string>> expanded_names;
 		for (const auto &attribute : attributes) {
 			if ((attribute.name.prefix.empty() && attribute.name.local_name == "xmlns") ||
 			    attribute.name.prefix == "xmlns") {
