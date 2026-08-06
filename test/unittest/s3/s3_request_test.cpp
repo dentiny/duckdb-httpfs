@@ -246,12 +246,73 @@ static void RunGCSBearerRequestScenario(const string &client_implementation) {
 			continue;
 		}
 		saw_object |= observation.method == "HEAD" && observation.target.find("object.bin") != string::npos;
-		saw_list |= observation.method == "GET" && observation.target.find("list-type=2") != string::npos;
-		saw_bulk_delete |= observation.method == "POST" && observation.target.find("delete") != string::npos;
+		if (observation.method == "GET" && observation.target.find("list-type=2") != string::npos) {
+			saw_list = true;
+			REQUIRE(observation.target.find("?encoding-type=url&list-type=2&prefix=") != string::npos);
+		}
+		if (observation.method == "POST" && observation.target.find("delete") != string::npos) {
+			saw_bulk_delete = true;
+			REQUIRE(StringUtil::EndsWith(observation.target, "?delete="));
+		}
 	}
 	REQUIRE(saw_object);
 	REQUIRE(saw_list);
 	REQUIRE(saw_bulk_delete);
+}
+
+static void RunBulkDeleteSecretIdentityScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.auth.stale_key_id = "NEVER_STALE";
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	S3TestHelper::LoadExtension(db);
+	S3TestHelper::RegisterRefreshProvider(db);
+	S3TestHelper::RequireQueryOk(con,
+	                             StringUtil::Format("SET httpfs_client_implementation='%s'", client_implementation));
+	S3TestHelper::RequireQueryOk(con, "SET httpfs_connection_caching=false");
+	for (const auto &entry :
+	     {pair<string, string> {"delete_identity_a", "a"}, pair<string, string> {"delete_identity_b", "b"}}) {
+		auto test_id = S3TestHelper::NextTestId();
+		S3TestHelper::RequireQueryOk(con, StringUtil::Format(R"(
+CREATE SECRET %s (
+	TYPE S3,
+	PROVIDER %s,
+	SCOPE 's3://refresh-bucket/%s/',
+	KEY_ID '%s',
+	SECRET '%s',
+	REGION 'us-east-1',
+	ENDPOINT '%s',
+	USE_SSL false,
+	URL_STYLE 'path',
+	TEST_ID '%s',
+	REFRESH_INFO MAP {
+		'KEY_ID': '%s',
+		'SECRET': '%s',
+		'TEST_ID': '%s'
+	}
+))",
+		                                                     entry.first, S3TestHelper::TEST_PROVIDER, entry.second,
+		                                                     S3TestHelper::STALE_KEY_ID, S3TestHelper::STALE_SECRET,
+		                                                     server.Endpoint(), test_id, S3TestHelper::FRESH_KEY_ID,
+		                                                     S3TestHelper::FRESH_SECRET, test_id));
+	}
+
+	S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	fs.RemoveFiles({"s3://refresh-bucket/a/object.bin", "s3://refresh-bucket/b/object.bin"});
+	S3TestHelper::RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	idx_t bulk_delete_requests = 0;
+	for (const auto &observation : observations) {
+		if (observation.method == "POST" && StringUtil::EndsWith(observation.target, "?delete=")) {
+			bulk_delete_requests++;
+		}
+	}
+	REQUIRE(bulk_delete_requests == 2);
 }
 
 static void RunGCSListAuthErrorScenario(const string &client_implementation) {
@@ -421,7 +482,8 @@ TEST_CASE("S3 provider policy selects request authentication", "[httpfs][s3][pro
 
 	SECTION("anonymous") {
 		S3AuthParams auth_params;
-		auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, "", "GET", auth_params);
+		auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(),
+		                                            RequestType::GET_REQUEST, auth_params);
 		REQUIRE(headers.GetHeaderValue("Host") == parsed_url.host);
 		REQUIRE_FALSE(headers.HasHeader("Authorization"));
 	}
@@ -432,8 +494,9 @@ TEST_CASE("S3 provider policy selects request authentication", "[httpfs][s3][pro
 		auth_params.region = "auto";
 		auth_params.access_key_id = "key";
 		auth_params.secret_access_key = "secret";
-		auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, "", "GET", auth_params, "20260806",
-		                                            "20260806T120000Z");
+		auto headers =
+		    S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(), RequestType::GET_REQUEST,
+		                                 auth_params, "20260806", "20260806T120000Z");
 		REQUIRE(StringUtil::StartsWith(headers.GetHeaderValue("Authorization"), "AWS4-HMAC-SHA256"));
 	}
 
@@ -443,8 +506,9 @@ TEST_CASE("S3 provider policy selects request authentication", "[httpfs][s3][pro
 		auth_params.access_key_id = "key";
 		auth_params.secret_access_key = "secret";
 		auth_params.oauth2_bearer_token = "token";
-		auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, "delete=", "POST", auth_params, "", "",
-		                                            "payload", "application/xml", "content-md5");
+		auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery({{"delete", ""}}),
+		                                            RequestType::POST_REQUEST, auth_params, "", "", "payload",
+		                                            "application/xml", "content-md5");
 		REQUIRE(headers.GetHeaderValue("Authorization") == "Bearer token");
 		REQUIRE(headers.GetHeaderValue("Content-Type") == "application/xml");
 		REQUIRE(headers.GetHeaderValue("Content-MD5") == "content-md5");
@@ -462,8 +526,8 @@ TEST_CASE("S3 request signing remains deterministic", "[httpfs][s3][signing]") {
 	parsed_url.path = "/test.txt";
 	parsed_url.host = "examplebucket.s3.amazonaws.com";
 
-	auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, "", "GET", auth_params, "20130524",
-	                                            "20130524T000000Z");
+	auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(), RequestType::GET_REQUEST,
+	                                            auth_params, "20130524", "20130524T000000Z");
 
 	REQUIRE(headers.GetHeaderValue("Host") == "examplebucket.s3.amazonaws.com");
 	REQUIRE(headers.GetHeaderValue("x-amz-content-sha256") ==
@@ -487,14 +551,60 @@ TEST_CASE("S3 request signing includes optional headers", "[httpfs][s3][signing]
 	parsed_url.path = "/bucket/key";
 	parsed_url.host = "bucket.example.com";
 
-	auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, "", "PUT", auth_params, "20260730",
-	                                            "20260730T120000Z", "", "application/octet-stream", "content-md5");
+	auto headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(), RequestType::PUT_REQUEST,
+	                                            auth_params, "20260730", "20260730T120000Z", "",
+	                                            "application/octet-stream", "content-md5");
 
 	REQUIRE(headers.GetHeaderValue("x-amz-security-token") == "token");
 	REQUIRE(headers.GetHeaderValue("x-amz-request-payer") == "requester");
 	REQUIRE(headers.GetHeaderValue("x-amz-server-side-encryption") == "aws:kms");
 	REQUIRE(headers.GetHeaderValue("x-amz-server-side-encryption-aws-kms-key-id") == "kms-key");
 	REQUIRE(headers.GetHeaderValue("Authorization").find("content-md5;content-type;host;") != string::npos);
+}
+
+TEST_CASE("S3 request queries share canonical and wire encoding", "[httpfs][s3][query][signing]") {
+	SECTION("raw parameters are encoded and sorted once") {
+		S3RequestQuery query {{"z", "a b"}, {"empty", ""}, {"slash", "a/b"}, {"amp", "x&y"}, {"a", "1"}};
+		const string expected = "a=1&amp=x%26y&empty=&slash=a%2Fb&z=a%20b";
+		REQUIRE(query.WireQuery() == expected);
+		REQUIRE(query.CanonicalQuery() == expected);
+		REQUIRE(query.HasParameter("empty"));
+		REQUIRE_FALSE(query.HasParameter("missing"));
+	}
+
+	SECTION("operation-specific parameters retain their wire contracts") {
+		REQUIRE(S3RequestQuery({{"delete", ""}}).WireQuery() == "delete=");
+		REQUIRE(S3RequestQuery({{"uploads", ""}}).WireQuery() == "uploads=");
+		REQUIRE(S3RequestQuery({{"versionId", "opaque&id /"}}).WireQuery() == "versionId=opaque%26id%20%2F");
+		REQUIRE(S3RequestQuery({{"uploadId", "opaque&id"}, {"partNumber", "12"}}).WireQuery() ==
+		        "partNumber=12&uploadId=opaque%26id");
+	}
+
+	SECTION("signing is independent of raw parameter order") {
+		::AESStateSSLFactory encryption_util;
+		S3AuthParams auth_params;
+		auth_params.region = "us-east-1";
+		auth_params.access_key_id = "key";
+		auth_params.secret_access_key = "secret";
+		ParsedS3Url parsed_url;
+		parsed_url.path = "/bucket/key";
+		parsed_url.host = "bucket.example.com";
+		auto first = S3RequestUtil::CreateHeaders(
+		    encryption_util, parsed_url, S3RequestQuery({{"uploadId", "opaque&id"}, {"partNumber", "12"}}),
+		    RequestType::PUT_REQUEST, auth_params, "20260806", "20260806T120000Z");
+		auto second = S3RequestUtil::CreateHeaders(
+		    encryption_util, parsed_url, S3RequestQuery({{"partNumber", "12"}, {"uploadId", "opaque&id"}}),
+		    RequestType::PUT_REQUEST, auth_params, "20260806", "20260806T120000Z");
+		REQUIRE(first.GetHeaderValue("Authorization") == second.GetHeaderValue("Authorization"));
+		REQUIRE(first.GetHeaderValue("Authorization") ==
+		        "AWS4-HMAC-SHA256 Credential=key/20260806/us-east-1/s3/aws4_request, "
+		        "SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+		        "Signature=7d31006078e4c8754eb70f96358af8f4c84a60186bf8e8fe1605b9bb90fcffad");
+		auto empty_query =
+		    S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(), RequestType::PUT_REQUEST,
+		                                 auth_params, "20260806", "20260806T120000Z");
+		REQUIRE(first.GetHeaderValue("Authorization") != empty_query.GetHeaderValue("Authorization"));
+	}
 }
 
 TEST_CASE("HTTPFS preserves S3 error bodies for streamed GETs", "[httpfs][s3][errors]") {
@@ -561,6 +671,15 @@ TEST_CASE("GCS bearer authentication is shared by object, list and bulk-delete r
 	}
 	SECTION("curl") {
 		RunGCSBearerRequestScenario("curl");
+	}
+}
+
+TEST_CASE("S3 bulk delete preserves selected secret identity", "[httpfs][s3][delete][secret]") {
+	SECTION("httplib") {
+		RunBulkDeleteSecretIdentityScenario("httplib");
+	}
+	SECTION("curl") {
+		RunBulkDeleteSecretIdentityScenario("curl");
 	}
 }
 

@@ -70,6 +70,7 @@ struct S3AuthParams {
 	static S3AuthParams ReadFrom(optional_ptr<FileOpener> opener, FileOpenerInfo &info);
 	static S3AuthParams ReadFrom(S3KeyValueReader &secret_reader, const string &file_path);
 	void SetRegion(string region_p);
+	bool operator==(const S3AuthParams &other) const;
 };
 
 struct AWSEnvironmentCredentialsProvider {

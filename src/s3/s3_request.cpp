@@ -16,19 +16,107 @@
 #include "duckdb/main/client_context_file_opener.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
+S3RefreshableHTTPParams::S3RefreshableHTTPParams(const HTTPFSParams &params) {
+	http_proxy = params.http_proxy;
+	http_proxy_port = params.http_proxy.empty() ? 0 : params.http_proxy_port;
+	http_proxy_username = params.http_proxy_username;
+	http_proxy_password = params.http_proxy_password;
+	extra_headers = params.extra_headers;
+	override_verify_ssl = params.override_verify_ssl;
+	verify_ssl = params.verify_ssl;
+	bearer_token = params.bearer_token;
+}
+
+void S3RefreshableHTTPParams::Apply(HTTPFSParams &target) const {
+	target.http_proxy = http_proxy;
+	target.http_proxy_port = http_proxy.empty() ? 0 : http_proxy_port;
+	target.http_proxy_username = http_proxy_username;
+	target.http_proxy_password = http_proxy_password;
+	target.extra_headers = extra_headers;
+	target.override_verify_ssl = override_verify_ssl;
+	target.verify_ssl = verify_ssl;
+	target.bearer_token = bearer_token;
+	target.pre_merged_headers = false;
+}
+
+bool S3RefreshableHTTPParams::operator==(const S3RefreshableHTTPParams &other) const {
+	return http_proxy == other.http_proxy && http_proxy_port == other.http_proxy_port &&
+	       http_proxy_username == other.http_proxy_username && http_proxy_password == other.http_proxy_password &&
+	       extra_headers == other.extra_headers && override_verify_ssl == other.override_verify_ssl &&
+	       verify_ssl == other.verify_ssl && bearer_token == other.bearer_token;
+}
+
+S3RequestQuery::S3RequestQuery(std::initializer_list<pair<string, string>> parameters_p)
+    : S3RequestQuery(vector<pair<string, string>>(parameters_p)) {
+}
+
+S3RequestQuery::S3RequestQuery(vector<pair<string, string>> parameters_p) : parameters(std::move(parameters_p)) {
+	vector<pair<string, string>> encoded_parameters;
+	encoded_parameters.reserve(parameters.size());
+	for (const auto &parameter : parameters) {
+		encoded_parameters.emplace_back(S3Url::Encode(parameter.first, true), S3Url::Encode(parameter.second, true));
+	}
+	std::sort(encoded_parameters.begin(), encoded_parameters.end());
+	for (const auto &parameter : encoded_parameters) {
+		if (!wire_query.empty()) {
+			wire_query += '&';
+		}
+		wire_query += parameter.first + "=" + parameter.second;
+	}
+	canonical_query = wire_query;
+}
+
+const string &S3RequestQuery::WireQuery() const {
+	return wire_query;
+}
+
+const string &S3RequestQuery::CanonicalQuery() const {
+	return canonical_query;
+}
+
+bool S3RequestQuery::HasParameter(const string &name) const {
+	for (const auto &parameter : parameters) {
+		if (parameter.first == name) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static const char *S3RequestMethod(RequestType request_type) {
+	switch (request_type) {
+	case RequestType::GET_REQUEST:
+		return "GET";
+	case RequestType::PUT_REQUEST:
+		return "PUT";
+	case RequestType::HEAD_REQUEST:
+		return "HEAD";
+	case RequestType::DELETE_REQUEST:
+		return "DELETE";
+	case RequestType::POST_REQUEST:
+		return "POST";
+	case RequestType::OPTIONS_REQUEST:
+		return "OPTIONS";
+	}
+	throw InternalException("Unsupported S3 request type");
+}
+
 struct S3HeaderBuilder {
-	S3HeaderBuilder(EncryptionUtil &encryption_util_p, string url_p, string query_p, string host_p, string service_p,
-	                string method_p, const S3AuthParams &auth_params_p, string date_now_p, string datetime_now_p,
-	                string payload_hash_p, string content_type_p, string content_md5_p)
-	    : encryption_util(encryption_util_p), url(std::move(url_p)), query(std::move(query_p)), host(std::move(host_p)),
-	      service(std::move(service_p)), method(std::move(method_p)), auth_params(auth_params_p),
-	      date_now(std::move(date_now_p)), datetime_now(std::move(datetime_now_p)),
+	S3HeaderBuilder(EncryptionUtil &encryption_util_p, string url_p, const S3RequestQuery &query_p, string host_p,
+	                string service_p, RequestType request_type_p, const S3AuthParams &auth_params_p, string date_now_p,
+	                string datetime_now_p, string payload_hash_p, string content_type_p, string content_md5_p)
+	    : encryption_util(encryption_util_p), url(std::move(url_p)), query(query_p.CanonicalQuery()),
+	      host(std::move(host_p)), service(std::move(service_p)), method(S3RequestMethod(request_type_p)),
+	      auth_params(auth_params_p), date_now(std::move(date_now_p)), datetime_now(std::move(datetime_now_p)),
 	      payload_hash(std::move(payload_hash_p)), content_type(std::move(content_type_p)),
 	      content_md5(std::move(content_md5_p)),
-	      use_sse_kms(!auth_params.kms_key_id.empty() && (method == "POST" || method == "PUT") &&
-	                  query.find("uploadId") == string::npos) {
+	      use_sse_kms(!auth_params.kms_key_id.empty() &&
+	                  (request_type_p == RequestType::POST_REQUEST || request_type_p == RequestType::PUT_REQUEST) &&
+	                  !query_p.HasParameter("uploadId")) {
 	}
 
 	HTTPHeaders Create() {
@@ -165,10 +253,10 @@ private:
 	HTTPHeaders headers;
 };
 
-HTTPHeaders S3RequestUtil::CreateHeaders(EncryptionUtil &encryption_util, const ParsedS3Url &parsed_url, string query,
-                                         string method, const S3AuthParams &auth_params, string date_now,
-                                         string datetime_now, string payload_hash, string content_type,
-                                         string content_md5) {
+HTTPHeaders S3RequestUtil::CreateHeaders(EncryptionUtil &encryption_util, const ParsedS3Url &parsed_url,
+                                         const S3RequestQuery &query, RequestType request_type,
+                                         const S3AuthParams &auth_params, string date_now, string datetime_now,
+                                         string payload_hash, string content_type, string content_md5) {
 	switch (S3Provider::GetAuthType(auth_params)) {
 	case S3AuthType::ANONYMOUS: {
 		HTTPHeaders headers;
@@ -176,9 +264,9 @@ HTTPHeaders S3RequestUtil::CreateHeaders(EncryptionUtil &encryption_util, const 
 		return headers;
 	}
 	case S3AuthType::SIGV4:
-		return S3HeaderBuilder(encryption_util, parsed_url.path, std::move(query), parsed_url.host, "s3",
-		                       std::move(method), auth_params, std::move(date_now), std::move(datetime_now),
-		                       std::move(payload_hash), std::move(content_type), std::move(content_md5))
+		return S3HeaderBuilder(encryption_util, parsed_url.path, query, parsed_url.host, "s3", request_type,
+		                       auth_params, std::move(date_now), std::move(datetime_now), std::move(payload_hash),
+		                       std::move(content_type), std::move(content_md5))
 		    .Create();
 	case S3AuthType::BEARER: {
 		HTTPHeaders headers;
@@ -227,48 +315,6 @@ static bool IsAuthRefreshStatus(const HTTPResponse &response) {
 	return response.status == HTTPStatusCode::BadRequest_400 && IsAuthRefreshErrorBody(response.body);
 }
 
-static bool S3AuthParamsMatch(const S3AuthParams &left, const S3AuthParams &right) {
-	return left.provider_type == right.provider_type && left.region == right.region &&
-	       left.access_key_id == right.access_key_id && left.secret_access_key == right.secret_access_key &&
-	       left.session_token == right.session_token && left.endpoint == right.endpoint &&
-	       left.kms_key_id == right.kms_key_id && left.url_style == right.url_style && left.use_ssl == right.use_ssl &&
-	       left.s3_url_compatibility_mode == right.s3_url_compatibility_mode &&
-	       left.requester_pays == right.requester_pays && left.oauth2_bearer_token == right.oauth2_bearer_token;
-}
-
-static S3RefreshableHTTPParams SnapshotRefreshableHTTPParams(const HTTPFSParams &params) {
-	S3RefreshableHTTPParams result;
-	result.http_proxy = params.http_proxy;
-	result.http_proxy_port = params.http_proxy.empty() ? 0 : params.http_proxy_port;
-	result.http_proxy_username = params.http_proxy_username;
-	result.http_proxy_password = params.http_proxy_password;
-	result.extra_headers = params.extra_headers;
-	result.override_verify_ssl = params.override_verify_ssl;
-	result.verify_ssl = params.verify_ssl;
-	result.bearer_token = params.bearer_token;
-	return result;
-}
-
-static void ApplyRefreshableHTTPParams(HTTPFSParams &target, const S3RefreshableHTTPParams &source) {
-	target.http_proxy = source.http_proxy;
-	target.http_proxy_port = source.http_proxy.empty() ? 0 : source.http_proxy_port;
-	target.http_proxy_username = source.http_proxy_username;
-	target.http_proxy_password = source.http_proxy_password;
-	target.extra_headers = source.extra_headers;
-	target.override_verify_ssl = source.override_verify_ssl;
-	target.verify_ssl = source.verify_ssl;
-	target.bearer_token = source.bearer_token;
-	target.pre_merged_headers = false;
-}
-
-static bool S3RefreshableHTTPParamsMatch(const S3RefreshableHTTPParams &left, const S3RefreshableHTTPParams &right) {
-	return left.http_proxy == right.http_proxy && left.http_proxy_port == right.http_proxy_port &&
-	       left.http_proxy_username == right.http_proxy_username &&
-	       left.http_proxy_password == right.http_proxy_password && left.extra_headers == right.extra_headers &&
-	       left.override_verify_ssl == right.override_verify_ssl && left.verify_ssl == right.verify_ssl &&
-	       left.bearer_token == right.bearer_token;
-}
-
 static S3AuthParams ReadS3AuthParams(optional_ptr<FileOpener> opener, const string &path) {
 	FileOpenerInfo info = {path};
 	auto auth_params = S3AuthParams::ReadFrom(opener, info);
@@ -281,7 +327,7 @@ S3RefreshableHTTPParams S3RequestExecutor::ReadRefreshableHTTPParams(optional_pt
 	FileOpenerInfo info = {path};
 	auto &http_util = HTTPFSUtil::GetHTTPUtil(opener);
 	auto params = http_util.InitializeParameters(opener, info);
-	return SnapshotRefreshableHTTPParams(params->Cast<HTTPFSParams>());
+	return S3RefreshableHTTPParams(params->Cast<HTTPFSParams>());
 }
 
 static bool TryRefreshS3SecretForPath(ClientContext &context, const string &path) {
@@ -317,13 +363,12 @@ static bool ReloadS3AuthMaterial(optional_ptr<FileOpener> opener, const string &
 	}
 	auto reloaded_http_params = S3RequestExecutor::ReadRefreshableHTTPParams(opener, path);
 
-	if (S3AuthParamsMatch(reloaded_auth_params, auth_params) &&
-	    S3RefreshableHTTPParamsMatch(reloaded_http_params, SnapshotRefreshableHTTPParams(http_params))) {
+	if (reloaded_auth_params == auth_params && reloaded_http_params == S3RefreshableHTTPParams(http_params)) {
 		return false;
 	}
 
 	auth_params = std::move(reloaded_auth_params);
-	ApplyRefreshableHTTPParams(http_params, reloaded_http_params);
+	reloaded_http_params.Apply(http_params);
 	return true;
 }
 
@@ -354,34 +399,37 @@ static bool TryRefreshS3AuthMaterial(optional_ptr<ClientContext> context, option
 
 S3RequestData S3RequestExecutor::CreateRequestData(EncryptionUtil &encryption_util,
                                                    const CapturedHTTPRequestSnapshot &captured, const string &s3_url,
-                                                   const string &method, const string &query_string,
-                                                   const string &payload_hash, const string &content_type,
-                                                   const string &content_md5) {
+                                                   RequestType request_type, S3RequestTarget target,
+                                                   const CreateQueryCallback &create_query, const string &payload_hash,
+                                                   const string &content_type, const string &content_md5) {
 	auto &snapshot = captured.snapshot->Cast<S3RequestSnapshot>();
 	S3RequestData result;
+	result.request_type = request_type;
 	result.captured = captured;
 	result.auth_params = snapshot.auth_params;
 	result.http_params = snapshot.CreateRequestParams();
 	auto parsed_s3_url = S3Url::Parse(s3_url, result.auth_params);
+	result.display_url = S3Url::GetDisplayUrl(s3_url, result.auth_params);
+	auto query = create_query(parsed_s3_url);
+	if (target == S3RequestTarget::BUCKET) {
+		parsed_s3_url.path = parsed_s3_url.GetBucketPath();
+	}
 
-	result.http_url = parsed_s3_url.GetHTTPUrl(query_string);
-	result.headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_s3_url, query_string, method,
+	result.http_url = parsed_s3_url.GetHTTPUrl(query.WireQuery());
+	result.headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_s3_url, query, request_type,
 	                                              result.auth_params, "", "", payload_hash, content_type, content_md5);
 	snapshot.AddConfiguredHeaders(result.headers);
 	return result;
 }
 
 S3RequestData S3RequestExecutor::CreateHandleRequestData(EncryptionUtil &encryption_util, S3FileHandle &s3_handle,
-                                                         const string &s3_url, const string &method,
+                                                         const string &s3_url, RequestType request_type,
                                                          const string &version_id) {
 	auto captured = s3_handle.request_session->Capture();
-
-	string query_string;
-	if (!version_id.empty()) {
-		query_string = "versionId=" + S3Url::Encode(version_id, true);
-	}
-
-	return S3RequestExecutor::CreateRequestData(encryption_util, captured, s3_url, method, query_string);
+	return S3RequestExecutor::CreateRequestData(
+	    encryption_util, captured, s3_url, request_type, S3RequestTarget::OBJECT, [&](const ParsedS3Url &) {
+		    return version_id.empty() ? S3RequestQuery() : S3RequestQuery({{"versionId", version_id}});
+	    });
 }
 
 static optional_idx GetRegionRedirect(const HTTPResponse &response, const S3AuthParams &auth_params,
@@ -445,8 +493,9 @@ static void SleepForS3RequestTimeoutRetry(const HTTPFSParams &http_params, idx_t
 	wait_ms *= http_params.retry_backoff;
 }
 
-static bool IsTransientRetryEligibleMethod(const string &method) {
-	return method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE";
+static bool IsTransientRetryEligibleMethod(RequestType request_type) {
+	return request_type == RequestType::GET_REQUEST || request_type == RequestType::HEAD_REQUEST ||
+	       request_type == RequestType::PUT_REQUEST || request_type == RequestType::DELETE_REQUEST;
 }
 
 unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, const CreateDataCallback &create_data,
@@ -527,7 +576,7 @@ bool S3RequestExecutor::TryRefreshSession(HTTPRequestSession &session, const S3R
 		return session.Capture().snapshot->Cast<S3RequestSnapshot>().credential_generation !=
 		       failed_snapshot.credential_generation;
 	}
-	auto refreshed_http_material = SnapshotRefreshableHTTPParams(*refreshed_http_params);
+	auto refreshed_http_material = S3RefreshableHTTPParams(*refreshed_http_params);
 	for (;;) {
 		current = session.Capture();
 		auto &latest = current.snapshot->Cast<S3RequestSnapshot>();
@@ -540,7 +589,7 @@ bool S3RequestExecutor::TryRefreshSession(HTTPRequestSession &session, const S3R
 			merged_auth_params.SetRegion(latest.auth_params.region);
 		}
 		auto merged_http_params = latest.CreateRequestParams();
-		ApplyRefreshableHTTPParams(*merged_http_params, refreshed_http_material);
+		refreshed_http_material.Apply(*merged_http_params);
 		auto replacement = make_shared_ptr<S3RequestSnapshot>(
 		    *merged_http_params, merged_auth_params, latest.refresh_path, latest.client_context,
 		    latest.credential_refresh_enabled, latest.region_redirected, latest.credential_generation + 1);
@@ -575,33 +624,37 @@ bool S3RequestExecutor::SetSessionRegion(HTTPRequestSession &session, const stri
 }
 
 unique_ptr<HTTPResponse> S3RequestExecutor::RunSession(EncryptionUtil &encryption_util, HTTPRequestSession &session,
-                                                       const string &s3_url, const string &method,
-                                                       const string &query_string, const string &payload_hash,
-                                                       const string &content_type, const string &content_md5,
-                                                       const RequestCallback &request) {
+                                                       const string &s3_url, RequestType request_type,
+                                                       S3RequestTarget target, const CreateQueryCallback &create_query,
+                                                       const string &payload_hash, const string &content_type,
+                                                       const string &content_md5, const RequestCallback &request,
+                                                       const RegionRedirectCallback &region_redirect) {
 	return S3RequestExecutor::Run(
 	    s3_url,
 	    [&]() {
-		    return S3RequestExecutor::CreateRequestData(encryption_util, session.Capture(), s3_url, method,
-		                                                query_string, payload_hash, content_type, content_md5);
+		    return S3RequestExecutor::CreateRequestData(encryption_util, session.Capture(), s3_url, request_type,
+		                                                target, create_query, payload_hash, content_type, content_md5);
 	    },
-	    IsTransientRetryEligibleMethod(method), request,
+	    IsTransientRetryEligibleMethod(request_type), request,
 	    [&](const S3RequestData &request_data) { return S3RequestExecutor::TryRefreshSession(session, request_data); },
 	    [&](const S3RequestData &request_data, const string &correct_region) {
 		    string previous_region;
-		    S3RequestExecutor::SetSessionRegion(session, correct_region, previous_region);
+		    if (S3RequestExecutor::SetSessionRegion(session, correct_region, previous_region) && region_redirect) {
+			    region_redirect(request_data, previous_region, correct_region);
+		    }
 	    });
 }
 
 unique_ptr<HTTPResponse> S3RequestExecutor::RunHandle(EncryptionUtil &encryption_util, S3FileHandle &s3_handle,
-                                                      const string &s3_url, const string &method,
+                                                      const string &s3_url, RequestType request_type,
                                                       const string &version_id, const RequestCallback &request) {
 	return S3RequestExecutor::Run(
 	    s3_url,
 	    [&]() {
-		    return S3RequestExecutor::CreateHandleRequestData(encryption_util, s3_handle, s3_url, method, version_id);
+		    return S3RequestExecutor::CreateHandleRequestData(encryption_util, s3_handle, s3_url, request_type,
+		                                                      version_id);
 	    },
-	    IsTransientRetryEligibleMethod(method), request,
+	    IsTransientRetryEligibleMethod(request_type), request,
 	    [&](const S3RequestData &request_data) {
 		    return S3RequestExecutor::TryRefreshSession(*s3_handle.request_session, request_data);
 	    },
@@ -684,11 +737,12 @@ string S3RequestUtil::GetPayloadHash(EncryptionUtil &encryption_util, const_data
 
 unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, const string &url, string &result,
                                                    const_data_ptr_t buffer_in, idx_t buffer_in_len,
-                                                   const string &http_params, S3PostRequestMode mode) {
+                                                   const S3RequestQuery &query, S3PostRequestMode mode) {
 	auto payload_hash = S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), buffer_in, buffer_in_len);
 	const string content_type = "application/octet-stream";
 	return S3RequestExecutor::RunSession(
-	    GetEncryptionUtil(), session, url, "POST", http_params, payload_hash, content_type, "",
+	    GetEncryptionUtil(), session, url, RequestType::POST_REQUEST, S3RequestTarget::OBJECT,
+	    [&](const ParsedS3Url &) { return query; }, payload_hash, content_type, "",
 	    [&](S3RequestData &request_data) {
 		    result.clear();
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
@@ -706,11 +760,12 @@ unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, 
 
 unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, const string &url,
                                                   const_data_ptr_t buffer_in, idx_t buffer_in_len,
-                                                  const string &http_params) {
+                                                  const S3RequestQuery &query) {
 	auto payload_hash = S3RequestUtil::GetPayloadHash(GetEncryptionUtil(), buffer_in, buffer_in_len);
 	const string content_type = "application/octet-stream";
 	return S3RequestExecutor::RunSession(
-	    GetEncryptionUtil(), session, url, "PUT", http_params, payload_hash, content_type, "",
+	    GetEncryptionUtil(), session, url, RequestType::PUT_REQUEST, S3RequestTarget::OBJECT,
+	    [&](const ParsedS3Url &) { return query; }, payload_hash, content_type, "",
 	    [&](S3RequestData &request_data) {
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		    return RunPutRequest(request_data.http_url, request_data.headers, params, buffer_in, buffer_in_len,
@@ -725,7 +780,7 @@ unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, c
 unique_ptr<HTTPResponse> S3FileSystem::HeadRequest(FileHandle &handle, const string &s3_url, HTTPHeaders header_map) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
 	return S3RequestExecutor::RunHandle(
-	    GetEncryptionUtil(), s3_handle, s3_url, "HEAD", {}, [&](S3RequestData &request_data) {
+	    GetEncryptionUtil(), s3_handle, s3_url, RequestType::HEAD_REQUEST, {}, [&](S3RequestData &request_data) {
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		    return RunHeadRequest(request_data.http_url, request_data.headers, params, [&](BaseRequest &request) {
 			    return S3RequestExecutor::SendHandleRequest(s3_handle, request_data.captured, params, request);
@@ -739,7 +794,7 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRequest(FileHandle &handle, string s3_
 	const auto version_id =
 	    read_config.condition.type == HTTPReadConditionType::S3_VERSION_ID ? read_config.condition.value : string();
 	return S3RequestExecutor::RunHandle(
-	    GetEncryptionUtil(), s3_handle, s3_url, "GET", version_id, [&](S3RequestData &request_data) {
+	    GetEncryptionUtil(), s3_handle, s3_url, RequestType::GET_REQUEST, version_id, [&](S3RequestData &request_data) {
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		    return RunGetRequest(
 		        s3_handle, request_data.http_url, request_data.headers, params, read_config, download,
@@ -757,7 +812,7 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, strin
 	const auto version_id =
 	    read_config.condition.type == HTTPReadConditionType::S3_VERSION_ID ? read_config.condition.value : string();
 	return S3RequestExecutor::RunHandle(
-	    GetEncryptionUtil(), s3_handle, s3_url, "GET", version_id, [&](S3RequestData &request_data) {
+	    GetEncryptionUtil(), s3_handle, s3_url, RequestType::GET_REQUEST, version_id, [&](S3RequestData &request_data) {
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		    return RunGetRangeRequest(
 		        s3_handle, request_data.http_url, request_data.headers, params, read_config, file_offset, buffer_out,
@@ -772,7 +827,7 @@ unique_ptr<HTTPResponse> S3FileSystem::GetRangeRequest(FileHandle &handle, strin
 unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, const string &s3_url, HTTPHeaders header_map) {
 	auto &s3_handle = handle.Cast<S3FileHandle>();
 	return S3RequestExecutor::RunHandle(
-	    GetEncryptionUtil(), s3_handle, s3_url, "DELETE", {}, [&](S3RequestData &request_data) {
+	    GetEncryptionUtil(), s3_handle, s3_url, RequestType::DELETE_REQUEST, {}, [&](S3RequestData &request_data) {
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		    return RunDeleteRequest(request_data.http_url, request_data.headers, params, [&](BaseRequest &request) {
 			    return S3RequestExecutor::SendHandleRequest(s3_handle, request_data.captured, params, request);
@@ -781,9 +836,11 @@ unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(FileHandle &handle, const s
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::DeleteRequest(HTTPRequestSession &session, const string &s3_url,
-                                                     const string &http_params) {
+                                                     const S3RequestQuery &query) {
 	return S3RequestExecutor::RunSession(
-	    GetEncryptionUtil(), session, s3_url, "DELETE", http_params, "", "", "", [&](S3RequestData &request_data) {
+	    GetEncryptionUtil(), session, s3_url, RequestType::DELETE_REQUEST, S3RequestTarget::OBJECT,
+	    [&](const ParsedS3Url &) { return query; }, "", "", "",
+	    [&](S3RequestData &request_data) {
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		    return RunDeleteRequest(request_data.http_url, request_data.headers, params, [&](BaseRequest &request) {
 			    return S3RequestExecutor::SendSessionRequest(session, request_data.captured, params, request);

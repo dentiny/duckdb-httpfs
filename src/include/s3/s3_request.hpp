@@ -6,6 +6,7 @@
 #include "duckdb/common/encryption_state.hpp"
 
 #include <functional>
+#include <initializer_list>
 #include <unordered_map>
 
 namespace duckdb {
@@ -14,6 +15,9 @@ class ClientContext;
 class S3FileHandle;
 
 struct S3RefreshableHTTPParams {
+	S3RefreshableHTTPParams() = default;
+	explicit S3RefreshableHTTPParams(const HTTPFSParams &params);
+
 	string http_proxy;
 	idx_t http_proxy_port = 0;
 	string http_proxy_username;
@@ -22,6 +26,26 @@ struct S3RefreshableHTTPParams {
 	bool override_verify_ssl = false;
 	bool verify_ssl = true;
 	string bearer_token;
+
+	void Apply(HTTPFSParams &target) const;
+	bool operator==(const S3RefreshableHTTPParams &other) const;
+};
+
+enum class S3RequestTarget : uint8_t { OBJECT, BUCKET };
+
+struct S3RequestQuery {
+	S3RequestQuery() = default;
+	S3RequestQuery(std::initializer_list<pair<string, string>> parameters);
+	explicit S3RequestQuery(vector<pair<string, string>> parameters);
+
+	const string &WireQuery() const;
+	const string &CanonicalQuery() const;
+	bool HasParameter(const string &name) const;
+
+private:
+	vector<pair<string, string>> parameters;
+	string wire_query;
+	string canonical_query;
 };
 
 struct S3RequestSnapshot : public HTTPRequestSnapshot {
@@ -40,18 +64,20 @@ struct S3RequestSnapshot : public HTTPRequestSnapshot {
 };
 
 struct S3RequestData {
+	RequestType request_type = RequestType::GET_REQUEST;
 	S3AuthParams auth_params;
 	unique_ptr<HTTPParams> http_params;
 	CapturedHTTPRequestSnapshot captured;
 	string http_url;
+	string display_url;
 	HTTPHeaders headers;
 };
 
 struct S3RequestUtil {
-	static HTTPHeaders CreateHeaders(EncryptionUtil &encryption_util, const ParsedS3Url &parsed_url, string query,
-	                                 string method, const S3AuthParams &auth_params, string date_now = "",
-	                                 string datetime_now = "", string payload_hash = "", string content_type = "",
-	                                 string content_md5 = "");
+	static HTTPHeaders CreateHeaders(EncryptionUtil &encryption_util, const ParsedS3Url &parsed_url,
+	                                 const S3RequestQuery &query, RequestType request_type,
+	                                 const S3AuthParams &auth_params, string date_now = "", string datetime_now = "",
+	                                 string payload_hash = "", string content_type = "", string content_md5 = "");
 	static string GetPayloadHash(EncryptionUtil &encryption_util, const_data_ptr_t buffer, idx_t buffer_len);
 	static bool IsRequestTimeout(const HTTPResponse &response);
 
@@ -64,24 +90,20 @@ struct S3RequestUtil {
 };
 
 struct S3RequestExecutor {
-	using CreateDataCallback = std::function<S3RequestData()>;
 	using RequestCallback = std::function<unique_ptr<HTTPResponse>(S3RequestData &)>;
-	using RefreshCallback = std::function<bool(const S3RequestData &)>;
-	using SetRegionCallback = std::function<void(const S3RequestData &, const string &)>;
+	using CreateQueryCallback = std::function<S3RequestQuery(const ParsedS3Url &)>;
+	using RegionRedirectCallback = std::function<void(const S3RequestData &, const string &, const string &)>;
 
-	static unique_ptr<HTTPResponse> Run(const string &s3_url, const CreateDataCallback &create_data,
-	                                    bool transient_retry_eligible, const RequestCallback &request,
-	                                    const RefreshCallback &refresh_auth_params,
-	                                    const SetRegionCallback &set_region);
 	static unique_ptr<HTTPResponse> RunSession(EncryptionUtil &encryption_util, HTTPRequestSession &session,
-	                                           const string &s3_url, const string &method, const string &query_string,
-	                                           const string &payload_hash, const string &content_type,
-	                                           const string &content_md5, const RequestCallback &request);
+	                                           const string &s3_url, RequestType request_type, S3RequestTarget target,
+	                                           const CreateQueryCallback &create_query, const string &payload_hash,
+	                                           const string &content_type, const string &content_md5,
+	                                           const RequestCallback &request,
+	                                           const RegionRedirectCallback &region_redirect = {});
 	static unique_ptr<HTTPResponse> RunHandle(EncryptionUtil &encryption_util, S3FileHandle &handle,
-	                                          const string &s3_url, const string &method, const string &version_id,
+	                                          const string &s3_url, RequestType request_type, const string &version_id,
 	                                          const RequestCallback &request);
 
-	static bool TryRefreshSession(HTTPRequestSession &session, const S3RequestData &request_data);
 	static bool SetSessionRegion(HTTPRequestSession &session, const string &correct_region, string &previous_region);
 	static bool CredentialRefreshEnabled(optional_ptr<FileOpener> opener);
 	static S3RefreshableHTTPParams ReadRefreshableHTTPParams(optional_ptr<FileOpener> opener, const string &path);
@@ -95,12 +117,22 @@ struct S3RequestExecutor {
 	                                                  HTTPFSParams &params, BaseRequest &request);
 
 private:
+	using CreateDataCallback = std::function<S3RequestData()>;
+	using RefreshCallback = std::function<bool(const S3RequestData &)>;
+	using SetRegionCallback = std::function<void(const S3RequestData &, const string &)>;
+
+	static unique_ptr<HTTPResponse> Run(const string &s3_url, const CreateDataCallback &create_data,
+	                                    bool transient_retry_eligible, const RequestCallback &request,
+	                                    const RefreshCallback &refresh_auth_params,
+	                                    const SetRegionCallback &set_region);
+	static bool TryRefreshSession(HTTPRequestSession &session, const S3RequestData &request_data);
 	static S3RequestData CreateRequestData(EncryptionUtil &encryption_util, const CapturedHTTPRequestSnapshot &captured,
-	                                       const string &s3_url, const string &method, const string &query_string,
-	                                       const string &payload_hash = "", const string &content_type = "",
-	                                       const string &content_md5 = "");
+	                                       const string &s3_url, RequestType request_type, S3RequestTarget target,
+	                                       const CreateQueryCallback &create_query, const string &payload_hash = "",
+	                                       const string &content_type = "", const string &content_md5 = "");
 	static S3RequestData CreateHandleRequestData(EncryptionUtil &encryption_util, S3FileHandle &handle,
-	                                             const string &s3_url, const string &method, const string &version_id);
+	                                             const string &s3_url, RequestType request_type,
+	                                             const string &version_id);
 };
 
 } // namespace duckdb

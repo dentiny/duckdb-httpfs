@@ -85,12 +85,12 @@ public:
 	                                         data_ptr_t buffer_out, idx_t buffer_out_len) override;
 	unique_ptr<HTTPResponse> PostRequest(HTTPRequestSession &session, const string &s3_url, string &buffer_out,
 	                                     const_data_ptr_t buffer_in, idx_t buffer_in_len,
-	                                     const string &http_params = "",
+	                                     const S3RequestQuery &query = S3RequestQuery(),
 	                                     S3PostRequestMode mode = S3PostRequestMode::REPLAYABLE);
 	unique_ptr<HTTPResponse> PutRequest(HTTPRequestSession &session, const string &s3_url, const_data_ptr_t buffer_in,
-	                                    idx_t buffer_in_len, const string &http_params = "");
+	                                    idx_t buffer_in_len, const S3RequestQuery &query = S3RequestQuery());
 	unique_ptr<HTTPResponse> DeleteRequest(HTTPRequestSession &session, const string &s3_url,
-	                                       const string &http_params);
+	                                       const S3RequestQuery &query);
 	unique_ptr<HTTPResponse> DeleteRequest(FileHandle &handle, const string &s3_url, HTTPHeaders header_map) override;
 	HTTPException GetHTTPError(FileHandle &, const HTTPResponse &response, const string &url) override;
 

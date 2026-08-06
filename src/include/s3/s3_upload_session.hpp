@@ -14,6 +14,7 @@ namespace duckdb {
 
 class HTTPRequestSession;
 class S3FileSystem;
+struct S3RequestQuery;
 
 class S3UploadSession {
 private:
@@ -119,7 +120,7 @@ private:
 	shared_ptr<const string> EnsureMultipartUpload();
 	void PublishInitializationFailure(ErrorData error, FailureDisposition disposition) DUCKDB_EXCLUDES(state_lock);
 	string InitializeMultipartUpload();
-	string Upload(const_data_ptr_t data, idx_t size, const string &query_param);
+	string Upload(const_data_ptr_t data, idx_t size, const S3RequestQuery &query);
 	void UploadPart(PreparedPart &part);
 	void UploadSingle(BufferedPart &buffered_part);
 	void UploadEmpty();

@@ -195,4 +195,9 @@ string ParsedS3Url::GetHTTPUrl(const string &http_query_string) const {
 	return full_url;
 }
 
+string ParsedS3Url::GetBucketPath() const {
+	auto bucket_path = path.substr(0, path.length() - key.length());
+	return bucket_path.empty() ? "/" : bucket_path;
+}
+
 } // namespace duckdb

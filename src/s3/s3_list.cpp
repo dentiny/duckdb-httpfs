@@ -8,8 +8,6 @@
 #include "duckdb/logging/file_system_logger.hpp"
 #include "duckdb/logging/logger.hpp"
 
-#include <map>
-
 namespace duckdb {
 
 static bool Match(vector<string>::const_iterator key, vector<string>::const_iterator key_end,
@@ -267,27 +265,6 @@ bool S3FileSystem::ListFilesExtended(const string &directory, const std::functio
 }
 
 struct S3ListRequest {
-	static S3RequestData Create(EncryptionUtil &encryption_util, HTTPRequestSession &session, const string &path,
-	                            const string &continuation_token, bool use_delimiter, optional_idx max_keys) {
-		auto captured = session.Capture();
-		auto &snapshot = captured.snapshot->Cast<S3RequestSnapshot>();
-		auto auth_params = snapshot.auth_params;
-		auto parsed_url = S3Url::Parse(path, auth_params);
-		auto encoded_params = BuildParameters(parsed_url, continuation_token, use_delimiter, max_keys);
-
-		S3RequestData result;
-		result.captured = captured;
-		result.auth_params = std::move(auth_params);
-		result.http_params = snapshot.CreateRequestParams();
-		auto request_path = parsed_url.path.substr(0, parsed_url.path.length() - parsed_url.key.length());
-		result.http_url = parsed_url.http_proto + parsed_url.host + S3Url::Encode(request_path) + "?" + encoded_params;
-		parsed_url.path = std::move(request_path);
-		result.headers =
-		    S3RequestUtil::CreateHeaders(encryption_util, parsed_url, encoded_params, "GET", result.auth_params);
-		snapshot.AddConfiguredHeaders(result.headers);
-		return result;
-	}
-
 	static string Finish(HTTPRequestSession &session, const string &path, unique_ptr<HTTPResponse> response) {
 		if (response->HasRequestError()) {
 			throw IOException("%s error for HTTP GET to '%s'", response->GetRequestError(), path);
@@ -302,56 +279,45 @@ struct S3ListRequest {
 		return std::move(response->body);
 	}
 
-private:
-	static string BuildParameters(const ParsedS3Url &parsed_url, const string &continuation_token, bool use_delimiter,
-	                              optional_idx max_keys) {
-		map<string, string> request_params;
+	static S3RequestQuery BuildQuery(const ParsedS3Url &parsed_url, const string &continuation_token,
+	                                 bool use_delimiter, optional_idx max_keys) {
+		vector<pair<string, string>> request_params;
 		if (!continuation_token.empty()) {
-			request_params["continuation-token"] = S3Url::Encode(continuation_token, true);
+			request_params.emplace_back("continuation-token", continuation_token);
 		}
 		if (use_delimiter) {
-			request_params["delimiter"] = "%2F";
+			request_params.emplace_back("delimiter", "/");
 		}
-		request_params["encoding-type"] = "url";
-		request_params["list-type"] = "2";
+		request_params.emplace_back("encoding-type", "url");
+		request_params.emplace_back("list-type", "2");
 		if (max_keys.IsValid()) {
-			request_params["max-keys"] = to_string(max_keys.GetIndex());
+			request_params.emplace_back("max-keys", to_string(max_keys.GetIndex()));
 		}
-		request_params["prefix"] = S3Url::Encode(parsed_url.key, true);
-
-		string result;
-		for (const auto &param : request_params) {
-			result += param.first + "=" + param.second + "&";
-		}
-		result.pop_back();
-		return result;
+		request_params.emplace_back("prefix", parsed_url.key);
+		return S3RequestQuery(std::move(request_params));
 	}
 };
 
 string AWSListObjectV2::Request(EncryptionUtil &encryption_util, HTTPRequestSession &session, const string &path,
                                 const string &continuation_token, bool use_delimiter, optional_idx max_keys) {
-	auto response = S3RequestExecutor::Run(
-	    path,
-	    [&]() {
-		    return S3ListRequest::Create(encryption_util, session, path, continuation_token, use_delimiter, max_keys);
+	auto response = S3RequestExecutor::RunSession(
+	    encryption_util, session, path, RequestType::GET_REQUEST, S3RequestTarget::BUCKET,
+	    [&](const ParsedS3Url &parsed_url) {
+		    return S3ListRequest::BuildQuery(parsed_url, continuation_token, use_delimiter, max_keys);
 	    },
-	    true,
+	    "", "", "",
 	    [&](S3RequestData &request_data) {
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
 		    GetRequestInfo get_request(request_data.http_url, request_data.headers, params, nullptr, nullptr);
 		    return S3RequestExecutor::SendSessionRequest(session, request_data.captured, params, get_request);
 	    },
-	    [&](const S3RequestData &request_data) { return S3RequestExecutor::TryRefreshSession(session, request_data); },
-	    [&](const S3RequestData &request_data, const string &correct_region) {
-		    string previous_region;
-		    if (S3RequestExecutor::SetSessionRegion(session, correct_region, previous_region)) {
-			    auto &params = request_data.http_params->Cast<HTTPFSParams>();
-			    DUCKDB_LOG_WARNING(
-			        params.logger,
-			        "Ran S3 glob \"%s\" from incorrect region \"%s\" - retrying with updated region \"%s\".\n"
-			        "Consider setting the S3 region to this explicitly to avoid extra round-trips.",
-			        path, previous_region, correct_region);
-		    }
+	    [&](const S3RequestData &request_data, const string &previous_region, const string &correct_region) {
+		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
+		    DUCKDB_LOG_WARNING(
+		        params.logger,
+		        "Ran S3 glob \"%s\" from incorrect region \"%s\" - retrying with updated region \"%s\".\n"
+		        "Consider setting the S3 region to this explicitly to avoid extra round-trips.",
+		        path, previous_region, correct_region);
 	    });
 	return S3ListRequest::Finish(session, path, std::move(response));
 }

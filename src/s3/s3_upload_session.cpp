@@ -235,9 +235,9 @@ void S3UploadSession::FailOperation(ErrorData error, FailureDisposition disposit
 }
 
 shared_ptr<const ErrorData> S3UploadSession::AbortMultipartUpload(const string &upload_id) {
-	auto query_param = "uploadId=" + S3Url::Encode(upload_id, true);
+	S3RequestQuery query {{"uploadId", upload_id}};
 	try {
-		auto response = s3fs.get().DeleteRequest(*request_session, path, query_param);
+		auto response = s3fs.get().DeleteRequest(*request_session, path, query);
 		if (response->status == HTTPStatusCode::NoContent_204) {
 			return nullptr;
 		}
@@ -346,7 +346,7 @@ S3UploadSession::PreparedWrite S3UploadSession::PrepareWrite(const_data_ptr_t da
 string S3UploadSession::InitializeMultipartUpload() {
 	string result;
 	auto response = s3fs.get().PostRequest(*request_session, path, result, nullptr, 0,
-	                                       "uploads=", S3PostRequestMode::NON_REPLAYABLE);
+	                                       S3RequestQuery({{"uploads", ""}}), S3PostRequestMode::NON_REPLAYABLE);
 	if (response->HasRequestError()) {
 		throw S3AmbiguousUploadException(StringUtil::Format(
 		    "S3 multipart upload initialization for \"%s\" has an unknown outcome because the response was not "
@@ -450,8 +450,8 @@ void S3UploadSession::ThrowIfFailed() DUCKDB_EXCLUDES(state_lock) {
 	}
 }
 
-string S3UploadSession::Upload(const_data_ptr_t data, idx_t size, const string &query_param) {
-	auto response = s3fs.get().PutRequest(*request_session, path, data, size, query_param);
+string S3UploadSession::Upload(const_data_ptr_t data, idx_t size, const S3RequestQuery &query) {
+	auto response = s3fs.get().PutRequest(*request_session, path, data, size, query);
 	if (response->HasRequestError()) {
 		throw IOException("S3 upload request for \"%s\" could not be completed", GetDisplayPath());
 	}
@@ -470,8 +470,8 @@ void S3UploadSession::UploadPart(PreparedPart &part) {
 	auto upload_id = EnsureMultipartUpload();
 	ThrowIfFailed();
 	D_ASSERT(upload_id);
-	auto query_param = "partNumber=" + to_string(part.part_number) + "&uploadId=" + S3Url::Encode(*upload_id, true);
-	auto etag = Upload(part.data, part.size, query_param);
+	S3RequestQuery query {{"partNumber", to_string(part.part_number)}, {"uploadId", *upload_id}};
+	auto etag = Upload(part.data, part.size, query);
 	StorePartETag(part.part_number, std::move(etag));
 }
 
@@ -494,12 +494,12 @@ void S3UploadSession::StorePartETag(idx_t part_number, string etag) DUCKDB_EXCLU
 }
 
 void S3UploadSession::UploadSingle(BufferedPart &buffered_part_p) {
-	Upload(buffered_part_p.Ptr(), buffered_part_p.size, string());
+	Upload(buffered_part_p.Ptr(), buffered_part_p.size, S3RequestQuery());
 }
 
 void S3UploadSession::UploadEmpty() {
 	const_data_ptr_t empty = nullptr;
-	Upload(empty, 0, string());
+	Upload(empty, 0, S3RequestQuery());
 }
 
 S3UploadSession::MultipartSnapshot S3UploadSession::GetMultipartSnapshot() DUCKDB_EXCLUDES(state_lock) {
@@ -526,9 +526,9 @@ void S3UploadSession::CompleteMultipartUpload() {
 	auto completion_body = body.str();
 
 	string result;
-	auto query_param = "uploadId=" + S3Url::Encode(*snapshot.upload_id, true);
+	S3RequestQuery query {{"uploadId", *snapshot.upload_id}};
 	auto response = s3fs.get().PostRequest(*request_session, path, result, const_data_ptr_cast(completion_body.data()),
-	                                       completion_body.size(), query_param, S3PostRequestMode::NON_REPLAYABLE);
+	                                       completion_body.size(), query, S3PostRequestMode::NON_REPLAYABLE);
 	if (response->HasRequestError()) {
 		throw S3AmbiguousUploadException(StringUtil::Format(
 		    "S3 multipart upload completion for \"%s\" has an unknown outcome because the response was not received; "

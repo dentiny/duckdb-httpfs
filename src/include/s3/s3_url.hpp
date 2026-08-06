@@ -15,6 +15,7 @@ struct ParsedS3Url {
 	string trimmed_s3_url;
 
 	string GetHTTPUrl(const string &http_query_string = "") const;
+	string GetBucketPath() const;
 };
 
 struct S3Url {
