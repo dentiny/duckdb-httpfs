@@ -85,7 +85,7 @@ SELECT COUNT(*) FROM 's3://test-bucket-public/root-dir/metadata_cache/etag_misma
 10
 
 statement ok
-COPY (SELECT * from range(0,25) tbl(i)) TO 's3://test-bucket-public/root-dir/metadata_cache/etag_mismatch.parquet?s3_access_key_id=${AWS_ACCESS_KEY_ID}&s3_secret_access_key=${AWS_SECRET_ACCESS_KEY}' (FORMAT PARQUET);
+COPY (SELECT * from range(0,25) tbl(i)) TO 's3://test-bucket-public/root-dir/metadata_cache/etag_mismatch.parquet?s3_access_key_id={AWS_ACCESS_KEY_ID}&s3_secret_access_key={AWS_SECRET_ACCESS_KEY}' (FORMAT PARQUET);
 
 statement error
 SELECT COUNT(*) FROM 's3://test-bucket-public/root-dir/metadata_cache/etag_mismatch.parquet';
