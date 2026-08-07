@@ -85,40 +85,10 @@ jobs:
           sudo ./scripts/install_s3_test_server.sh
           ./scripts/generate_presigned_url.sh
 
-      - name: Run tests with dynamically loaded extensions
+      - name: Run tests
         shell: bash
         run: |
-          source ./scripts/run_s3_test_server.sh
-          source ./scripts/set_s3_test_server_variables.sh
-          ./build/release/test/unittest "*" --test-config test/configs/httpfs_dynamic.json
-
-      - name: Run tests with extension autoloading
-        shell: bash
-        run: |
-          source ./scripts/run_s3_test_server.sh
-          source ./scripts/set_s3_test_server_variables.sh
-          ./build/release/test/unittest "*" --test-config test/configs/httpfs_autoloading.json
-
-      - name: Run tests with statically loaded extensions (curl)
-        shell: bash
-        run: |
-          source ./scripts/run_s3_test_server.sh
-          source ./scripts/set_s3_test_server_variables.sh
-          ./build/release/test/unittest "*" --test-config test/configs/httpfs_curl.json
-
-      - name: Run tests with statically loaded extensions (httplib)
-        shell: bash
-        run: |
-          source ./scripts/run_s3_test_server.sh
-          source ./scripts/set_s3_test_server_variables.sh
-          ./build/release/test/unittest "*" --test-config test/configs/httpfs_httplib.json
-
-      - name: Run tests with statically loaded extensions (curl connection caching)
-        shell: bash
-        run: |
-          source ./scripts/run_s3_test_server.sh
-          source ./scripts/set_s3_test_server_variables.sh
-          ./build/release/test/unittest "*" --test-config test/configs/httpfs_connection_caching.json
+          make test_minio
 
       - name: Stop test server
         if: always()
