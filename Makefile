@@ -26,4 +26,6 @@ MINIO_TEST_CONFIGS := \
 
 .PHONY: test_minio
 test_minio:
-	scripts/with_s3_test_server.sh build/release/test/run "*" $(foreach config,$(MINIO_TEST_CONFIGS),--test-config $(PROJ_DIR)$(config))
+	@set -e; for config in $(MINIO_TEST_CONFIGS); do \
+		scripts/with_s3_test_server.sh build/release/test/run "*" --test-config "$(PROJ_DIR)$$config"; \
+	done
