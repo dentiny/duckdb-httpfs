@@ -19,15 +19,12 @@ static const array<S3ProviderMatch, 6> &ProviderMatches() {
 }
 
 namespace {
-//! Additional URL schemes routed to the S3-compatible filesystem, configured
-//! via the 's3_compatible_url_schemes' setting (e.g. "oss://", "cos://").
 mutex custom_scheme_lock;
 vector<string> custom_url_schemes;
 } // namespace
 
 string S3Provider::SetCustomUrlSchemes(const string &schemes_csv) {
-	//! Schemes already claimed by built-in filesystems or well-known extensions (e.g. azure); allowing these would
-	//! hijack their routing
+	// Claimed by built-in filesystems or well-known extensions; registering them would hijack their routing
 	static const vector<string> reserved_schemes = {"s3://", "s3a://",   "s3n://",   "gcs://", "gs://",
 	                                                "r2://", "http://",  "https://", "hf://",  "file://",
 	                                                "az://", "azure://", "abfss://", "abfs://"};
@@ -84,7 +81,7 @@ optional<S3ProviderMatch> S3Provider::TryMatchUrl(const string &url) {
 			return provider_match;
 		}
 	}
-	// Custom schemes registered via 's3_compatible_url_schemes' are served by the plain S3 provider
+	// Custom schemes are served by the plain S3 provider
 	for (auto &prefix : GetCustomUrlSchemes()) {
 		if (StringUtil::StartsWith(lower_url, prefix)) {
 			return S3ProviderMatch {S3ProviderType::S3, prefix};

@@ -133,7 +133,7 @@ void S3Settings::Register(DBConfig &config) {
 			                                "s3_compatible_url_schemes = '%s'",
 			                                parameter.ToString());
 		    }
-		    // Store the normalized form (lowercased, deduplicated, '://'-suffixed) as the setting value
+		    // Store the normalized value
 		    parameter = Value(S3Provider::SetCustomUrlSchemes(parameter.ToString()));
 	    },
 	    SetScope::GLOBAL);

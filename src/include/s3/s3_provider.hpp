@@ -29,9 +29,8 @@ struct S3Provider {
 	static optional<S3ProviderMatch> TryMatchUrl(const string &url);
 	static S3ProviderMatch MatchUrl(const string &url);
 
-	//! Configure additional URL schemes routed to the S3-compatible filesystem
-	//! (set via the 's3_compatible_url_schemes' setting, e.g. "oss, cos").
-	//! Returns the normalized scheme list (lowercased, deduplicated, '://'-suffixed).
+	//! Extra URL schemes routed to the S3 filesystem ('s3_compatible_url_schemes' setting).
+	//! Returns the normalized value that should be stored for the setting.
 	static string SetCustomUrlSchemes(const string &schemes_csv);
 	static vector<string> GetCustomUrlSchemes();
 
