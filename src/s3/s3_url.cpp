@@ -103,21 +103,22 @@ string S3Url::GetDisplayUrl(const string &url, const S3AuthParams &params) {
 	return query_position == string::npos ? url : url.substr(0, query_position);
 }
 
-string S3Url::TryGetPrefix(const string &url) {
-	auto provider_match = S3Provider::TryMatchUrl(url);
-	return provider_match ? provider_match->prefix : string();
-}
-
-string S3Url::GetPrefix(const string &url) {
-	return S3Provider::MatchUrl(url).prefix;
-}
-
 ParsedS3Url S3Url::Parse(const string &url, const S3AuthParams &params) {
 	string http_proto, prefix, host, bucket, key, path, query_param, trimmed_s3_url;
 
-	auto provider_match = S3Provider::MatchUrl(url);
-	D_ASSERT(provider_match.type == params.provider_type);
-	prefix = std::move(provider_match.prefix);
+	auto provider_match = S3Provider::TryMatchUrl(url);
+	if (provider_match) {
+		D_ASSERT(provider_match->type == params.provider_type);
+		prefix = std::move(provider_match->prefix);
+	} else {
+		// Alias-routed url: the caller already matched it against 's3_url_scheme_aliases'
+		D_ASSERT(params.provider_type == S3ProviderType::S3);
+		auto scheme_end = url.find("://");
+		if (scheme_end == string::npos) {
+			S3Provider::MatchUrl(url); // throws with the expected-prefixes message
+		}
+		prefix = StringUtil::Lower(url.substr(0, scheme_end + 3));
+	}
 	auto prefix_end_pos = url.find("//") + 2;
 	auto slash_pos = url.find('/', prefix_end_pos);
 	if (slash_pos == string::npos) {

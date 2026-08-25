@@ -2,8 +2,10 @@
 
 #include "s3/s3_auth.hpp"
 
-#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/extension_entries.hpp"
 #include "duckdb/main/secret/secret.hpp"
 
 #include <algorithm>
@@ -18,48 +20,88 @@ static const array<S3ProviderMatch, 6> &ProviderMatches() {
 	return provider_matches;
 }
 
-namespace {
-mutex custom_scheme_lock;
-vector<string> custom_url_schemes;
-} // namespace
-
-string S3Provider::SetCustomUrlSchemes(const string &schemes_csv) {
-	// Claimed by built-in filesystems or well-known extensions; registering them would hijack their routing
-	static const vector<string> reserved_schemes = {"s3://", "s3a://",   "s3n://",   "gcs://", "gs://",
-	                                                "r2://", "http://",  "https://", "hf://",  "file://",
-	                                                "az://", "azure://", "abfss://", "abfs://"};
-	vector<string> result;
-	for (auto &scheme : StringUtil::Split(schemes_csv, ',')) {
-		auto trimmed = StringUtil::Lower(scheme);
-		StringUtil::Trim(trimmed);
-		if (trimmed.empty()) {
-			continue;
+static bool SchemeIsReserved(const string &scheme) {
+	auto prefix = scheme + "://";
+	for (const auto &provider_match : ProviderMatches()) {
+		if (prefix == provider_match.prefix) {
+			return true;
 		}
-		// Accept both 'oss' and 'oss://'
-		if (!StringUtil::EndsWith(trimmed, "://")) {
-			trimmed += "://";
-		}
-		for (auto &reserved : reserved_schemes) {
-			if (trimmed == reserved) {
-				throw InvalidInputException("Scheme '%s' is already handled by a built-in filesystem and cannot be "
-				                            "added to 's3_compatible_url_schemes'",
-				                            trimmed);
-			}
-		}
-		if (std::find(result.begin(), result.end(), trimmed) != result.end()) {
-			continue;
-		}
-		result.push_back(std::move(trimmed));
 	}
-	auto normalized = StringUtil::Join(result, ",");
-	lock_guard<mutex> guard(custom_scheme_lock);
-	custom_url_schemes = std::move(result);
-	return normalized;
+	// Schemes core maps to an extension, so an alias cannot keep that extension from being autoloaded
+	for (const auto &entry : EXTENSION_FILE_PREFIXES) {
+		if (prefix == entry.name) {
+			return true;
+		}
+	}
+	// Schemes that table misses: 'file' is the VFS fallback the core registry does not list, and the
+	// azure extension serves 'abfs' alongside the 'abfss' the table does list
+	return scheme == "file" || scheme == "abfs";
 }
 
-vector<string> S3Provider::GetCustomUrlSchemes() {
-	lock_guard<mutex> guard(custom_scheme_lock);
-	return custom_url_schemes;
+static bool SchemeSyntaxIsValid(const string &scheme) {
+	if (scheme.empty() || !StringUtil::CharacterIsAlpha(scheme[0])) {
+		return false;
+	}
+	for (idx_t i = 1; i < scheme.size(); i++) {
+		if (!StringUtil::CharacterIsAlphaNumeric(scheme[i]) && scheme[i] != '+' && scheme[i] != '-' &&
+		    scheme[i] != '.') {
+			return false;
+		}
+	}
+	return true;
+}
+
+Value S3Provider::NormalizeSchemeAliases(const Value &aliases) {
+	vector<Value> normalized;
+	vector<string> seen;
+	if (aliases.IsNull()) {
+		return Value::LIST(LogicalType::VARCHAR, std::move(normalized));
+	}
+	for (auto &element : ListValue::GetChildren(aliases)) {
+		if (element.IsNull()) {
+			throw InvalidInputException("s3_url_scheme_aliases does not accept NULL elements");
+		}
+		auto alias = StringUtil::Lower(element.ToString());
+		StringUtil::Trim(alias);
+		if (!SchemeSyntaxIsValid(alias)) {
+			throw InvalidInputException("Invalid URL scheme alias '%s': provide bare scheme names such as 'oss'",
+			                            element.ToString());
+		}
+		if (SchemeIsReserved(alias)) {
+			throw InvalidInputException(
+			    "Scheme '%s' is already handled by a built-in filesystem and cannot be added to "
+			    "'s3_url_scheme_aliases'",
+			    alias);
+		}
+		if (std::find(seen.begin(), seen.end(), alias) != seen.end()) {
+			continue;
+		}
+		seen.push_back(alias);
+		normalized.emplace_back(std::move(alias));
+	}
+	return Value::LIST(LogicalType::VARCHAR, std::move(normalized));
+}
+
+vector<string> S3Provider::GetSchemeAliasPrefixes(const DBConfig &config) {
+	Value value;
+	if (!config.TryGetCurrentSetting("s3_url_scheme_aliases", value) || value.IsNull() ||
+	    value.type().id() != LogicalTypeId::LIST) {
+		return {};
+	}
+	vector<string> result;
+	for (auto &element : ListValue::GetChildren(value)) {
+		if (element.IsNull()) {
+			continue;
+		}
+		// Values that were stored without going through the setting callback are filtered here rather
+		// than trusted: a reserved scheme would otherwise hijack the filesystem that owns it
+		auto alias = StringUtil::Lower(element.ToString());
+		if (!SchemeSyntaxIsValid(alias) || SchemeIsReserved(alias)) {
+			continue;
+		}
+		result.push_back(alias + "://");
+	}
+	return result;
 }
 
 const array<const char *, 4> &S3Provider::SecretTypes() {
@@ -81,8 +123,17 @@ optional<S3ProviderMatch> S3Provider::TryMatchUrl(const string &url) {
 			return provider_match;
 		}
 	}
-	// Custom schemes are served by the plain S3 provider
-	for (auto &prefix : GetCustomUrlSchemes()) {
+	return {};
+}
+
+optional<S3ProviderMatch> S3Provider::TryMatchUrl(const string &url, const vector<string> &scheme_alias_prefixes) {
+	auto provider_match = TryMatchUrl(url);
+	if (provider_match) {
+		return provider_match;
+	}
+	// Aliased schemes are served by the plain S3 provider
+	auto lower_url = StringUtil::Lower(url);
+	for (auto &prefix : scheme_alias_prefixes) {
 		if (StringUtil::StartsWith(lower_url, prefix)) {
 			return S3ProviderMatch {S3ProviderType::S3, prefix};
 		}
@@ -97,7 +148,7 @@ S3ProviderMatch S3Provider::MatchUrl(const string &url) {
 		for (const auto &entry : ProviderMatches()) {
 			prefixes.push_back(entry.prefix);
 		}
-		throw IOException("URL needs to start with %s (or a scheme listed in the 's3_compatible_url_schemes' setting)",
+		throw IOException("URL needs to start with %s (or a scheme listed in the 's3_url_scheme_aliases' setting)",
 		                  StringUtil::Join(prefixes, ", "));
 	}
 	return *provider_match;
@@ -105,11 +156,7 @@ S3ProviderMatch S3Provider::MatchUrl(const string &url) {
 
 vector<string> S3Provider::DefaultSecretScope(const string &secret_type) {
 	if (secret_type == "s3") {
-		vector<string> scope {"s3://", "s3n://", "s3a://"};
-		for (auto &scheme : GetCustomUrlSchemes()) {
-			scope.push_back(scheme);
-		}
-		return scope;
+		return {"s3://", "s3n://", "s3a://"};
 	}
 	if (secret_type == "r2") {
 		return {"r2://"};
@@ -157,7 +204,10 @@ bool S3Provider::TryApplySecretOption(const CreateSecretInput &input, const stri
 }
 
 void S3Provider::ReadAuthParams(S3KeyValueReader &secret_reader, const string &file_path, S3AuthParams &result) {
-	result.provider_type = MatchUrl(file_path).type;
+	// Routing already accepted the path, so a non-built-in scheme is an alias served by plain S3
+	auto provider_match = TryMatchUrl(file_path);
+	result.provider_type = provider_match ? provider_match->type : S3ProviderType::S3;
+	result.scheme_is_alias = !provider_match;
 	secret_reader.TryGetSecretKeyOrSetting("region", "s3_region", result.region);
 	secret_reader.TryGetSecretKeyOrSetting("key_id", "s3_access_key_id", result.access_key_id);
 	secret_reader.TryGetSecretKeyOrSetting("secret", "s3_secret_access_key", result.secret_access_key);
@@ -199,6 +249,16 @@ void S3Provider::InitializeAuthParams(S3AuthParams &auth_params) {
 		}
 	} else if (auth_params.provider_type == S3ProviderType::R2 && auth_params.endpoint.empty()) {
 		throw IOException("R2 requires an endpoint; provide account_id in the secret or s3_endpoint in the URL");
+	}
+	if (auth_params.scheme_is_alias) {
+		// An alias means the store is not AWS, so never let a blank endpoint reach the AWS defaults below.
+		// This runs after url query parameters are applied, which can clear an endpoint read from a secret.
+		auto endpoint = auth_params.endpoint;
+		StringUtil::Trim(endpoint);
+		if (endpoint.empty()) {
+			throw IOException("An aliased URL scheme requires an endpoint; provide ENDPOINT in the secret or set "
+			                  "s3_endpoint");
+		}
 	}
 	if (!EndpointIsAWS(auth_params.endpoint)) {
 		return;

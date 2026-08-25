@@ -7,6 +7,7 @@
 namespace duckdb {
 
 class CreateSecretFunction;
+struct DBConfig;
 class KeyValueSecret;
 class Value;
 struct CreateSecretInput;
@@ -27,12 +28,13 @@ struct S3Provider {
 	static const array<const char *, 12> &CredentialMaterialKeys();
 
 	static optional<S3ProviderMatch> TryMatchUrl(const string &url);
+	static optional<S3ProviderMatch> TryMatchUrl(const string &url, const vector<string> &scheme_alias_prefixes);
 	static S3ProviderMatch MatchUrl(const string &url);
 
-	//! Extra URL schemes routed to the S3 filesystem ('s3_compatible_url_schemes' setting).
-	//! Returns the normalized value that should be stored for the setting.
-	static string SetCustomUrlSchemes(const string &schemes_csv);
-	static vector<string> GetCustomUrlSchemes();
+	//! Validate and normalize the 's3_url_scheme_aliases' value (bare scheme names, lowercased, deduplicated)
+	static Value NormalizeSchemeAliases(const Value &aliases);
+	//! The database's configured scheme aliases as '<scheme>://' prefixes
+	static vector<string> GetSchemeAliasPrefixes(const DBConfig &config);
 
 	static vector<string> DefaultSecretScope(const string &secret_type);
 	static void SetSecretNamedParameters(const string &secret_type, CreateSecretFunction &function);

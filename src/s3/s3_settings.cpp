@@ -123,18 +123,16 @@ void S3Settings::Register(DBConfig &config) {
 	                          LogicalType::BOOLEAN, Value(false));
 	config.AddExtensionOption("s3_requester_pays", "S3 use requester pays mode", LogicalType::BOOLEAN, Value(false));
 	config.AddExtensionOption(
-	    "s3_compatible_url_schemes",
-	    "Comma-separated list of additional URL schemes routed to the S3-compatible filesystem (e.g. 'oss, cos'). "
-	    "Can only be set globally.",
-	    LogicalType::VARCHAR, Value(""),
+	    "s3_url_scheme_aliases",
+	    "Additional URL schemes routed to the S3-compatible filesystem (e.g. ['oss', 'cos']). "
+	    "Can only be set globally; secrets for aliased schemes need an explicit SCOPE.",
+	    LogicalType::LIST(LogicalType::VARCHAR), Value::LIST(LogicalType::VARCHAR, vector<Value>()),
 	    [](ClientContext &context, SetScope scope, Value &parameter) {
 		    if (scope == SetScope::SESSION || scope == SetScope::LOCAL) {
-			    throw InvalidInputException("s3_compatible_url_schemes can only be set globally: SET GLOBAL "
-			                                "s3_compatible_url_schemes = '%s'",
-			                                parameter.ToString());
+			    throw InvalidInputException("s3_url_scheme_aliases can only be set globally");
 		    }
-		    // Store the normalized value
-		    parameter = Value(S3Provider::SetCustomUrlSchemes(parameter.ToString()));
+		    // Validate only: routing reads the stored value from DBConfig
+		    parameter = S3Provider::NormalizeSchemeAliases(parameter);
 	    },
 	    SetScope::GLOBAL);
 	config.AddExtensionOption(
