@@ -239,27 +239,31 @@ static bool EndpointIsAWS(const string &endpoint) {
 	return StringUtil::StartsWith(endpoint, "s3.") && StringUtil::EndsWith(endpoint, ".amazonaws.com");
 }
 
-void S3Provider::InitializeAuthParams(S3AuthParams &auth_params) {
-	if (auth_params.provider_type == S3ProviderType::GCS) {
-		if (auth_params.endpoint.empty()) {
-			auth_params.endpoint = "storage.googleapis.com";
-		}
-		if (auth_params.url_style.empty()) {
-			auth_params.url_style = "path";
-		}
-	} else if (auth_params.provider_type == S3ProviderType::R2 && auth_params.endpoint.empty()) {
-		throw IOException("R2 requires an endpoint; provide account_id in the secret or s3_endpoint in the URL");
+//! Not AWS, so deriving an AWS endpoint would sign a request to the wrong host
+static bool RequiresExplicitEndpoint(const S3AuthParams &auth_params) {
+	return auth_params.scheme_is_alias || auth_params.provider_type == S3ProviderType::R2;
+}
+
+static bool EndpointIsUnresolved(const S3AuthParams &auth_params) {
+	auto endpoint = auth_params.endpoint;
+	StringUtil::Trim(endpoint);
+	return endpoint.empty();
+}
+
+//! Re-applied in both phases: url query parameters can clear these between them
+static void ApplyProviderDefaults(S3AuthParams &auth_params) {
+	if (auth_params.provider_type != S3ProviderType::GCS) {
+		return;
 	}
-	if (auth_params.scheme_is_alias) {
-		// An alias means the store is not AWS, so never let a blank endpoint reach the AWS defaults below.
-		// This runs after url query parameters are applied, which can clear an endpoint read from a secret.
-		auto endpoint = auth_params.endpoint;
-		StringUtil::Trim(endpoint);
-		if (endpoint.empty()) {
-			throw IOException("An aliased URL scheme requires an endpoint; provide ENDPOINT in the secret or set "
-			                  "s3_endpoint");
-		}
+	if (auth_params.endpoint.empty()) {
+		auth_params.endpoint = "storage.googleapis.com";
 	}
+	if (auth_params.url_style.empty()) {
+		auth_params.url_style = "path";
+	}
+}
+
+static void ApplyDerivedDefaults(S3AuthParams &auth_params) {
 	if (!EndpointIsAWS(auth_params.endpoint)) {
 		return;
 	}
@@ -271,6 +275,27 @@ void S3Provider::InitializeAuthParams(S3AuthParams &auth_params) {
 		auth_params.region = "us-east-1";
 	}
 	auth_params.endpoint = StringUtil::Format("s3.%s.amazonaws.com", auth_params.region);
+}
+
+void S3Provider::InitializeAuthParams(S3AuthParams &auth_params) {
+	ApplyProviderDefaults(auth_params);
+	if (RequiresExplicitEndpoint(auth_params) && EndpointIsUnresolved(auth_params)) {
+		// Url query parameters still get to supply one; FinalizeAuthParams rejects it if none did
+		return;
+	}
+	ApplyDerivedDefaults(auth_params);
+}
+
+void S3Provider::FinalizeAuthParams(S3AuthParams &auth_params) {
+	ApplyProviderDefaults(auth_params);
+	if (RequiresExplicitEndpoint(auth_params) && EndpointIsUnresolved(auth_params)) {
+		if (auth_params.provider_type == S3ProviderType::R2) {
+			throw IOException("R2 requires an endpoint; provide account_id in the secret or s3_endpoint in the URL");
+		}
+		throw IOException("An aliased URL scheme requires an endpoint; provide ENDPOINT in the secret, set "
+		                  "s3_endpoint, or pass s3_endpoint in the URL");
+	}
+	ApplyDerivedDefaults(auth_params);
 }
 
 S3AuthType S3Provider::GetAuthType(const S3AuthParams &auth_params) {

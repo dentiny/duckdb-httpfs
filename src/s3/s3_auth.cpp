@@ -54,7 +54,7 @@ S3AuthParams S3AuthParams::ReadFrom(S3KeyValueReader &secret_reader, const strin
 
 void S3AuthParams::SetRegion(string new_region) {
 	region = std::move(new_region);
-	S3Provider::InitializeAuthParams(*this);
+	S3Provider::FinalizeAuthParams(*this);
 }
 
 bool S3AuthParams::operator==(const S3AuthParams &other) const {

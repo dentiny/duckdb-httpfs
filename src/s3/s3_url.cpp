@@ -90,8 +90,9 @@ void S3Url::ReadQueryParams(const string &url_query_param, S3AuthParams &params)
 
 ParsedS3Url S3Url::Resolve(const string &url, S3AuthParams &params) {
 	auto parsed_url = Parse(url, params);
+	// The last source of an endpoint, so validation happens after it
 	ReadQueryParams(parsed_url.query_param, params);
-	S3Provider::InitializeAuthParams(params);
+	S3Provider::FinalizeAuthParams(params);
 	return Parse(url, params);
 }
 
