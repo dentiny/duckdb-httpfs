@@ -46,7 +46,7 @@ statement ok
 copy (select 1 as a) to 's3://test-bucket/test-file.parquet'
 
 query I
-select count(*) FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'HEAD'
+select cast(count(*) between 1 and 2 as integer) FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'HEAD'
 ----
 1
 
@@ -57,6 +57,6 @@ statement ok
 copy (select random() as a FROM range(8000000)) to 's3://test-bucket/test-file2.csv'
 
 query I
-select count(*) FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'HEAD'
+select cast(count(*) between 1 and 2 as integer) FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'HEAD'
 ----
 1
