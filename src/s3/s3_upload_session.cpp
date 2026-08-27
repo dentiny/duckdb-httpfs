@@ -87,11 +87,14 @@ void S3UploadSession::BeginWriteOperation() DUCKDB_EXCLUDES(state_lock) {
 		}
 		if (primary_failure.primary_error) {
 			failure = CaptureFailure();
-		} else if (finalizing) {
+		} else if (lifecycle_state == LifecycleState::ABORTING || lifecycle_state == LifecycleState::ABORTED) {
+			error_message = "Cannot write to an aborted S3 upload";
+		} else if (lifecycle_state == LifecycleState::FINALIZING) {
 			error_message = "Concurrent S3 upload operations are not supported";
-		} else if (finalized) {
+		} else if (lifecycle_state == LifecycleState::FINALIZED) {
 			error_message = "Cannot write to a finalized S3 upload";
 		} else {
+			D_ASSERT(lifecycle_state == LifecycleState::ACTIVE);
 			active_operations++;
 		}
 	}
@@ -116,12 +119,15 @@ unique_ptr<S3UploadSession::BufferedPart> S3UploadSession::BeginFinalize(bool &a
 		}
 		if (primary_failure.primary_error) {
 			failure = CaptureFailure();
-		} else if (finalizing || active_operations > 0) {
+		} else if (lifecycle_state == LifecycleState::ABORTING || lifecycle_state == LifecycleState::ABORTED) {
+			error_message = "Cannot finalize an aborted S3 upload";
+		} else if (lifecycle_state == LifecycleState::FINALIZING || active_operations > 0) {
 			error_message = "Concurrent S3 upload operations are not supported";
-		} else if (finalized) {
+		} else if (lifecycle_state == LifecycleState::FINALIZED) {
 			already_finalized = true;
 		} else {
-			finalizing = true;
+			D_ASSERT(lifecycle_state == LifecycleState::ACTIVE);
+			lifecycle_state = LifecycleState::FINALIZING;
 			active_operations++;
 			result = std::move(buffered_part);
 		}
@@ -148,11 +154,10 @@ void S3UploadSession::ReleaseWriteNoThrow() noexcept DUCKDB_EXCLUDES(state_lock)
 
 void S3UploadSession::FinishFinalize() DUCKDB_EXCLUDES(state_lock) {
 	annotated_lock_guard<annotated_mutex> guard(state_lock);
-	D_ASSERT(finalizing);
+	D_ASSERT(lifecycle_state == LifecycleState::FINALIZING);
 	D_ASSERT(active_operations == 1);
 	active_operations--;
-	finalizing = false;
-	finalized = true;
+	lifecycle_state = LifecycleState::FINALIZED;
 	state_changed.notify_all();
 }
 
@@ -165,7 +170,9 @@ void S3UploadSession::LatchFailureLocked(shared_ptr<const ErrorData> error, Fail
 	if (disposition == FailureDisposition::AMBIGUOUS) {
 		abort_suppressed = true;
 	}
-	finalizing = false;
+	if (lifecycle_state == LifecycleState::FINALIZING) {
+		lifecycle_state = LifecycleState::ACTIVE;
+	}
 	state_changed.notify_all();
 }
 
@@ -633,6 +640,71 @@ void S3UploadSession::Finalize() {
 	} catch (std::exception &ex) {
 		FailOperation(ErrorData(ex), FailureDisposition::DEFINITIVE);
 	}
+}
+
+bool S3UploadSession::Abort() {
+	shared_ptr<const string> upload_id;
+	unique_ptr<BufferedPart> discarded_buffer;
+	FailureSnapshot failure;
+	bool cleanup_owner = false;
+	{
+		annotated_unique_lock<annotated_mutex> guard(state_lock);
+		while (lifecycle_state == LifecycleState::FINALIZING || lifecycle_state == LifecycleState::ABORTING) {
+			state_changed.wait(guard);
+		}
+		if (lifecycle_state == LifecycleState::FINALIZED) {
+			return false;
+		}
+		if (lifecycle_state == LifecycleState::ABORTED) {
+			return true;
+		}
+
+		D_ASSERT(lifecycle_state == LifecycleState::ACTIVE);
+		lifecycle_state = LifecycleState::ABORTING;
+		while (active_operations > 0) {
+			state_changed.wait(guard);
+		}
+		discarded_buffer = std::move(buffered_part);
+
+		if (primary_failure.primary_error) {
+			while (cleanup_state != CleanupState::COMPLETE) {
+				state_changed.wait(guard);
+			}
+			failure = CaptureFailure();
+		} else if (multipart_upload_id && !abort_suppressed) {
+			D_ASSERT(cleanup_state == CleanupState::NONE);
+			cleanup_state = CleanupState::IN_PROGRESS;
+			upload_id = multipart_upload_id;
+			cleanup_owner = true;
+		} else {
+			cleanup_state = CleanupState::COMPLETE;
+		}
+
+		if (!cleanup_owner) {
+			lifecycle_state = LifecycleState::ABORTED;
+			state_changed.notify_all();
+		}
+	}
+	discarded_buffer.reset();
+
+	shared_ptr<const ErrorData> abort_error;
+	if (cleanup_owner) {
+		D_ASSERT(upload_id);
+		abort_error = AbortMultipartUpload(*upload_id);
+		{
+			annotated_lock_guard<annotated_mutex> guard(state_lock);
+			cleanup_state = CleanupState::COMPLETE;
+			lifecycle_state = LifecycleState::ABORTED;
+			state_changed.notify_all();
+		}
+	}
+	if (failure.primary_error) {
+		ThrowFailure(failure);
+	}
+	if (abort_error) {
+		abort_error->Throw();
+	}
+	return true;
 }
 
 } // namespace duckdb

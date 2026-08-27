@@ -2,6 +2,7 @@
 
 #include "duckdb/common/chrono.hpp"
 #include "duckdb/common/file_opener.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/secret/secret.hpp"
@@ -13,6 +14,7 @@
 #include "s3/s3_settings.hpp"
 
 #include <exception>
+#include <condition_variable>
 #include <unordered_map>
 
 #undef RemoveDirectory
@@ -27,6 +29,36 @@ enum class S3PostRequestMode : uint8_t { REPLAYABLE, NON_REPLAYABLE };
 class S3FileHandle : public HTTPFileHandle {
 	friend class S3FileSystem;
 
+private:
+	enum class UploadState : uint8_t { ACTIVE, ABORTING, ABORTED };
+
+	class UploadClaim {
+		friend class S3FileHandle;
+
+	private:
+		UploadClaim(S3FileHandle &handle, optional_ptr<S3UploadSession> session);
+
+	public:
+		UploadClaim(UploadClaim &&other) noexcept;
+		UploadClaim(const UploadClaim &) = delete;
+		UploadClaim &operator=(const UploadClaim &) = delete;
+		~UploadClaim();
+
+	public:
+		explicit operator bool() const {
+			return session != nullptr;
+		}
+
+		S3UploadSession &Get() {
+			D_ASSERT(session);
+			return *session;
+		}
+
+	private:
+		reference<S3FileHandle> handle;
+		optional_ptr<S3UploadSession> session;
+	};
+
 public:
 	S3FileHandle(FileSystem &fs, const OpenFileInfo &file, FileOpenFlags flags, unique_ptr<HTTPParams> http_params_p,
 	             const S3AuthParams &auth_params_p, const S3UploadConfig &upload_config);
@@ -36,6 +68,7 @@ public:
 	void Close() override;
 	void Initialize(optional_ptr<FileOpener> opener) override;
 	void FinalizeUpload();
+	void AbortUpload();
 
 protected:
 	shared_ptr<const HTTPRequestSnapshot> CreateRequestSnapshot(const HTTPFSParams &params) const override;
@@ -45,9 +78,15 @@ protected:
 
 private:
 	void SetRegion(const string &region);
+	UploadClaim ClaimUpload(bool write);
+	void ReleaseUpload();
 
 private:
+	annotated_mutex upload_lock;
+	std::condition_variable upload_state_changed;
 	unique_ptr<S3UploadSession> upload_session;
+	UploadState upload_state DUCKDB_GUARDED_BY(upload_lock) = UploadState::ACTIVE;
+	idx_t active_upload_calls DUCKDB_GUARDED_BY(upload_lock) = 0;
 };
 
 class S3FileSystem : public HTTPFileSystem {
@@ -63,6 +102,7 @@ public:
 	void RemoveFiles(const vector<string> &filenames, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void FileSync(FileHandle &handle) override;
+	void AbortFileWrite(FileHandle &handle) override;
 	FileWriteMode GetWriteMode(FileHandle &) override;
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 

@@ -233,6 +233,7 @@ public:
 
 public:
 	explicit Impl(MockS3ServerConfig config_p) : config(std::move(config_p)) {
+		uploaded_object = config.upload.initial_published_object;
 		remaining_put_failures = config.failures.transient_put_failures;
 		remaining_get_failures = config.failures.transient_get_failures;
 		remaining_range_behavior_requests = config.range.behavior_requests;
