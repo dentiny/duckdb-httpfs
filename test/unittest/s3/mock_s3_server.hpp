@@ -116,6 +116,8 @@ struct MockS3FullGetConfig {
 };
 
 struct MockS3UploadConfig {
+	//! Existing object preserved when an upload is abandoned
+	string initial_published_object;
 	//! Multipart upload ID returned by the mock server
 	string upload_id = "refresh-test-upload-id";
 	//! Hold these one-based part numbers until ReleasePartUploads is called
