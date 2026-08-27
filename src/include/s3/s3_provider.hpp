@@ -7,6 +7,7 @@
 namespace duckdb {
 
 class CreateSecretFunction;
+struct DBConfig;
 class KeyValueSecret;
 class Value;
 struct CreateSecretInput;
@@ -27,7 +28,13 @@ struct S3Provider {
 	static const array<const char *, 12> &CredentialMaterialKeys();
 
 	static optional<S3ProviderMatch> TryMatchUrl(const string &url);
+	static optional<S3ProviderMatch> TryMatchUrl(const string &url, const vector<string> &scheme_alias_prefixes);
 	static S3ProviderMatch MatchUrl(const string &url);
+
+	//! Validate and normalize the 's3_url_scheme_aliases' value (bare scheme names, lowercased, deduplicated)
+	static Value NormalizeSchemeAliases(const Value &aliases);
+	//! The database's configured scheme aliases as '<scheme>://' prefixes
+	static vector<string> GetSchemeAliasPrefixes(const DBConfig &config);
 
 	static vector<string> DefaultSecretScope(const string &secret_type);
 	static void SetSecretNamedParameters(const string &secret_type, CreateSecretFunction &function);
@@ -36,7 +43,10 @@ struct S3Provider {
 	                                 KeyValueSecret &secret);
 
 	static void ReadAuthParams(S3KeyValueReader &secret_reader, const string &file_path, S3AuthParams &result);
+	//! Apply provider defaults; a required endpoint no secret or setting supplied stays unresolved
 	static void InitializeAuthParams(S3AuthParams &auth_params);
+	//! Validate that endpoint once every source has been read, then derive the remaining defaults
+	static void FinalizeAuthParams(S3AuthParams &auth_params);
 	static S3AuthType GetAuthType(const S3AuthParams &auth_params);
 	static string GetBadRequestError(const S3AuthParams &auth_params, const string &correct_region = "");
 	static string GetAuthError(const S3AuthParams &auth_params);

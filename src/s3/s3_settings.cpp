@@ -1,6 +1,7 @@
 #include "s3/s3_settings.hpp"
 
 #include "s3/s3_auth.hpp"
+#include "s3/s3_provider.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/storage/storage_info.hpp"
@@ -121,6 +122,19 @@ void S3Settings::Register(DBConfig &config) {
 	config.AddExtensionOption("s3_url_compatibility_mode", "Disable Globs and Query Parameters on S3 URLs",
 	                          LogicalType::BOOLEAN, Value(false));
 	config.AddExtensionOption("s3_requester_pays", "S3 use requester pays mode", LogicalType::BOOLEAN, Value(false));
+	config.AddExtensionOption(
+	    "s3_url_scheme_aliases",
+	    "Additional URL schemes routed to the S3-compatible filesystem (e.g. ['oss', 'cos']). "
+	    "Can only be set globally; secrets for aliased schemes need an explicit SCOPE.",
+	    LogicalType::LIST(LogicalType::VARCHAR), Value::LIST(LogicalType::VARCHAR, vector<Value>()),
+	    [](ClientContext &context, SetScope scope, Value &parameter) {
+		    if (scope == SetScope::SESSION || scope == SetScope::LOCAL) {
+			    throw InvalidInputException("s3_url_scheme_aliases can only be set globally");
+		    }
+		    // Validate only: routing reads the stored value from DBConfig
+		    parameter = S3Provider::NormalizeSchemeAliases(parameter);
+	    },
+	    SetScope::GLOBAL);
 	config.AddExtensionOption(
 	    "s3_allow_recursive_globbing",
 	    "Whether globs on S3-like storage are optimized with recursive strategy (alternative is listing)",
