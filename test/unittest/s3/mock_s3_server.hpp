@@ -66,6 +66,14 @@ struct MockS3MetadataConfig {
 	optional_idx head_content_length;
 };
 
+struct MockS3CompletionFaultConfig {
+	//! Number of leading multipart-completion responses to replace
+	idx_t count = 0;
+	int status = 200;
+	string code = "InternalError";
+	string message = "Injected multipart completion failure";
+};
+
 struct MockS3FailureConfig {
 	//! Answer this many leading ListObjectsV2 requests with HTTP 503 SlowDown
 	idx_t transient_503_lists = 0;
@@ -81,12 +89,12 @@ struct MockS3FailureConfig {
 	idx_t head_not_found_requests = 0;
 	//! Number of object DELETEs to fail with a 400 before succeeding
 	idx_t transient_delete_failures = 0;
-	//! Number of multipart-init POSTs (uploads=) to fail with a 400 before succeeding
+	//! Number of multipart-init POSTs (uploads=) to fail before succeeding
 	idx_t transient_post_failures = 0;
-	//! Number of multipart-complete POSTs (uploadId=) to fail with a 400 before succeeding
-	idx_t transient_complete_post_failures = 0;
-	//! Number of multipart-complete POSTs to answer with an HTTP 200 containing InternalError before succeeding
-	idx_t transient_complete_post_200_errors = 0;
+	//! HTTP status used for injected multipart-init failures
+	int transient_post_status = 400;
+	//! Leading multipart-completion response fault
+	MockS3CompletionFaultConfig completion_fault;
 	//! Whether injected 400s carry S3's retryable RequestTimeout code or a generic (non-retryable) code
 	bool failure_is_request_timeout = true;
 	//! Whether injected 400 bodies are truncated mid-XML (an open <Code> with no closing tag)
@@ -128,6 +136,8 @@ struct MockS3UploadConfig {
 	bool block_initialization = false;
 	MockS3MultipartInitializationBehavior initialization_behavior = MockS3MultipartInitializationBehavior::SUCCESS;
 	MockS3MultipartCompletionBehavior completion_behavior = MockS3MultipartCompletionBehavior::SUCCESS;
+	//! HTTP status sent before disconnecting a multipart-completion response body
+	int completion_disconnect_status = 200;
 	MockS3MultipartAbortBehavior abort_behavior = MockS3MultipartAbortBehavior::SUCCESS;
 };
 
@@ -162,6 +172,7 @@ struct MockS3RequestObservation {
 	idx_t user_agent_count = 0;
 	idx_t session_header_count = 0;
 	int status = 0;
+	bool multipart_upload_published = false;
 	//! Client's ephemeral source port; a new connection shows a new port
 	int remote_port = 0;
 };

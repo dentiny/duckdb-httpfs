@@ -54,6 +54,116 @@ static idx_t CountObservationsTarget(const vector<MockS3RequestObservation> &obs
 	return result;
 }
 
+template <class CALLBACK>
+static string RequireError(CALLBACK callback, optional_ptr<ErrorData> error_data = nullptr) {
+	try {
+		callback();
+	} catch (std::exception &ex) {
+		if (error_data) {
+			*error_data = ErrorData(ex);
+		}
+		return ex.what();
+	}
+	FAIL("Expected operation to throw");
+	return string();
+}
+
+static unique_ptr<FileHandle> OpenWriter(Connection &con) {
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	return fs.OpenFile(S3TestHelper::S3_PATH, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+}
+
+static string MultipartPayload() {
+	return string(10ULL * 1024ULL * 1024ULL + 1, 'x');
+}
+
+static string ConfigureUploadTest(DuckDB &db, Connection &con, MockS3Server &server,
+                                  const string &client_implementation, idx_t retries) {
+	auto test_id = S3TestHelper::ConfigureRefresh(db, con, server, client_implementation, false);
+	S3TestHelper::RequireQueryOk(con, "SET s3_uploader_max_filesize='50GB'");
+	S3TestHelper::RequireQueryOk(con, "SET http_retries=" + to_string(retries));
+	S3TestHelper::RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	return test_id;
+}
+
+static void RunRecoveringCompletionFaultScenario(const string &client_implementation,
+                                                 MockS3CompletionFaultConfig completion_fault, idx_t retries) {
+	MockS3ServerConfig config;
+	config.object.bucket = S3TestHelper::BUCKET;
+	config.object.key = S3TestHelper::OBJECT_KEY;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.upload.initial_published_object = "existing object";
+	auto expected_attempts = completion_fault.count + 1;
+	auto expected_fault_status = completion_fault.status;
+	config.failures.completion_fault = std::move(completion_fault);
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureUploadTest(db, con, server, client_implementation, retries);
+	S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto handle = OpenWriter(con);
+	auto payload = MultipartPayload();
+	handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size());
+	handle->Close();
+	handle.reset();
+	S3TestHelper::RequireQueryOk(con, "COMMIT");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	S3TestHelper::RequireCompletionIdentity(observations, expected_attempts);
+	auto completions = S3TestHelper::CompletionObservations(observations);
+	for (idx_t attempt = 0; attempt < completions.size() - 1; attempt++) {
+		REQUIRE(completions[attempt].status == expected_fault_status);
+		REQUIRE_FALSE(completions[attempt].multipart_upload_published);
+	}
+	REQUIRE(completions.back().status == 200);
+	REQUIRE(completions.back().multipart_upload_published);
+	REQUIRE(CountObservationsTarget(observations, "DELETE", 204, "uploadId") == 0);
+	REQUIRE(server.UploadedObject() == payload);
+}
+
+static void RunFailedCompletionFaultScenario(const string &client_implementation,
+                                             MockS3CompletionFaultConfig completion_fault, idx_t retries,
+                                             idx_t expected_attempts) {
+	MockS3ServerConfig config;
+	config.object.bucket = S3TestHelper::BUCKET;
+	config.object.key = S3TestHelper::OBJECT_KEY;
+	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
+	config.upload.initial_published_object = "existing object";
+	auto expected_status = completion_fault.status;
+	auto expected_code = completion_fault.code;
+	config.failures.completion_fault = std::move(completion_fault);
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	ConfigureUploadTest(db, con, server, client_implementation, retries);
+	S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+	auto handle = OpenWriter(con);
+	auto payload = MultipartPayload();
+	handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size());
+	ErrorData error;
+	auto first_error = RequireError([&]() { handle->Sync(); }, error);
+	auto second_error = RequireError([&]() { handle->Close(); });
+	REQUIRE(second_error == first_error);
+	handle.reset();
+	S3TestHelper::RequireQueryOk(con, "ROLLBACK");
+
+	auto observations = server.Observations();
+	INFO(MockS3DescribeObservations(observations));
+	S3TestHelper::RequireCompletionIdentity(observations, expected_attempts);
+	for (const auto &completion : S3TestHelper::CompletionObservations(observations)) {
+		REQUIRE(completion.status == expected_status);
+		REQUIRE_FALSE(completion.multipart_upload_published);
+	}
+	REQUIRE(error.Type() == ExceptionType::HTTP);
+	REQUIRE(error.ExtraInfo().at("status_code") == to_string(expected_status));
+	REQUIRE(StringUtil::Contains(error.ExtraInfo().at("response_body"), expected_code));
+	REQUIRE(CountObservationsTarget(observations, "DELETE", 204, "uploadId") == 1);
+	REQUIRE(server.UploadedObject() == "existing object");
+}
+
 // A generic (non-RequestTimeout) 400 must fail on the first try. Uses a single-shot PUT so exactly one
 // request is expected, distinguishing "not retried" from "retried N times and still failed".
 static void RunGenericErrorNotRetriedScenario(const string &client_implementation) {
@@ -304,91 +414,106 @@ static void RunHeadNotRetriedScenario(const string &client_implementation) {
 	REQUIRE(error_ports[0] == success_ports[0]);
 }
 
-// Like multipart-init, a multipart-complete POST must not be replayed even on RequestTimeout.
-static void RunMultipartCompleteNotRetriedScenario(const string &client_implementation) {
+// A received RequestTimeout response permits multipart completion to use its explicit S3 retry budget.
+static void RunMultipartCompleteRequestTimeoutRetryScenario(const string &client_implementation) {
+	RunFailedCompletionFaultScenario(client_implementation,
+	                                 {1000, 400, "RequestTimeout", "Injected completion timeout"}, 3, 4);
+}
+
+static void RunCompletionErrorCodeRecoveryScenarios(const string &client_implementation) {
+	for (const auto &code :
+	     {"InternalError", "OperationAborted", "SlowDown", "ServiceUnavailable", "TooManyRequests", "RequestTimeout"}) {
+		INFO("S3 error code: " << code);
+		RunRecoveringCompletionFaultScenario(client_implementation,
+		                                     {2, 200, code, "Injected retryable multipart completion error"}, 3);
+	}
+}
+
+static void RunCompletionStatusRecoveryScenarios(const string &client_implementation) {
+	for (const auto status : {429, 500, 502, 503}) {
+		INFO("HTTP status: " << status);
+		RunRecoveringCompletionFaultScenario(
+		    client_implementation, {1, status, "PermanentError", "Injected status-classified completion error"}, 1);
+	}
+}
+
+static void RunPermanentCompletionFailureScenarios(const string &client_implementation) {
+	RunFailedCompletionFaultScenario(client_implementation,
+	                                 {1000, 400, "InvalidRequest", "Injected permanent completion error"}, 3, 1);
+	RunFailedCompletionFaultScenario(client_implementation,
+	                                 {1000, 200, "internalerror", "Retry codes are case-sensitive"}, 3, 1);
+}
+
+static void RunCompletionWithoutRetriesScenario(const string &client_implementation) {
+	RunFailedCompletionFaultScenario(client_implementation, {1000, 503, "SlowDown", "No completion retries configured"},
+	                                 0, 1);
+}
+
+static void RunMultipartInitializationThrottleScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
 	config.object.bucket = S3TestHelper::BUCKET;
 	config.object.key = S3TestHelper::OBJECT_KEY;
-	config.auth.stale_key_id = S3TestHelper::STALE_KEY_ID;
 	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.failures.transient_complete_post_failures = 1000;
+	config.failures.transient_post_failures = 1000;
+	config.failures.transient_post_status = 429;
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
 	Connection con(db);
-	S3TestHelper::ConfigureRefresh(db, con, server, client_implementation, false);
-
-	S3TestHelper::RequireQueryOk(con, "SET http_retries=3");
-	S3TestHelper::RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	ConfigureUploadTest(db, con, server, client_implementation, 3);
 	S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
-	REQUIRE_THROWS(S3TestHelper::WriteMultipartPayload(con));
+	auto handle = OpenWriter(con);
+	auto payload = MultipartPayload();
+	auto first_error = RequireError(
+	    [&]() { handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size()); });
+	auto second_error = RequireError([&]() { handle->Close(); });
+	REQUIRE(second_error == first_error);
+	handle.reset();
 	S3TestHelper::RequireQueryOk(con, "ROLLBACK");
 
 	auto observations = server.Observations();
 	INFO(MockS3DescribeObservations(observations));
-	REQUIRE(CountObservationsTarget(observations, "POST", 400, "uploadId") == 1);
+	REQUIRE(CountObservationsTarget(observations, "POST", 429, "uploads") == 1);
+	REQUIRE(CountObservationsTarget(observations, "POST", 200, "uploadId") == 0);
+	REQUIRE(CountObservationsTarget(observations, "DELETE", 204, "uploadId") == 0);
 }
 
-static void RunCompletePost200ErrorRetryScenario(const string &client_implementation) {
+static void RunCompletionRefreshThenRetryScenario(const string &client_implementation) {
 	MockS3ServerConfig config;
 	config.object.bucket = S3TestHelper::BUCKET;
 	config.object.key = S3TestHelper::OBJECT_KEY;
-	config.auth.stale_key_id = S3TestHelper::STALE_KEY_ID;
-	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.failures.transient_complete_post_200_errors = 2;
+	config.auth.refresh_target = MockS3RefreshTarget::MULTIPART_COMPLETE_POST;
+	config.upload.initial_published_object = "existing object";
+	config.failures.completion_fault = {1, 503, "SlowDown", "Retry after refreshing credentials"};
 	MockS3Server server(std::move(config));
 
 	DuckDB db(nullptr);
 	Connection con(db);
-	S3TestHelper::ConfigureRefresh(db, con, server, client_implementation, false);
-
-	S3TestHelper::RequireQueryOk(con, "SET http_retries=3");
-	S3TestHelper::RequireQueryOk(con, "SET http_retry_wait_ms=1");
+	auto test_id = ConfigureUploadTest(db, con, server, client_implementation, 1);
 	S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
-	S3TestHelper::WriteMultipartPayload(con);
+	auto handle = OpenWriter(con);
+	auto payload = MultipartPayload();
+	handle->Write(QueryContext(*con.context), data_ptr_cast(payload.data()), payload.size());
+	handle->Close();
+	handle.reset();
 	S3TestHelper::RequireQueryOk(con, "COMMIT");
 
+	S3TestHelper::AssertSingleRefresh(test_id);
 	auto observations = server.Observations();
 	INFO(MockS3DescribeObservations(observations));
-	REQUIRE(CountObservationsTarget(observations, "POST", 200, "uploadId") == 3);
+	S3TestHelper::RequireCompletionIdentity(observations, 3);
+	auto completions = S3TestHelper::CompletionObservations(observations);
+	REQUIRE(completions[0].status == 403);
+	REQUIRE(completions[0].key_id == S3TestHelper::STALE_KEY_ID);
+	REQUIRE_FALSE(completions[0].multipart_upload_published);
+	REQUIRE(completions[1].status == 503);
+	REQUIRE(completions[1].key_id == S3TestHelper::FRESH_KEY_ID);
+	REQUIRE_FALSE(completions[1].multipart_upload_published);
+	REQUIRE(completions[2].status == 200);
+	REQUIRE(completions[2].key_id == S3TestHelper::FRESH_KEY_ID);
+	REQUIRE(completions[2].multipart_upload_published);
 	REQUIRE(CountObservationsTarget(observations, "DELETE", 204, "uploadId") == 0);
-	REQUIRE(server.UploadedObject().size() == 10 * 1024 * 1024 + 1);
-}
-
-static void RunCompletePost200ErrorExhaustsBudgetScenario(const string &client_implementation) {
-	MockS3ServerConfig config;
-	config.object.bucket = S3TestHelper::BUCKET;
-	config.object.key = S3TestHelper::OBJECT_KEY;
-	config.auth.stale_key_id = S3TestHelper::STALE_KEY_ID;
-	config.auth.refresh_target = MockS3RefreshTarget::DELETE_OBJECT;
-	config.failures.transient_complete_post_200_errors = 1000;
-	MockS3Server server(std::move(config));
-
-	DuckDB db(nullptr);
-	Connection con(db);
-	S3TestHelper::ConfigureRefresh(db, con, server, client_implementation, false);
-
-	S3TestHelper::RequireQueryOk(con, "SET http_retries=3");
-	S3TestHelper::RequireQueryOk(con, "SET http_retry_wait_ms=1");
-	S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
-	ErrorData error;
-	bool threw = false;
-	try {
-		S3TestHelper::WriteMultipartPayload(con);
-	} catch (std::exception &ex) {
-		threw = true;
-		error = ErrorData(ex);
-	}
-	S3TestHelper::RequireQueryOk(con, "ROLLBACK");
-
-	REQUIRE(threw);
-	REQUIRE(error.Type() == ExceptionType::HTTP);
-	REQUIRE(error.ExtraInfo().at("status_code") == "200");
-	REQUIRE(StringUtil::Contains(error.ExtraInfo().at("response_body"), "InternalError"));
-	auto observations = server.Observations();
-	INFO(MockS3DescribeObservations(observations));
-	REQUIRE(CountObservationsTarget(observations, "POST", 200, "uploadId") == 4);
-	REQUIRE(CountObservationsTarget(observations, "DELETE", 204, "uploadId") == 1);
+	REQUIRE(server.UploadedObject() == payload);
 }
 
 static void RunAllTransientRetryScenarios(const string &client_implementation) {
@@ -407,17 +532,29 @@ static void RunAllTransientRetryScenarios(const string &client_implementation) {
 	SECTION("a truncated error body is not retried and does not invalidate the database") {
 		RunTruncatedErrorBodyScenario(client_implementation);
 	}
-	SECTION("a multipart-init POST is not retried even on RequestTimeout") {
+	SECTION("multipart initialization does not retry a received RequestTimeout") {
 		RunMultipartInitNotRetriedScenario(client_implementation);
 	}
-	SECTION("a multipart-complete POST is not retried even on RequestTimeout") {
-		RunMultipartCompleteNotRetriedScenario(client_implementation);
+	SECTION("multipart initialization does not receive core throttle retries") {
+		RunMultipartInitializationThrottleScenario(client_implementation);
 	}
-	SECTION("a multipart-complete 200 InternalError is retried") {
-		RunCompletePost200ErrorRetryScenario(client_implementation);
+	SECTION("multipart completion retries a received RequestTimeout within the configured budget") {
+		RunMultipartCompleteRequestTimeoutRetryScenario(client_implementation);
 	}
-	SECTION("multipart-complete 200 InternalError retries are bounded by http_retries") {
-		RunCompletePost200ErrorExhaustsBudgetScenario(client_implementation);
+	SECTION("multipart completion retries every configured S3 error code") {
+		RunCompletionErrorCodeRecoveryScenarios(client_implementation);
+	}
+	SECTION("multipart completion retries HTTP throttle and server-error statuses") {
+		RunCompletionStatusRecoveryScenarios(client_implementation);
+	}
+	SECTION("multipart completion does not retry permanent errors") {
+		RunPermanentCompletionFailureScenarios(client_implementation);
+	}
+	SECTION("multipart completion honors http_retries=0") {
+		RunCompletionWithoutRetriesScenario(client_implementation);
+	}
+	SECTION("credential refresh preserves the multipart completion retry budget") {
+		RunCompletionRefreshThenRetryScenario(client_implementation);
 	}
 	SECTION("a HEAD 400 is not retried because HEAD responses carry no error body") {
 		RunHeadNotRetriedScenario(client_implementation);

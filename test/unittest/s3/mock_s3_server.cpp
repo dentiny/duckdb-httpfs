@@ -2,6 +2,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/mutex.hpp"
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/string_util.hpp"
 
 #include "httplib.hpp"
@@ -72,7 +73,7 @@ static bool ParseRange(const string &range, idx_t object_size, idx_t &start, idx
 	return start <= end && end < object_size;
 }
 
-static bool ConsumeBehavior(std::atomic<idx_t> &remaining) {
+static bool ConsumeBehavior(atomic<idx_t> &remaining) {
 	auto current = remaining.load();
 	while (current > 0) {
 		if (remaining.compare_exchange_weak(current, current - 1)) {
@@ -241,8 +242,7 @@ public:
 		remaining_head_not_found = config.failures.head_not_found_requests;
 		remaining_delete_failures = config.failures.transient_delete_failures;
 		remaining_post_failures = config.failures.transient_post_failures;
-		remaining_complete_post_failures = config.failures.transient_complete_post_failures;
-		remaining_complete_post_200_errors = config.failures.transient_complete_post_200_errors;
+		remaining_completion_faults = config.failures.completion_fault.count;
 		if (config.range.behavior == MockS3RangeBehavior::SHORT_SUCCESS && config.range.behavior_requests > 0) {
 			server.set_keep_alive_max_count(1);
 		}
@@ -389,7 +389,7 @@ public:
 		       ExtractCredentialRegion(GetHeader(request, "Authorization")) != config.auth.required_region;
 	}
 
-	void Record(const httplib::Request &request, int status) const DUCKDB_EXCLUDES(observation_lock) {
+	void Record(const httplib::Request &request, int status) const DUCKDB_EXCLUDES(observation_lock, upload_lock) {
 		MockS3RequestObservation observation;
 		observation.method = request.method;
 		observation.path = request.path;
@@ -412,6 +412,10 @@ public:
 		observation.session_header_count = CountHeader(request, "X-HTTPFS-Session");
 		observation.status = status;
 		observation.remote_port = request.remote_port;
+		{
+			annotated_lock_guard<annotated_mutex> lock(upload_lock);
+			observation.multipart_upload_published = multipart_upload_published;
+		}
 
 		annotated_lock_guard<annotated_mutex> lock(observation_lock);
 		observations.push_back(std::move(observation));
@@ -451,8 +455,9 @@ public:
 		Record(request, response.status);
 	}
 
-	void SendDisconnectedSuccess(const httplib::Request &request, httplib::Response &response) const {
-		response.status = 200;
+	void SendDisconnectedResponse(const httplib::Request &request, httplib::Response &response,
+	                              int status = 200) const {
+		response.status = status;
 		response.set_content_provider(1, "application/xml", [](size_t, size_t, httplib::DataSink &) { return false; });
 		Record(request, response.status);
 	}
@@ -507,11 +512,13 @@ public:
 		Record(request, response.status);
 	}
 
-	void SendComplete200Error(const httplib::Request &request, httplib::Response &response) const {
-		response.status = 200;
-		response.set_content("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-		                     "<Error><Code>InternalError</Code>"
-		                     "<Message>We encountered an internal error. Please try again.</Message></Error>",
+	void SendCompletionFault(const httplib::Request &request, httplib::Response &response) const {
+		auto &fault = config.failures.completion_fault;
+		response.status = fault.status;
+		response.set_content(StringUtil::Format("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+		                                        "<Error><Code>%s</Code><Message>%s</Message></Error>",
+		                                        MockS3XMLText::Escape(fault.code),
+		                                        MockS3XMLText::Escape(fault.message)),
 		                     "application/xml");
 		Record(request, response.status);
 	}
@@ -547,6 +554,7 @@ public:
 			previous_part_number = manifest_part.part_number;
 		}
 		uploaded_object = std::move(completed_object);
+		multipart_upload_published = true;
 		return true;
 	}
 
@@ -587,7 +595,7 @@ public:
 				Record(request, response.status);
 				return;
 			case MockS3MultipartInitializationBehavior::CREATE_THEN_DISCONNECT:
-				SendDisconnectedSuccess(request, response);
+				SendDisconnectedResponse(request, response);
 				return;
 			default:
 				throw InternalException("Unknown multipart initialization behavior");
@@ -639,7 +647,7 @@ public:
 			Record(request, response.status);
 			return;
 		case MockS3MultipartCompletionBehavior::COMMIT_THEN_DISCONNECT:
-			SendDisconnectedSuccess(request, response);
+			SendDisconnectedResponse(request, response, config.upload.completion_disconnect_status);
 			return;
 		case MockS3MultipartCompletionBehavior::EMBEDDED_ERROR:
 			throw InternalException("Embedded multipart errors must be handled before committing the upload");
@@ -872,7 +880,7 @@ public:
 				return;
 			}
 			if (config.range.block_first_body_until_second && range_request_index == 1) {
-				auto wait_for_second_request = make_shared_ptr<std::atomic<bool>>(true);
+				auto wait_for_second_request = make_shared_ptr<atomic<bool>>(true);
 				response.set_content_provider(
 				    config.object.data.size(), "application/octet-stream",
 				    [this, wait_for_second_request](size_t offset, size_t length, httplib::DataSink &sink) {
@@ -977,17 +985,20 @@ public:
 			}
 			if (request.target.find("uploads") != string::npos && remaining_post_failures.load() > 0) {
 				remaining_post_failures--;
-				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
+				if (config.failures.transient_post_status == 400) {
+					SendS3Error400(request, response, config.failures.failure_is_request_timeout);
+				} else {
+					response.status = config.failures.transient_post_status;
+					response.set_content("<Error><Code>TooManyRequests</Code><Message>Injected initialization "
+					                     "throttle</Message></Error>",
+					                     "application/xml");
+					Record(request, response.status);
+				}
 				return;
 			}
-			if (request.target.find("uploadId") != string::npos && remaining_complete_post_failures.load() > 0) {
-				remaining_complete_post_failures--;
-				SendS3Error400(request, response, config.failures.failure_is_request_timeout);
-				return;
-			}
-			if (request.target.find("uploadId") != string::npos && remaining_complete_post_200_errors.load() > 0) {
-				remaining_complete_post_200_errors--;
-				SendComplete200Error(request, response);
+			if (request.target.find("uploadId") != string::npos && remaining_completion_faults.load() > 0) {
+				remaining_completion_faults--;
+				SendCompletionFault(request, response);
 				return;
 			}
 			SendMultipartPost(request, response);
@@ -1046,17 +1057,16 @@ public:
 	int port = 0;
 
 	//! Injected request failures
-	mutable std::atomic<idx_t> transient_503_lists_sent {0};
-	mutable std::atomic<idx_t> transient_400_lists_sent {0};
-	mutable std::atomic<idx_t> remaining_put_failures {0};
-	mutable std::atomic<idx_t> remaining_get_failures {0};
-	mutable std::atomic<idx_t> remaining_range_behavior_requests {0};
-	mutable std::atomic<idx_t> remaining_head_failures {0};
-	mutable std::atomic<idx_t> remaining_head_not_found {0};
-	mutable std::atomic<idx_t> remaining_delete_failures {0};
-	mutable std::atomic<idx_t> remaining_post_failures {0};
-	mutable std::atomic<idx_t> remaining_complete_post_failures {0};
-	mutable std::atomic<idx_t> remaining_complete_post_200_errors {0};
+	mutable atomic<idx_t> transient_503_lists_sent {0};
+	mutable atomic<idx_t> transient_400_lists_sent {0};
+	mutable atomic<idx_t> remaining_put_failures {0};
+	mutable atomic<idx_t> remaining_get_failures {0};
+	mutable atomic<idx_t> remaining_range_behavior_requests {0};
+	mutable atomic<idx_t> remaining_head_failures {0};
+	mutable atomic<idx_t> remaining_head_not_found {0};
+	mutable atomic<idx_t> remaining_delete_failures {0};
+	mutable atomic<idx_t> remaining_post_failures {0};
+	mutable atomic<idx_t> remaining_completion_faults {0};
 
 	//! Request observations
 	mutable annotated_mutex observation_lock;
@@ -1069,6 +1079,7 @@ public:
 	set<idx_t> released_part_numbers DUCKDB_GUARDED_BY(upload_lock);
 	string uploaded_object DUCKDB_GUARDED_BY(upload_lock);
 	string completion_body DUCKDB_GUARDED_BY(upload_lock);
+	bool multipart_upload_published DUCKDB_GUARDED_BY(upload_lock) = false;
 	idx_t active_part_uploads DUCKDB_GUARDED_BY(upload_lock) = 0;
 	idx_t maximum_active_part_uploads DUCKDB_GUARDED_BY(upload_lock) = 0;
 	bool part_uploads_released DUCKDB_GUARDED_BY(upload_lock) = false;
@@ -1209,12 +1220,14 @@ string MockS3DescribeObservations(const vector<MockS3RequestObservation> &observ
 		}
 		result += StringUtil::Format(
 		    "%s %s status=%d key=%s region=%s range=%s if_match=%s version_id=%s target=%s upload_id=%s "
-		    "part_number=%s body_size=%llu body_digest=%s sse=%s kms_key_id=%s user_agent=%s session_header=%s",
+		    "part_number=%s body_size=%llu body_digest=%s published=%s sse=%s kms_key_id=%s user_agent=%s "
+		    "session_header=%s",
 		    observation.method, observation.path, observation.status, observation.key_id, observation.region,
 		    observation.range, observation.if_match, observation.version_id, observation.target, observation.upload_id,
 		    observation.part_number.IsValid() ? std::to_string(observation.part_number.GetIndex()) : string(),
-		    observation.body_size, observation.body_digest, observation.server_side_encryption, observation.kms_key_id,
-		    observation.user_agent, observation.session_header);
+		    observation.body_size, observation.body_digest, observation.multipart_upload_published ? "true" : "false",
+		    observation.server_side_encryption, observation.kms_key_id, observation.user_agent,
+		    observation.session_header);
 	}
 	return result;
 }

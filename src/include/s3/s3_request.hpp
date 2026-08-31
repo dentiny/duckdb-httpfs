@@ -35,6 +35,7 @@ public:
 };
 
 enum class S3RequestTarget : uint8_t { OBJECT, BUCKET };
+enum class S3PostRequestMode : uint8_t { DEFAULT, RETRY_RECEIVED_RESPONSES };
 
 struct S3RequestQuery {
 	S3RequestQuery() = default;
@@ -91,6 +92,7 @@ struct S3RequestUtil {
 	                                 string payload_hash = "", string content_type = "", string content_md5 = "");
 	static string GetPayloadHash(EncryptionUtil &encryption_util, const_data_ptr_t buffer, idx_t buffer_len);
 	static bool IsRequestTimeout(const HTTPResponse &response);
+	static bool IsRetryableReceivedResponse(const HTTPResponse &response);
 
 	static string ParseError(const string &error);
 	static HTTPException GetError(const S3AuthParams &auth_params, const HTTPResponse &response,
@@ -109,7 +111,8 @@ struct S3RequestExecutor {
 	                                           const string &content_type, const string &content_md5,
 	                                           const RequestCallback &request,
 	                                           const RegionRedirectCallback &region_redirect = {},
-	                                           optional_ptr<S3RequestContext> request_context = nullptr);
+	                                           optional_ptr<S3RequestContext> request_context = nullptr,
+	                                           S3PostRequestMode post_request_mode = S3PostRequestMode::DEFAULT);
 	static unique_ptr<HTTPResponse> RunHandle(EncryptionUtil &encryption_util, S3FileHandle &handle,
 	                                          const string &s3_url, RequestType request_type, const string &version_id,
 	                                          const RequestCallback &request);
@@ -135,7 +138,8 @@ private:
 
 	static unique_ptr<HTTPResponse> Run(const string &s3_url, const CreateDataCallback &create_data,
 	                                    const RequestCallback &request, const RefreshCallback &refresh_auth_params,
-	                                    const SetRegionCallback &set_region, const FinalRequestCallback &final_request);
+	                                    const SetRegionCallback &set_region, const FinalRequestCallback &final_request,
+	                                    S3PostRequestMode post_request_mode = S3PostRequestMode::DEFAULT);
 	static bool TryRefreshSession(HTTPRequestSession &session, const S3RequestData &request_data);
 	static S3RequestData CreateRequestData(EncryptionUtil &encryption_util, const CapturedHTTPRequestSnapshot &captured,
 	                                       const string &s3_url, RequestType request_type, S3RequestTarget target,

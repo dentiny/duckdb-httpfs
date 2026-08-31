@@ -134,12 +134,18 @@ struct S3UploadLifecycleTest {
 	}
 
 	static void RunAmbiguousCompletion(const string &client_implementation, MockS3MultipartCompletionBehavior behavior,
-	                                   const string &error_fragment) {
+	                                   const string &error_fragment, bool leading_retryable_response = false) {
 		MockS3ServerConfig config;
 		config.object.bucket = S3TestHelper::BUCKET;
 		config.object.key = S3TestHelper::OBJECT_KEY;
 		config.auth.refresh_target = MockS3RefreshTarget::HEAD;
 		config.upload.completion_behavior = behavior;
+		if (behavior == MockS3MultipartCompletionBehavior::COMMIT_THEN_DISCONNECT) {
+			config.upload.completion_disconnect_status = 503;
+		}
+		if (leading_retryable_response) {
+			config.failures.completion_fault = {1, 503, "SlowDown", "Retry before an ambiguous completion"};
+		}
 		auto upload_id = config.upload.upload_id;
 		MockS3Server server(std::move(config));
 
@@ -162,7 +168,17 @@ struct S3UploadLifecycleTest {
 
 		auto observations = server.Observations();
 		INFO(MockS3DescribeObservations(observations));
-		REQUIRE(Count(observations, "POST", "uploadId") == 1);
+		auto expected_attempts = leading_retryable_response ? 2 : 1;
+		S3TestHelper::RequireCompletionIdentity(observations, expected_attempts);
+		auto completions = S3TestHelper::CompletionObservations(observations);
+		for (idx_t attempt = 0; attempt < completions.size() - 1; attempt++) {
+			REQUIRE_FALSE(completions[attempt].multipart_upload_published);
+		}
+		REQUIRE(completions.back().multipart_upload_published);
+		if (leading_retryable_response) {
+			REQUIRE(completions[0].status == 503);
+			REQUIRE(completions[1].status == 503);
+		}
 		REQUIRE(Count(observations, "DELETE") == 0);
 		REQUIRE(server.UploadedObject() == payload);
 	}
@@ -622,6 +638,10 @@ struct S3UploadLifecycleTest {
 		SECTION("completion transport loss is ambiguous") {
 			RunAmbiguousCompletion(client_implementation, MockS3MultipartCompletionBehavior::COMMIT_THEN_DISCONNECT,
 			                       "unknown outcome");
+		}
+		SECTION("a retryable completion response followed by transport loss is ambiguous") {
+			RunAmbiguousCompletion(client_implementation, MockS3MultipartCompletionBehavior::COMMIT_THEN_DISCONNECT,
+			                       "unknown outcome", true);
 		}
 		SECTION("empty completion success is ambiguous") {
 			RunAmbiguousCompletion(client_implementation, MockS3MultipartCompletionBehavior::EMPTY_SUCCESS,
