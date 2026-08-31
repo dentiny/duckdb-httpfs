@@ -1,11 +1,13 @@
 #include "s3/s3fs.hpp"
 
+#include "s3/s3_provider.hpp"
 #include "s3/s3_upload_session.hpp"
 #include "s3/s3_url.hpp"
 
 #include "duckdb/common/helper.hpp"
 #include "duckdb/logging/file_system_logger.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 
 namespace duckdb {
@@ -225,7 +227,16 @@ void S3FileHandle::Initialize(optional_ptr<FileOpener> opener) {
 }
 
 bool S3FileSystem::CanHandleFile(const string &fpath) {
-	return !S3Url::TryGetPrefix(fpath).empty();
+	// This runs for every path the VFS probes, so keep local paths and built-in schemes off the
+	// setting lookup, which takes the database-wide settings lock
+	if (S3Provider::TryMatchUrl(fpath)) {
+		return true;
+	}
+	if (fpath.find("://") == string::npos) {
+		return false;
+	}
+	auto &config = DBConfig::GetConfig(buffer_manager.GetDatabase());
+	return S3Provider::TryMatchUrl(fpath, S3Provider::GetSchemeAliasPrefixes(config)).has_value();
 }
 
 bool S3FileSystem::OnDiskFile(FileHandle &) {

@@ -64,6 +64,8 @@ public:
 
 public:
 	S3ProviderType provider_type = S3ProviderType::S3;
+	//! Whether the url was routed here by 's3_url_scheme_aliases' rather than a built-in scheme
+	bool scheme_is_alias = false;
 	string region;
 	string access_key_id;
 	string secret_access_key;
