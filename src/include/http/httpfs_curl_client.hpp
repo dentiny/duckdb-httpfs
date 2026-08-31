@@ -3,7 +3,7 @@
 #include <curl/curl.h>
 #include <utility>
 
-#include "duckdb/common/http_util.hpp"
+#include "http/httpfs_client.hpp"
 
 namespace duckdb {
 class HTTPLogger;
@@ -76,6 +76,13 @@ public:
 
 	void Add(const string &header) {
 		headers = curl_slist_append(headers, header.c_str());
+	}
+	void Add(const string &name, const string &value) {
+		if (HTTPFSHeaderValue::IsEmpty(value)) {
+			Add(name + ";");
+		} else {
+			Add(name + ": " + value);
+		}
 	}
 
 public:

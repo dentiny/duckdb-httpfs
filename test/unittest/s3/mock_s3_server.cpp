@@ -391,6 +391,9 @@ public:
 
 	void Record(const httplib::Request &request, int status) const DUCKDB_EXCLUDES(observation_lock, upload_lock) {
 		MockS3RequestObservation observation;
+		for (const auto &header : request.headers) {
+			observation.headers.emplace_back(header.first, header.second);
+		}
 		observation.method = request.method;
 		observation.path = request.path;
 		observation.target = request.target;
@@ -1210,6 +1213,16 @@ bool MockS3HasObservation(const vector<MockS3RequestObservation> &observations, 
 		}
 	}
 	return false;
+}
+
+vector<string> MockS3HeaderValues(const MockS3RequestObservation &observation, const string &name) {
+	vector<string> result;
+	for (const auto &header : observation.headers) {
+		if (StringUtil::CIEquals(header.first, name)) {
+			result.push_back(header.second);
+		}
+	}
+	return result;
 }
 
 string MockS3DescribeObservations(const vector<MockS3RequestObservation> &observations) {

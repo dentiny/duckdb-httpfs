@@ -231,11 +231,11 @@ private:
 
 		duckdb_httplib_openssl::Headers headers;
 		for (auto &entry : header_map) {
-			headers.insert(entry);
+			headers.emplace(entry.first, HTTPFSHeaderValue::IsEmpty(entry.second) ? string() : entry.second);
 		}
 		if (!httpfs_params.pre_merged_headers) {
 			for (auto &entry : params.extra_headers) {
-				headers.insert(entry);
+				headers.emplace(entry.first, HTTPFSHeaderValue::IsEmpty(entry.second) ? string() : entry.second);
 			}
 		}
 		return headers;

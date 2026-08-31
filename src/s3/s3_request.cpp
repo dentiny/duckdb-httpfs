@@ -89,11 +89,50 @@ bool S3RequestQuery::HasParameter(const string &name) const {
 	return false;
 }
 
+struct HTTPFSOwnedS3Headers {
+public:
+	static bool Contains(const string &name) {
+		return Headers().find(name) != Headers().end();
+	}
+
+	static const string &CanonicalName(const string &name) {
+		auto entry = Headers().find(name);
+		D_ASSERT(entry != Headers().end());
+		return entry->second;
+	}
+
+private:
+	static const case_insensitive_map_t<string> &Headers() {
+		static const case_insensitive_map_t<string> headers {
+		    {"Host", "Host"},
+		    {"Authorization", "Authorization"},
+		    {"Content-Length", "Content-Length"},
+		    {"Content-Type", "Content-Type"},
+		    {"Content-MD5", "Content-MD5"},
+		    {"Range", "Range"},
+		    {"If-Match", "If-Match"},
+		    {"x-amz-date", "x-amz-date"},
+		    {"x-amz-content-sha256", "x-amz-content-sha256"},
+		    {"x-amz-security-token", "x-amz-security-token"},
+		    {"x-amz-request-payer", "x-amz-request-payer"},
+		    {"x-amz-server-side-encryption", "x-amz-server-side-encryption"},
+		    {"x-amz-server-side-encryption-aws-kms-key-id", "x-amz-server-side-encryption-aws-kms-key-id"},
+		};
+		return headers;
+	}
+};
+
 struct S3HeaderBuilder {
+	struct CanonicalHeader {
+		string name;
+		string value;
+	};
+
 public:
 	S3HeaderBuilder(EncryptionUtil &encryption_util_p, string url_p, const S3RequestQuery &query_p, string host_p,
 	                string service_p, RequestType request_type_p, const S3AuthParams &auth_params_p, string date_now_p,
-	                string datetime_now_p, string payload_hash_p, string content_type_p, string content_md5_p)
+	                string datetime_now_p, string payload_hash_p, string content_type_p, string content_md5_p,
+	                HTTPHeaders &headers_p)
 	    : encryption_util(encryption_util_p), url(std::move(url_p)), query(query_p.CanonicalQuery()),
 	      host(std::move(host_p)), service(std::move(service_p)), method(HTTPFSUtil::GetRequestMethod(request_type_p)),
 	      auth_params(auth_params_p), date_now(std::move(date_now_p)), datetime_now(std::move(datetime_now_p)),
@@ -101,24 +140,21 @@ public:
 	      content_md5(std::move(content_md5_p)),
 	      use_sse_kms(!auth_params.kms_key_id.empty() &&
 	                  (request_type_p == RequestType::POST_REQUEST || request_type_p == RequestType::PUT_REQUEST) &&
-	                  !query_p.HasParameter("uploadId")) {
+	                  !query_p.HasParameter("uploadId")),
+	      headers(headers_p) {
 	}
 
 public:
-	HTTPHeaders Create() {
+	void Create() {
 		headers["Host"] = host;
-		if (auth_params.secret_access_key.empty() && auth_params.access_key_id.empty()) {
-			return headers;
-		}
-
 		InitializeDefaults();
 		AddRequestHeaders();
-		auto signed_headers = BuildSignedHeaders();
-		auto canonical_request = BuildCanonicalRequest(signed_headers);
+		auto canonical_headers = BuildCanonicalHeaders();
+		auto signed_headers = BuildSignedHeaders(canonical_headers);
+		auto canonical_request = BuildCanonicalRequest(canonical_headers, signed_headers);
 		auto signature = CreateSignature(canonical_request);
 		headers["Authorization"] = "AWS4-HMAC-SHA256 Credential=" + auth_params.access_key_id + "/" +
 		                           CredentialScope() + ", SignedHeaders=" + signed_headers + ", Signature=" + signature;
-		return headers;
 	}
 
 private:
@@ -154,45 +190,64 @@ private:
 		}
 	}
 
-	string BuildSignedHeaders() const {
+	static bool ShouldSignHeader(const string &name) {
+		return StringUtil::CIEquals(name, "host") || StringUtil::CIEquals(name, "content-md5") ||
+		       StringUtil::CIEquals(name, "content-type") || StringUtil::CIStartsWith(name, "x-amz-") ||
+		       StringUtil::CIStartsWith(name, "x-goog-");
+	}
+
+	static string NormalizeHeaderValue(const string &value) {
 		string result;
-		if (!content_md5.empty()) {
-			result += "content-md5;";
-		}
-		if (!content_type.empty()) {
-			result += "content-type;";
-		}
-		result += "host;x-amz-content-sha256;x-amz-date";
-		if (auth_params.requester_pays) {
-			result += ";x-amz-request-payer";
-		}
-		if (!auth_params.session_token.empty()) {
-			result += ";x-amz-security-token";
-		}
-		if (use_sse_kms) {
-			result += ";x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id";
+		bool whitespace = false;
+		for (const auto character : value) {
+			if (character == ' ' || character == '\t') {
+				whitespace = !result.empty();
+				continue;
+			}
+			if (whitespace) {
+				result += ' ';
+				whitespace = false;
+			}
+			result += character;
 		}
 		return result;
 	}
 
-	string BuildCanonicalRequest(const string &signed_headers) const {
+	vector<CanonicalHeader> BuildCanonicalHeaders() const {
+		vector<CanonicalHeader> result;
+		for (const auto &header : headers) {
+			if (!ShouldSignHeader(header.first)) {
+				continue;
+			}
+			auto value = header.second;
+			if (!HTTPFSOwnedS3Headers::Contains(header.first)) {
+				value = NormalizeHeaderValue(value);
+			}
+			result.push_back({StringUtil::Lower(header.first), std::move(value)});
+		}
+		if (!content_type.empty() && !headers.HasHeader("content-type")) {
+			result.push_back({"content-type", content_type});
+		}
+		std::sort(result.begin(), result.end(),
+		          [](const CanonicalHeader &left, const CanonicalHeader &right) { return left.name < right.name; });
+		return result;
+	}
+
+	static string BuildSignedHeaders(const vector<CanonicalHeader> &canonical_headers) {
+		string result;
+		for (const auto &header : canonical_headers) {
+			if (!result.empty()) {
+				result += ';';
+			}
+			result += header.name;
+		}
+		return result;
+	}
+
+	string BuildCanonicalRequest(const vector<CanonicalHeader> &canonical_headers, const string &signed_headers) const {
 		auto result = method + "\n" + S3Url::Encode(url, S3URLEncodeMode::PATH) + "\n" + query;
-		if (!content_md5.empty()) {
-			result += "\ncontent-md5:" + content_md5;
-		}
-		if (!content_type.empty()) {
-			result += "\ncontent-type:" + content_type;
-		}
-		result += "\nhost:" + host + "\nx-amz-content-sha256:" + payload_hash + "\nx-amz-date:" + datetime_now;
-		if (auth_params.requester_pays) {
-			result += "\nx-amz-request-payer:requester";
-		}
-		if (!auth_params.session_token.empty()) {
-			result += "\nx-amz-security-token:" + auth_params.session_token;
-		}
-		if (use_sse_kms) {
-			result += "\nx-amz-server-side-encryption:aws:kms";
-			result += "\nx-amz-server-side-encryption-aws-kms-key-id:" + auth_params.kms_key_id;
+		for (const auto &header : canonical_headers) {
+			result += "\n" + header.name + ":" + header.value;
 		}
 		return result + "\n\n" + signed_headers + "\n" + payload_hash;
 	}
@@ -237,26 +292,66 @@ private:
 	const string content_type;
 	const string content_md5;
 	const bool use_sse_kms;
-	HTTPHeaders headers;
+	HTTPHeaders &headers;
 };
+
+static HTTPHeaders CreateConfiguredS3Headers(const unordered_map<string, string> &extra_headers,
+                                             const string &user_agent) {
+	vector<pair<string, string>> sorted_headers;
+	sorted_headers.reserve(extra_headers.size());
+	for (const auto &header : extra_headers) {
+		sorted_headers.emplace_back(header.first, header.second);
+	}
+	std::sort(sorted_headers.begin(), sorted_headers.end(), [](const auto &left, const auto &right) {
+		auto left_name = StringUtil::Lower(left.first);
+		auto right_name = StringUtil::Lower(right.first);
+		if (left_name != right_name) {
+			return left_name < right_name;
+		}
+		return left.first < right.first;
+	});
+
+	for (idx_t header_idx = 0; header_idx < sorted_headers.size(); header_idx++) {
+		auto &header = sorted_headers[header_idx];
+		if (header_idx > 0 && StringUtil::CIEquals(sorted_headers[header_idx - 1].first, header.first)) {
+			throw InvalidInputException("Configured S3 headers \"%s\" and \"%s\" differ only by case",
+			                            sorted_headers[header_idx - 1].first, header.first);
+		}
+		if (HTTPFSOwnedS3Headers::Contains(header.first)) {
+			throw InvalidInputException("Configured S3 header \"%s\" conflicts with HTTPFS-owned header \"%s\"",
+			                            header.first, HTTPFSOwnedS3Headers::CanonicalName(header.first));
+		}
+	}
+
+	HTTPHeaders result;
+	for (auto &header : sorted_headers) {
+		result[header.first] = header.second;
+	}
+	if (!user_agent.empty()) {
+		result.Insert("User-Agent", user_agent);
+	}
+	return result;
+}
 
 HTTPHeaders S3RequestUtil::CreateHeaders(EncryptionUtil &encryption_util, const ParsedS3Url &parsed_url,
                                          const S3RequestQuery &query, RequestType request_type,
                                          const S3AuthParams &auth_params, string date_now, string datetime_now,
-                                         string payload_hash, string content_type, string content_md5) {
+                                         string payload_hash, string content_type, string content_md5,
+                                         const unordered_map<string, string> &extra_headers, const string &user_agent) {
+	auto headers = CreateConfiguredS3Headers(extra_headers, user_agent);
 	switch (S3Provider::GetAuthType(auth_params)) {
 	case S3AuthType::ANONYMOUS: {
-		HTTPHeaders headers;
 		headers["Host"] = parsed_url.host;
 		return headers;
 	}
-	case S3AuthType::SIGV4:
-		return S3HeaderBuilder(encryption_util, parsed_url.path, query, parsed_url.host, "s3", request_type,
-		                       auth_params, std::move(date_now), std::move(datetime_now), std::move(payload_hash),
-		                       std::move(content_type), std::move(content_md5))
+	case S3AuthType::SIGV4: {
+		S3HeaderBuilder(encryption_util, parsed_url.path, query, parsed_url.host, "s3", request_type, auth_params,
+		                std::move(date_now), std::move(datetime_now), std::move(payload_hash), std::move(content_type),
+		                std::move(content_md5), headers)
 		    .Create();
+		return headers;
+	}
 	case S3AuthType::BEARER: {
-		HTTPHeaders headers;
 		headers["Authorization"] = "Bearer " + auth_params.oauth2_bearer_token;
 		headers["Host"] = parsed_url.host;
 		if (!content_type.empty()) {
@@ -421,9 +516,10 @@ S3RequestData S3RequestExecutor::CreateRequestData(EncryptionUtil &encryption_ut
 	}
 
 	result.http_url = parsed_s3_url.GetHTTPUrl(query.WireQuery());
+	auto &http_params = result.http_params->Cast<HTTPFSParams>();
 	result.headers = S3RequestUtil::CreateHeaders(encryption_util, parsed_s3_url, query, request_type,
-	                                              result.auth_params, "", "", payload_hash, content_type, content_md5);
-	snapshot.AddConfiguredHeaders(result.headers);
+	                                              result.auth_params, "", "", payload_hash, content_type, content_md5,
+	                                              http_params.extra_headers, http_params.user_agent);
 	return result;
 }
 

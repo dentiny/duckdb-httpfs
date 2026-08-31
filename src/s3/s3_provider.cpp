@@ -105,15 +105,15 @@ vector<string> S3Provider::GetSchemeAliasPrefixes(const DBConfig &config) {
 }
 
 const array<const char *, 4> &S3Provider::SecretTypes() {
-	static const array<const char *, 4> secret_types = {"s3", "r2", "gcs", "aws"};
-	return secret_types;
+	static constexpr array<const char *, 4> SECRET_TYPES = {"s3", "r2", "gcs", "aws"};
+	return SECRET_TYPES;
 }
 
 const array<const char *, 12> &S3Provider::CredentialMaterialKeys() {
-	static const array<const char *, 12> credential_material_keys = {
+	static constexpr array<const char *, 12> CREDENTIAL_MATERIAL_KEYS = {
 	    "key_id",    "secret",  "session_token",          "region",         "endpoint",     "kms_key_id",
 	    "url_style", "use_ssl", "url_compatibility_mode", "requester_pays", "bearer_token", "account_id"};
-	return credential_material_keys;
+	return CREDENTIAL_MATERIAL_KEYS;
 }
 
 optional<S3ProviderMatch> S3Provider::TryMatchUrl(const string &url) {
@@ -310,7 +310,7 @@ S3AuthType S3Provider::GetAuthType(const S3AuthParams &auth_params) {
 
 string S3Provider::GetBadRequestError(const S3AuthParams &auth_params, const string &correct_region) {
 	if (auth_params.provider_type != S3ProviderType::S3) {
-		return string();
+		return {};
 	}
 	string extra_text = "\n\nBad Request - this can be caused by the S3 region being set incorrectly.";
 	if (auth_params.region.empty()) {
