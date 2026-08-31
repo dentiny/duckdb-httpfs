@@ -108,7 +108,13 @@ CREATE SECRET s3_headers (
 	ENDPOINT '%s',
 	USE_SSL false,
 	URL_STYLE 'path',
-	EXTRA_HTTP_HEADERS MAP {'X-HTTPFS-Session': 'present'}
+	EXTRA_HTTP_HEADERS MAP {
+		'X-HTTPFS-Session': 'present',
+		'X-AmZ-Meta-Color': 'blue',
+		'x-GoOg-Meta-Mode': 'fast',
+		'X-AmZ-Meta-Empty': '',
+		'x-GoOg-Meta-Whitespace': '   '
+	}
 ))",
 	                                                     S3TestHelper::S3_PATH, server.Endpoint()));
 
@@ -128,7 +134,115 @@ CREATE SECRET s3_headers (
 		REQUIRE_FALSE(observation.user_agent.empty());
 		REQUIRE(observation.session_header_count == 1);
 		REQUIRE(observation.session_header == "present");
+		REQUIRE(MockS3HeaderValues(observation, "X-AmZ-Meta-Color") == vector<string> {"blue"});
+		REQUIRE(MockS3HeaderValues(observation, "x-GoOg-Meta-Mode") == vector<string> {"fast"});
+		REQUIRE(MockS3HeaderValues(observation, "X-AmZ-Meta-Empty") == vector<string> {""});
+		REQUIRE(MockS3HeaderValues(observation, "x-GoOg-Meta-Whitespace") == vector<string> {""});
+		REQUIRE(StringUtil::Contains(observation.authorization, "x-amz-meta-color"));
+		REQUIRE(StringUtil::Contains(observation.authorization, "x-amz-meta-empty"));
+		REQUIRE(StringUtil::Contains(observation.authorization, "x-goog-meta-mode"));
+		REQUIRE(StringUtil::Contains(observation.authorization, "x-goog-meta-whitespace"));
+		REQUIRE_FALSE(StringUtil::Contains(observation.authorization, "x-httpfs-session"));
+		REQUIRE_FALSE(StringUtil::Contains(observation.authorization, "user-agent"));
+
+		bool found_amz_spelling = false;
+		bool found_goog_spelling = false;
+		for (const auto &header : observation.headers) {
+			found_amz_spelling |= header.first == "X-AmZ-Meta-Color";
+			found_goog_spelling |= header.first == "x-GoOg-Meta-Mode";
+		}
+		REQUIRE(found_amz_spelling);
+		REQUIRE(found_goog_spelling);
 	}
+}
+
+static void RunS3RejectedHeaderScenario(const string &client_implementation) {
+	MockS3ServerConfig config;
+	config.auth.stale_key_id = "NEVER_STALE";
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	S3TestHelper::LoadExtension(db);
+	S3TestHelper::RequireQueryOk(con,
+	                             StringUtil::Format("SET httpfs_client_implementation='%s'", client_implementation));
+	S3TestHelper::RequireQueryOk(con, "SET httpfs_connection_caching=false");
+	S3TestHelper::RequireQueryOk(con, StringUtil::Format(R"(
+CREATE SECRET s3_rejected_headers (
+	TYPE S3,
+	SCOPE '%s',
+	KEY_ID 'FRESH_KEY',
+	SECRET 'S3TestHelper::FRESH_SECRET',
+	REGION 'us-east-1',
+	ENDPOINT '%s',
+	USE_SSL false,
+	URL_STYLE 'path'
+))",
+	                                                     S3TestHelper::S3_PATH, server.Endpoint()));
+
+	auto capture_open_error = [&]() {
+		S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+		string error;
+		try {
+			auto &fs = FileSystem::GetFileSystem(*con.context);
+			fs.OpenFile(S3TestHelper::S3_PATH, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+		} catch (std::exception &ex) {
+			error = ex.what();
+		}
+		S3TestHelper::RequireQueryOk(con, "ROLLBACK");
+		return error;
+	};
+	const vector<pair<string, string>> protected_headers {
+	    {"hOsT", "Host"},
+	    {"AUTHORIZATION", "Authorization"},
+	    {"content-LENGTH", "Content-Length"},
+	    {"CONTENT-type", "Content-Type"},
+	    {"content-md5", "Content-MD5"},
+	    {"RANGE", "Range"},
+	    {"if-match", "If-Match"},
+	    {"X-AMZ-DATE", "x-amz-date"},
+	    {"X-AMZ-CONTENT-SHA256", "x-amz-content-sha256"},
+	    {"X-AMZ-SECURITY-TOKEN", "x-amz-security-token"},
+	    {"X-AMZ-REQUEST-PAYER", "x-amz-request-payer"},
+	    {"X-AMZ-SERVER-SIDE-ENCRYPTION", "x-amz-server-side-encryption"},
+	    {"X-AMZ-SERVER-SIDE-ENCRYPTION-AWS-KMS-KEY-ID", "x-amz-server-side-encryption-aws-kms-key-id"},
+	};
+	for (const auto &protected_header : protected_headers) {
+		S3TestHelper::RequireQueryOk(
+		    con, StringUtil::Format("SET extra_http_headers=MAP {'%s': 'override'}", protected_header.first));
+		auto error = capture_open_error();
+		INFO(client_implementation);
+		INFO(protected_header.first);
+		REQUIRE(StringUtil::Contains(error, protected_header.first));
+		REQUIRE(StringUtil::Contains(error, protected_header.second));
+		REQUIRE(server.Observations().empty());
+	}
+
+	S3TestHelper::RequireQueryOk(
+	    con, "SET extra_http_headers=MAP {'X-Amz-Meta-Duplicate': 'one', 'x-amz-meta-duplicate': 'two'}");
+	auto raw_duplicate_error = capture_open_error();
+	REQUIRE(StringUtil::Contains(raw_duplicate_error, "X-Amz-Meta-Duplicate"));
+	REQUIRE(StringUtil::Contains(raw_duplicate_error, "x-amz-meta-duplicate"));
+	REQUIRE(server.Observations().empty());
+
+	S3TestHelper::RequireQueryOk(con, "SET extra_http_headers=MAP {'X-Amz-Meta-Layer': 'setting'}");
+	S3TestHelper::RequireQueryOk(con, StringUtil::Format(R"(
+CREATE OR REPLACE SECRET s3_rejected_headers (
+	TYPE S3,
+	SCOPE '%s',
+	KEY_ID 'FRESH_KEY',
+	SECRET 'S3TestHelper::FRESH_SECRET',
+	REGION 'us-east-1',
+	ENDPOINT '%s',
+	USE_SSL false,
+	URL_STYLE 'path',
+	EXTRA_HTTP_HEADERS MAP {'x-amz-meta-layer': 'secret'}
+))",
+	                                                     S3TestHelper::S3_PATH, server.Endpoint()));
+	auto layered_duplicate_error = capture_open_error();
+	REQUIRE(StringUtil::Contains(layered_duplicate_error, "X-Amz-Meta-Layer"));
+	REQUIRE(StringUtil::Contains(layered_duplicate_error, "x-amz-meta-layer"));
+	REQUIRE(server.Observations().empty());
 }
 
 static void RunS3RegionRedirectScenario(const string &client_implementation, bool list_request) {
@@ -153,7 +267,8 @@ CREATE SECRET s3_region_redirect (
 	REGION 'eu-west-1',
 	ENDPOINT '%s',
 	USE_SSL false,
-	URL_STYLE 'path'
+	URL_STYLE 'path',
+	EXTRA_HTTP_HEADERS MAP {'X-AmZ-Meta-Region': 'region-value'}
 ))",
 	                                                     server.Endpoint()));
 
@@ -179,6 +294,8 @@ CREATE SECRET s3_region_redirect (
 	bool saw_redirect = false;
 	bool saw_success = false;
 	for (const auto &observation : observations) {
+		REQUIRE(MockS3HeaderValues(observation, "X-AmZ-Meta-Region") == vector<string> {"region-value"});
+		REQUIRE(StringUtil::Contains(observation.authorization, "x-amz-meta-region"));
 		if (observation.status == 301 && observation.region == "eu-west-1") {
 			saw_redirect = true;
 		}
@@ -517,6 +634,114 @@ TEST_CASE("S3 provider policy selects request authentication", "[httpfs][s3][pro
 	}
 }
 
+TEST_CASE("S3 configured headers are validated before request authentication", "[httpfs][s3][headers]") {
+	::AESStateSSLFactory encryption_util;
+	ParsedS3Url parsed_url;
+	parsed_url.path = "/bucket/key";
+	parsed_url.host = "storage.example.com";
+
+	vector<S3AuthParams> auth_params(3);
+	auth_params[1].region = "us-east-1";
+	auth_params[1].access_key_id = "key";
+	auth_params[1].secret_access_key = "secret";
+	auth_params[2].provider_type = S3ProviderType::GCS;
+	auth_params[2].oauth2_bearer_token = "token";
+
+	auto create_headers = [&](const S3AuthParams &auth, const unordered_map<string, string> &extra_headers,
+	                          const string &user_agent = "httpfs-agent") {
+		return S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(), RequestType::GET_REQUEST,
+		                                    auth, "", "", "", "", "", extra_headers, user_agent);
+	};
+	auto capture_error = [&](const S3AuthParams &auth, const unordered_map<string, string> &extra_headers) {
+		try {
+			create_headers(auth, extra_headers);
+			return string();
+		} catch (std::exception &ex) {
+			return string(ex.what());
+		}
+	};
+
+	SECTION("allowed headers are merged once for every authentication mode") {
+		unordered_map<string, string> extra_headers {
+		    {"X-HTTPFS-Session", "present"}, {"x-amz-meta-test", "metadata"}, {"uSeR-aGeNt", "custom-agent"}};
+		for (idx_t auth_idx = 0; auth_idx < auth_params.size(); auth_idx++) {
+			auto headers = create_headers(auth_params[auth_idx], extra_headers);
+			REQUIRE(headers.GetHeaderValue("X-HTTPFS-Session") == "present");
+			REQUIRE(headers.GetHeaderValue("x-amz-meta-test") == "metadata");
+			REQUIRE(headers.GetHeaderValue("User-Agent") == "custom-agent");
+			if (auth_idx == 0) {
+				REQUIRE_FALSE(headers.HasHeader("Authorization"));
+			} else if (auth_idx == 1) {
+				auto authorization = headers.GetHeaderValue("Authorization");
+				REQUIRE_FALSE(StringUtil::Contains(authorization, "x-httpfs-session"));
+				REQUIRE_FALSE(StringUtil::Contains(authorization, "user-agent"));
+			} else {
+				REQUIRE(headers.GetHeaderValue("Authorization") == "Bearer token");
+			}
+		}
+	}
+
+	SECTION("case variants fail deterministically") {
+		unordered_map<string, string> extra_headers {{"X-Amz-Meta-Test", "first"}, {"x-amz-meta-test", "second"}};
+		for (const auto &auth : auth_params) {
+			auto error = capture_error(auth, extra_headers);
+			REQUIRE(StringUtil::Contains(error, "X-Amz-Meta-Test"));
+			REQUIRE(StringUtil::Contains(error, "x-amz-meta-test"));
+		}
+	}
+
+	SECTION("HTTPFS-owned headers fail case-insensitively") {
+		const vector<pair<string, string>> protected_headers {
+		    {"hOsT", "Host"},
+		    {"AUTHORIZATION", "Authorization"},
+		    {"content-LENGTH", "Content-Length"},
+		    {"CONTENT-type", "Content-Type"},
+		    {"content-md5", "Content-MD5"},
+		    {"RANGE", "Range"},
+		    {"if-match", "If-Match"},
+		    {"X-AMZ-DATE", "x-amz-date"},
+		    {"X-AMZ-CONTENT-SHA256", "x-amz-content-sha256"},
+		    {"X-AMZ-SECURITY-TOKEN", "x-amz-security-token"},
+		    {"X-AMZ-REQUEST-PAYER", "x-amz-request-payer"},
+		    {"X-AMZ-SERVER-SIDE-ENCRYPTION", "x-amz-server-side-encryption"},
+		    {"X-AMZ-SERVER-SIDE-ENCRYPTION-AWS-KMS-KEY-ID", "x-amz-server-side-encryption-aws-kms-key-id"},
+		};
+		for (const auto &auth : auth_params) {
+			for (const auto &protected_header : protected_headers) {
+				auto error = capture_error(auth, {{protected_header.first, "override"}});
+				INFO(protected_header.first);
+				REQUIRE(StringUtil::Contains(error, protected_header.first));
+				REQUIRE(StringUtil::Contains(error, protected_header.second));
+			}
+		}
+	}
+}
+
+TEST_CASE("S3 rejects configured header conflicts before request dispatch", "[httpfs][s3][headers][request-session]") {
+	HTTPFSUtil http_util;
+	HTTPFSParams http_params(http_util);
+	http_params.extra_headers["hOsT"] = "override";
+	S3AuthParams auth_params;
+	auth_params.region = "us-east-1";
+	auth_params.endpoint = "s3.amazonaws.com";
+	auth_params.access_key_id = "key";
+	auth_params.secret_access_key = "secret";
+	auto snapshot = make_shared_ptr<S3RequestSnapshot>(http_params, auth_params, "s3://bucket/key",
+	                                                   weak_ptr<ClientContext>(), false);
+	HTTPRequestSession session(snapshot);
+	::AESStateSSLFactory encryption_util;
+	idx_t request_count = 0;
+
+	REQUIRE_THROWS(S3RequestExecutor::RunSession(
+	    encryption_util, session, "s3://bucket/key", RequestType::GET_REQUEST, S3RequestTarget::OBJECT,
+	    [](const ParsedS3Url &) { return S3RequestQuery(); }, "", "", "",
+	    [&](S3RequestData &) {
+		    request_count++;
+		    return make_uniq<HTTPResponse>(HTTPStatusCode::OK_200);
+	    }));
+	REQUIRE(request_count == 0);
+}
+
 TEST_CASE("S3 HTTP errors preserve metadata and provider-specific context", "[httpfs][s3][error]") {
 	HTTPResponse response(HTTPStatusCode::Forbidden_403);
 	response.reason = "Forbidden by test";
@@ -664,7 +889,110 @@ TEST_CASE("S3 request signing includes optional headers", "[httpfs][s3][signing]
 	REQUIRE(headers.GetHeaderValue("x-amz-request-payer") == "requester");
 	REQUIRE(headers.GetHeaderValue("x-amz-server-side-encryption") == "aws:kms");
 	REQUIRE(headers.GetHeaderValue("x-amz-server-side-encryption-aws-kms-key-id") == "kms-key");
-	REQUIRE(headers.GetHeaderValue("Authorization").find("content-md5;content-type;host;") != string::npos);
+	REQUIRE(headers.GetHeaderValue("Authorization") ==
+	        "AWS4-HMAC-SHA256 Credential=key/20260730/eu-west-1/s3/aws4_request, "
+	        "SignedHeaders=content-md5;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-request-payer;"
+	        "x-amz-security-token;x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id, "
+	        "Signature=303dcf01c2ad19bf52fe539998ff6fa5d6a5d3ee54c6eb8cf6275ed5128e89b0");
+}
+
+TEST_CASE("S3 request signing canonicalizes configured extension headers", "[httpfs][s3][signing][headers]") {
+	::AESStateSSLFactory encryption_util;
+	S3AuthParams auth_params;
+	auth_params.region = "us-east-1";
+	auth_params.access_key_id = "key";
+	auth_params.secret_access_key = "secret";
+	ParsedS3Url parsed_url;
+	parsed_url.path = "/bucket/key";
+	parsed_url.host = "bucket.example.com";
+	unordered_map<string, string> raw_headers {
+	    {"X-AmZ-Meta-Color", "\t blue  green \t"}, {"x-GoOg-Meta-Mode", "  fast\tmode  "}, {"X-Ordinary", "value"}};
+	unordered_map<string, string> normalized_headers {
+	    {"x-amz-meta-color", "blue green"}, {"X-GOOG-META-MODE", "fast mode"}, {"X-Ordinary", "value"}};
+
+	auto raw = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(), RequestType::GET_REQUEST,
+	                                        auth_params, "20260831", "20260831T120000Z", "", "", "", raw_headers,
+	                                        "httpfs-agent");
+	auto normalized = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(),
+	                                               RequestType::GET_REQUEST, auth_params, "20260831",
+	                                               "20260831T120000Z", "", "", "", normalized_headers, "httpfs-agent");
+
+	const auto &authorization = raw.GetHeaderValue("Authorization");
+	REQUIRE(authorization == normalized.GetHeaderValue("Authorization"));
+	REQUIRE(authorization == "AWS4-HMAC-SHA256 Credential=key/20260831/us-east-1/s3/aws4_request, "
+	                         "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-color;x-goog-meta-mode, "
+	                         "Signature=3ed4748c9e12b8756c2328d76892759de1d0bea864f52926473f594f2c38e89d");
+	REQUIRE_FALSE(StringUtil::Contains(authorization, "x-ordinary"));
+	REQUIRE_FALSE(StringUtil::Contains(authorization, "user-agent"));
+	REQUIRE(raw.GetHeaderValue("X-AmZ-Meta-Color") == "\t blue  green \t");
+	REQUIRE(raw.GetHeaderValue("x-GoOg-Meta-Mode") == "  fast\tmode  ");
+
+	bool found_amz_spelling = false;
+	bool found_goog_spelling = false;
+	for (const auto &header : raw) {
+		found_amz_spelling |= header.first == "X-AmZ-Meta-Color";
+		found_goog_spelling |= header.first == "x-GoOg-Meta-Mode";
+	}
+	REQUIRE(found_amz_spelling);
+	REQUIRE(found_goog_spelling);
+}
+
+TEST_CASE("S3 request signing preserves empty configured extension headers", "[httpfs][s3][signing][headers]") {
+	::AESStateSSLFactory encryption_util;
+	S3AuthParams auth_params;
+	auth_params.region = "us-east-1";
+	auth_params.access_key_id = "key";
+	auth_params.secret_access_key = "secret";
+	ParsedS3Url parsed_url;
+	parsed_url.path = "/bucket/key";
+	parsed_url.host = "bucket.example.com";
+	unordered_map<string, string> raw_headers {{"X-AmZ-Meta-Empty", ""}, {"x-GoOg-Meta-Whitespace", "\t  \t"}};
+	unordered_map<string, string> normalized_headers {{"x-amz-meta-empty", ""}, {"X-GOOG-META-WHITESPACE", ""}};
+
+	auto raw = S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(), RequestType::GET_REQUEST,
+	                                        auth_params, "20260831", "20260831T120000Z", "", "", "", raw_headers);
+	auto normalized =
+	    S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(), RequestType::GET_REQUEST,
+	                                 auth_params, "20260831", "20260831T120000Z", "", "", "", normalized_headers);
+
+	const auto &authorization = raw.GetHeaderValue("Authorization");
+	REQUIRE(authorization == normalized.GetHeaderValue("Authorization"));
+	REQUIRE(authorization ==
+	        "AWS4-HMAC-SHA256 Credential=key/20260831/us-east-1/s3/aws4_request, "
+	        "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-empty;x-goog-meta-whitespace, "
+	        "Signature=5455a5d0c5002b36bdd90eb1719e3620ce3df4cfb1bd7d73e295721f96a7d787");
+	REQUIRE(raw.GetHeaderValue("X-AmZ-Meta-Empty").empty());
+	REQUIRE(raw.GetHeaderValue("x-GoOg-Meta-Whitespace") == "\t  \t");
+}
+
+TEST_CASE("S3 request signing changes configured headers after a region redirect", "[httpfs][s3][signing][headers]") {
+	::AESStateSSLFactory encryption_util;
+	S3AuthParams auth_params;
+	auth_params.region = "us-east-1";
+	auth_params.access_key_id = "key";
+	auth_params.secret_access_key = "secret";
+	ParsedS3Url parsed_url;
+	parsed_url.path = "/bucket/key";
+	parsed_url.host = "bucket.example.com";
+	unordered_map<string, string> extra_headers {{"X-AmZ-Meta-Region", "region-value"}};
+
+	auto us_east_1 =
+	    S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(), RequestType::GET_REQUEST,
+	                                 auth_params, "20260831", "20260831T120000Z", "", "", "", extra_headers);
+	auth_params.region = "eu-west-1";
+	auto eu_west_1 =
+	    S3RequestUtil::CreateHeaders(encryption_util, parsed_url, S3RequestQuery(), RequestType::GET_REQUEST,
+	                                 auth_params, "20260831", "20260831T120000Z", "", "", "", extra_headers);
+
+	const auto &us_authorization = us_east_1.GetHeaderValue("Authorization");
+	const auto &eu_authorization = eu_west_1.GetHeaderValue("Authorization");
+	REQUIRE(us_authorization == "AWS4-HMAC-SHA256 Credential=key/20260831/us-east-1/s3/aws4_request, "
+	                            "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-region, "
+	                            "Signature=826c88e7c2fb7eaac361dd8c8c3d82d8cad1b0e873fa424c7077c8c32e564595");
+	REQUIRE(eu_authorization == "AWS4-HMAC-SHA256 Credential=key/20260831/eu-west-1/s3/aws4_request, "
+	                            "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-region, "
+	                            "Signature=63d1e86e39a4cc2c815cbd349d1dbc7358240af72d2b82a0a27045a76ff704fb");
+	REQUIRE(us_authorization != eu_authorization);
 }
 
 TEST_CASE("S3 request queries share canonical and wire encoding", "[httpfs][s3][query][signing]") {
@@ -751,7 +1079,7 @@ TEST_CASE("HTTPFS initializes and clones parameters without a configured proxy",
 	REQUIRE(cloned_params.http_proxy_port == 0);
 }
 
-TEST_CASE("HTTP request sessions merge configured headers once", "[httpfs][request-session][headers]") {
+TEST_CASE("HTTP request sessions merge configured headers once", "[httpfs][s3][request-session][headers]") {
 	SECTION("httplib") {
 		RunS3HeaderScenario("httplib");
 	}
@@ -799,6 +1127,16 @@ TEST_CASE("GCS list failures use provider-specific authentication diagnostics", 
 	}
 	SECTION("curl") {
 		RunGCSListAuthErrorScenario("curl");
+	}
+}
+
+TEST_CASE("S3 request sessions reject conflicting configured headers before HTTP",
+          "[httpfs][s3][request-session][headers]") {
+	SECTION("httplib") {
+		RunS3RejectedHeaderScenario("httplib");
+	}
+	SECTION("curl") {
+		RunS3RejectedHeaderScenario("curl");
 	}
 }
 

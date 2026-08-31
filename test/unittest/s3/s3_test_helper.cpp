@@ -92,15 +92,23 @@ struct TestS3SecretFunctions : public CreateS3SecretFunctions {
 	static void SetTestNamedParams(CreateSecretFunction &function, string type) {
 		SetBaseNamedParams(function, type);
 		function.named_parameters["test_id"] = LogicalType::VARCHAR;
+		function.named_parameters["test_extra_header_name"] = LogicalType::VARCHAR;
+		function.named_parameters["test_extra_header_value"] = LogicalType::VARCHAR;
 	}
 
 	static unique_ptr<BaseSecret> CreateTestSecret(ClientContext &context, CreateSecretInput &input) {
 		RecordProviderCall(GetOptionString(input, "test_id"), GetOptionString(input, "key_id"));
 
 		auto delegated_input = input;
-		auto test_id_entry = delegated_input.options.find("test_id");
-		if (test_id_entry != delegated_input.options.end()) {
-			delegated_input.options.erase(test_id_entry);
+		delegated_input.options.erase("test_id");
+		auto extra_header_name = GetOptionString(delegated_input, "test_extra_header_name");
+		auto extra_header_value = GetOptionString(delegated_input, "test_extra_header_value");
+		delegated_input.options.erase("test_extra_header_name");
+		delegated_input.options.erase("test_extra_header_value");
+		if (!extra_header_name.empty()) {
+			InsertionOrderPreservingMap<string> extra_headers;
+			extra_headers.insert(extra_header_name, extra_header_value);
+			delegated_input.options["extra_http_headers"] = Value::MAP(extra_headers);
 		}
 		return CreateSecretFunctionInternal(context, delegated_input);
 	}

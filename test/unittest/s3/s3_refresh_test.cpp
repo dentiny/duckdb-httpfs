@@ -456,6 +456,86 @@ static void RunRefreshPublicationScenario(const string &client_implementation, b
 	S3TestHelper::AssertSingleRefresh(test_id);
 }
 
+static void RunConfiguredHeaderRefreshScenario(const string &client_implementation, bool refresh_to_reserved_header) {
+	MockS3ServerConfig config;
+	config.object.bucket = S3TestHelper::BUCKET;
+	config.object.key = S3TestHelper::OBJECT_KEY;
+	config.auth.stale_key_id = S3TestHelper::STALE_KEY_ID;
+	config.auth.refresh_target = MockS3RefreshTarget::HEAD;
+	MockS3Server server(std::move(config));
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	S3TestHelper::LoadExtension(db);
+	S3TestHelper::RegisterRefreshProvider(db);
+	auto test_id = S3TestHelper::NextTestId();
+	S3TestHelper::RequireQueryOk(con,
+	                             StringUtil::Format("SET httpfs_client_implementation='%s'", client_implementation));
+	S3TestHelper::RequireQueryOk(con, "SET httpfs_connection_caching=false");
+	S3TestHelper::RequireQueryOk(con, "SET httpfs_enable_credential_refresh=true");
+	S3TestHelper::RequireQueryOk(con, StringUtil::Format("SET s3_endpoint='%s'", server.Endpoint()));
+	S3TestHelper::RequireQueryOk(con, "SET s3_region='us-east-1'");
+	S3TestHelper::RequireQueryOk(con, "SET s3_use_ssl=false");
+	S3TestHelper::RequireQueryOk(con, "SET s3_url_style='path'");
+	auto fresh_header_name = refresh_to_reserved_header ? "hOsT" : "x-GoOg-Meta-Fresh";
+	S3TestHelper::RequireQueryOk(con,
+	                             StringUtil::Format(R"(
+CREATE SECRET refresh_s3_headers (
+	TYPE S3,
+	PROVIDER %s,
+	SCOPE 's3://refresh-bucket/',
+	KEY_ID '%s',
+	SECRET '%s',
+	TEST_ID '%s',
+	TEST_EXTRA_HEADER_NAME 'X-AmZ-Meta-Stale',
+	TEST_EXTRA_HEADER_VALUE 'stale-value',
+	REFRESH_INFO MAP {
+		'KEY_ID': '%s',
+		'SECRET': '%s',
+		'TEST_ID': '%s',
+		'TEST_EXTRA_HEADER_NAME': '%s',
+		'TEST_EXTRA_HEADER_VALUE': 'fresh-value'
+	}
+))",
+	                                                S3TestHelper::TEST_PROVIDER, S3TestHelper::STALE_KEY_ID,
+	                                                S3TestHelper::STALE_SECRET, test_id, S3TestHelper::FRESH_KEY_ID,
+	                                                S3TestHelper::FRESH_SECRET, test_id, fresh_header_name));
+
+	S3TestHelper::RequireQueryOk(con, "BEGIN TRANSACTION");
+	string error;
+	try {
+		OpenForRead(con, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_DIRECT_IO);
+	} catch (std::exception &ex) {
+		error = ex.what();
+	}
+	S3TestHelper::RequireQueryOk(con, error.empty() ? "COMMIT" : "ROLLBACK");
+	auto observations = server.Observations();
+	INFO(client_implementation);
+	INFO(MockS3DescribeObservations(observations));
+	S3TestHelper::AssertSingleRefresh(test_id);
+	REQUIRE(observations.size() == (refresh_to_reserved_header ? 1 : 2));
+	const auto &stale_observation = observations[0];
+	REQUIRE(stale_observation.key_id == S3TestHelper::STALE_KEY_ID);
+	REQUIRE(stale_observation.status == 403);
+	REQUIRE(MockS3HeaderValues(stale_observation, "X-AmZ-Meta-Stale") == vector<string> {"stale-value"});
+	REQUIRE(StringUtil::Contains(stale_observation.authorization, "x-amz-meta-stale"));
+
+	if (refresh_to_reserved_header) {
+		REQUIRE(StringUtil::Contains(error, "hOsT"));
+		REQUIRE(StringUtil::Contains(error, "Host"));
+		return;
+	}
+
+	REQUIRE(error.empty());
+	const auto &fresh_observation = observations[1];
+	REQUIRE(fresh_observation.key_id == S3TestHelper::FRESH_KEY_ID);
+	REQUIRE(fresh_observation.status == 200);
+	REQUIRE(MockS3HeaderValues(fresh_observation, "x-GoOg-Meta-Fresh") == vector<string> {"fresh-value"});
+	REQUIRE(MockS3HeaderValues(fresh_observation, "X-AmZ-Meta-Stale").empty());
+	REQUIRE(StringUtil::Contains(fresh_observation.authorization, "x-goog-meta-fresh"));
+	REQUIRE_FALSE(StringUtil::Contains(fresh_observation.authorization, "x-amz-meta-stale"));
+}
+
 } // namespace
 
 TEST_CASE("HTTPFS refreshes S3 credentials across request methods", "[httpfs][s3][refresh]") {
@@ -549,6 +629,17 @@ TEST_CASE("S3 credential refresh composes with a concurrent region publication",
 	}
 	SECTION("curl") {
 		RunRefreshPublicationScenario("curl", false, true);
+	}
+}
+
+TEST_CASE("S3 credential refresh revalidates and re-signs configured headers", "[httpfs][s3][refresh][headers]") {
+	for (const string client_implementation : {"httplib", "curl"}) {
+		DYNAMIC_SECTION(client_implementation << " signs refreshed header material") {
+			RunConfiguredHeaderRefreshScenario(client_implementation, false);
+		}
+		DYNAMIC_SECTION(client_implementation << " rejects a refreshed reserved header before dispatch") {
+			RunConfiguredHeaderRefreshScenario(client_implementation, true);
+		}
 	}
 }
 

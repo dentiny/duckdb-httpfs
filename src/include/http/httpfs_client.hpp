@@ -34,6 +34,17 @@ class HTTPException;
 
 enum class HTTPClientReuseMode : uint8_t { SESSION_LOCAL, SHARED, NONE };
 
+struct HTTPFSHeaderValue {
+	static bool IsEmpty(const string &value) {
+		for (const auto character : value) {
+			if (character != ' ' && character != '\t') {
+				return false;
+			}
+		}
+		return true;
+	}
+};
+
 struct HTTPFSParams : public HTTPParams {
 public:
 	explicit HTTPFSParams(HTTPUtil &http_util) : HTTPParams(http_util) {

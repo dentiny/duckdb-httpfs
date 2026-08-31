@@ -152,6 +152,7 @@ struct MockS3ServerConfig {
 };
 
 struct MockS3RequestObservation {
+	vector<std::pair<string, string>> headers;
 	string method;
 	string path;
 	string target;
@@ -212,6 +213,7 @@ string MockS3RefreshTargetName(MockS3RefreshTarget target);
 bool MockS3HasObservation(const vector<MockS3RequestObservation> &observations, const string &method,
                           const string &key_id, int status, const string &range = string(),
                           const string &target_contains = string());
+vector<string> MockS3HeaderValues(const MockS3RequestObservation &observation, const string &name);
 string MockS3DescribeObservations(const vector<MockS3RequestObservation> &observations);
 
 } // namespace duckdb

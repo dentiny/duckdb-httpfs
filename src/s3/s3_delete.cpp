@@ -262,7 +262,7 @@ void S3FileSystem::RemoveFiles(const vector<string> &paths, optional_ptr<FileOpe
 		    S3RequestExecutor::CreateSession(opener, secret_lookup_paths.front(), url_info.auth_params);
 
 		for (idx_t batch_start = 0; batch_start < keys.size(); batch_start += MAX_KEYS_PER_REQUEST) {
-			idx_t batch_end = MinValue<idx_t>(batch_start + MAX_KEYS_PER_REQUEST, keys.size());
+			auto batch_end = MinValue<idx_t>(batch_start + MAX_KEYS_PER_REQUEST, keys.size());
 			auto body = S3XMLWriter::WriteDeleteObjectsRequest(keys, batch_start, batch_end);
 			string result;
 			S3RequestContext request_context;
