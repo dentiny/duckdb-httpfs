@@ -476,6 +476,22 @@ bool S3RequestUtil::IsRequestTimeout(const HTTPResponse &response) {
 	return S3XMLResponseParser::TryParseError(response.body, error) && error.code == "RequestTimeout";
 }
 
+bool S3RequestUtil::IsRetryableReceivedResponse(const HTTPResponse &response) {
+	if (response.HasRequestError()) {
+		return false;
+	}
+	auto status = static_cast<int>(response.status);
+	if (response.status == HTTPStatusCode::TooManyRequests_429 || (status >= 500 && status < 600)) {
+		return true;
+	}
+	S3XMLError error;
+	if (!S3XMLResponseParser::TryParseError(response.body, error)) {
+		return false;
+	}
+	return error.code == "InternalError" || error.code == "OperationAborted" || error.code == "SlowDown" ||
+	       error.code == "ServiceUnavailable" || error.code == "TooManyRequests" || error.code == "RequestTimeout";
+}
+
 static bool IsS3RequestTimeoutError(const ErrorData &error) {
 	auto &extra_info = error.ExtraInfo();
 	auto status_entry = extra_info.find("status_code");
@@ -503,12 +519,23 @@ static bool IsTransientRetryEligibleMethod(RequestType request_type) {
 	       request_type == RequestType::PUT_REQUEST || request_type == RequestType::DELETE_REQUEST;
 }
 
-unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, const CreateDataCallback &create_data,
-                                                const RequestCallback &request,
-                                                const RefreshCallback &refresh_auth_params,
-                                                const SetRegionCallback &set_region,
-                                                const FinalRequestCallback &final_request) {
-	// Auth refresh and region redirect are one-shot; transient timeouts follow the configured HTTP retry policy.
+static bool ShouldRetryReceivedResponse(const S3RequestData &request_data, const HTTPResponse &response,
+                                        S3PostRequestMode post_request_mode) {
+	if (response.HasRequestError()) {
+		return false;
+	}
+	if (IsTransientRetryEligibleMethod(request_data.request_type) && S3RequestUtil::IsRequestTimeout(response)) {
+		return true;
+	}
+	return post_request_mode == S3PostRequestMode::RETRY_RECEIVED_RESPONSES &&
+	       S3RequestUtil::IsRetryableReceivedResponse(response);
+}
+
+unique_ptr<HTTPResponse>
+S3RequestExecutor::Run(const string &s3_url, const CreateDataCallback &create_data, const RequestCallback &request,
+                       const RefreshCallback &refresh_auth_params, const SetRegionCallback &set_region,
+                       const FinalRequestCallback &final_request, S3PostRequestMode post_request_mode) {
+	// Auth refresh and region redirect are one-shot; transient responses follow the configured HTTP retry policy.
 	bool retried_auth_refresh = false;
 	bool retried_region = false;
 	idx_t transient_retries = 0;
@@ -518,19 +545,21 @@ unique_ptr<HTTPResponse> S3RequestExecutor::Run(const string &s3_url, const Crea
 		auto &http_params = request_data.http_params->Cast<HTTPFSParams>();
 		try {
 			auto result = request(request_data);
-			if (result && !retried_auth_refresh && IsAuthRefreshStatus(*result) && refresh_auth_params(request_data)) {
+			auto received_response = result && !result->HasRequestError();
+			if (received_response && !retried_auth_refresh && IsAuthRefreshStatus(*result) &&
+			    refresh_auth_params(request_data)) {
 				retried_auth_refresh = true;
 				continue;
 			}
 			string correct_region;
-			if (result && !retried_region &&
+			if (received_response && !retried_region &&
 			    GetRegionRedirect(*result, request_data.auth_params, correct_region).IsValid()) {
 				set_region(request_data, correct_region);
 				retried_region = true;
 				continue;
 			}
-			if (IsTransientRetryEligibleMethod(request_data.request_type) && result &&
-			    transient_retries < http_params.retries && S3RequestUtil::IsRequestTimeout(*result)) {
+			if (received_response && transient_retries < http_params.retries &&
+			    ShouldRetryReceivedResponse(request_data, *result, post_request_mode)) {
 				SleepForRetry(http_params, transient_retries, transient_wait_ms);
 				transient_retries++;
 				continue;
@@ -633,13 +662,12 @@ bool S3RequestExecutor::SetSessionRegion(HTTPRequestSession &session, const stri
 	}
 }
 
-unique_ptr<HTTPResponse> S3RequestExecutor::RunSession(EncryptionUtil &encryption_util, HTTPRequestSession &session,
-                                                       const string &s3_url, RequestType request_type,
-                                                       S3RequestTarget target, const CreateQueryCallback &create_query,
-                                                       const string &payload_hash, const string &content_type,
-                                                       const string &content_md5, const RequestCallback &request,
-                                                       const RegionRedirectCallback &region_redirect,
-                                                       optional_ptr<S3RequestContext> request_context) {
+unique_ptr<HTTPResponse>
+S3RequestExecutor::RunSession(EncryptionUtil &encryption_util, HTTPRequestSession &session, const string &s3_url,
+                              RequestType request_type, S3RequestTarget target, const CreateQueryCallback &create_query,
+                              const string &payload_hash, const string &content_type, const string &content_md5,
+                              const RequestCallback &request, const RegionRedirectCallback &region_redirect,
+                              optional_ptr<S3RequestContext> request_context, S3PostRequestMode post_request_mode) {
 	return S3RequestExecutor::Run(
 	    s3_url,
 	    [&]() {
@@ -660,7 +688,8 @@ unique_ptr<HTTPResponse> S3RequestExecutor::RunSession(EncryptionUtil &encryptio
 			    request_context->auth_params = request_data.auth_params;
 			    request_context->display_url = request_data.display_url;
 		    }
-	    });
+	    },
+	    post_request_mode);
 }
 
 unique_ptr<HTTPResponse> S3RequestExecutor::RunHandle(EncryptionUtil &encryption_util, S3FileHandle &s3_handle,
@@ -687,7 +716,7 @@ unique_ptr<HTTPResponse> S3RequestExecutor::RunHandle(EncryptionUtil &encryption
 			        request_data.display_url, previous_region, correct_region);
 		    }
 	    },
-	    {});
+	    {}, S3PostRequestMode::DEFAULT);
 }
 
 unique_ptr<HTTPResponse> S3RequestExecutor::SendSessionRequest(HTTPRequestSession &session,
@@ -767,17 +796,14 @@ unique_ptr<HTTPResponse> S3FileSystem::PostRequest(HTTPRequestSession &session, 
 	    [&](S3RequestData &request_data) {
 		    result.clear();
 		    auto &params = request_data.http_params->Cast<HTTPFSParams>();
-		    if (mode == S3PostRequestMode::NON_REPLAYABLE) {
-			    params.retries = 0;
-		    }
 		    return RunPostRequest(request_data.http_url, request_data.headers, params, result, buffer_in, buffer_in_len,
 		                          [&](BaseRequest &request) {
-			                          request.try_request = mode == S3PostRequestMode::NON_REPLAYABLE;
+			                          request.try_request = true;
 			                          return S3RequestExecutor::SendSessionRequest(session, request_data.captured,
 			                                                                       params, request);
 		                          });
 	    },
-	    {}, request_context);
+	    {}, request_context, mode);
 }
 
 unique_ptr<HTTPResponse> S3FileSystem::PutRequest(HTTPRequestSession &session, const string &url,

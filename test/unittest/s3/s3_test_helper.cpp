@@ -278,6 +278,31 @@ idx_t S3TestHelper::CountObservations(const vector<MockS3RequestObservation> &ob
 	return result;
 }
 
+vector<MockS3RequestObservation>
+S3TestHelper::CompletionObservations(const vector<MockS3RequestObservation> &observations) {
+	vector<MockS3RequestObservation> result;
+	for (const auto &observation : observations) {
+		if (observation.method == "POST" && StringUtil::Contains(observation.target, "uploadId")) {
+			result.push_back(observation);
+		}
+	}
+	return result;
+}
+
+void S3TestHelper::RequireCompletionIdentity(const vector<MockS3RequestObservation> &observations,
+                                             idx_t expected_attempts) {
+	auto completions = CompletionObservations(observations);
+	REQUIRE(completions.size() == expected_attempts);
+	REQUIRE(completions.front().body_size > 0);
+	REQUIRE_FALSE(completions.front().body_digest.empty());
+	REQUIRE_FALSE(completions.front().upload_id.empty());
+	for (const auto &completion : completions) {
+		REQUIRE(completion.body_size == completions.front().body_size);
+		REQUIRE(completion.body_digest == completions.front().body_digest);
+		REQUIRE(completion.upload_id == completions.front().upload_id);
+	}
+}
+
 vector<int> S3TestHelper::ObservationPorts(const vector<MockS3RequestObservation> &observations, const string &method,
                                            const string &key_id, int status, const string &range) {
 	vector<int> result;

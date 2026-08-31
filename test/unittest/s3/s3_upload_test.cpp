@@ -750,7 +750,7 @@ public:
 		config.object.bucket = S3TestHelper::BUCKET;
 		config.object.key = S3TestHelper::OBJECT_KEY;
 		config.auth.refresh_target = MockS3RefreshTarget::HEAD;
-		config.failures.transient_complete_post_failures = 1000;
+		config.failures.completion_fault = {1000, 400, "RequestTimeout", "Injected completion timeout"};
 		MockS3Server server(std::move(config));
 
 		DuckDB db(nullptr);
